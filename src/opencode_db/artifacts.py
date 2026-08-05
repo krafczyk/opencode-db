@@ -1,8 +1,9 @@
-"""Create private, immutable, copy-only SQLite source snapshots.
+"""Create and validate private immutable SQLite cleanup evidence.
 
 The functions here read operator-selected source bytes with ordinary file I/O.
 They never import SQLite, invoke OpenCode, or writable-open active or retained
-database files. Later units may consume only accepted snapshots.
+database files. Later units consume only accepted snapshots and rehash retained
+candidates/reports before allowing a selected action to proceed.
 """
 
 from __future__ import annotations
@@ -12,20 +13,30 @@ import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 from . import __version__
-from .model import AcceptedSnapshot, CaptureOutcome, SourceFile, SourceManifest
+from .model import (
+    AcceptedSnapshot,
+    CandidateEvidence,
+    CaptureOutcome,
+    OperationEvidence,
+    SourceFile,
+    SourceManifest,
+)
 from .target import (
     TargetEnvironment,
     TargetError,
     admit_scratch,
     ensure_private_directory,
+    resolve_recorded_target,
     resolve_target,
     storage_space,
 )
@@ -35,6 +46,9 @@ COPY_CHUNK_BYTES = 1024 * 1024
 
 MANIFEST_SCHEMA_VERSION = 1
 """Schema version for target catalogs and retained snapshot manifests."""
+
+CATALOG_SCHEMA_VERSION = 2
+"""Current schema version for target-scoped catalog coordination state."""
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -102,9 +116,7 @@ def capture_source_set(
             target.path, target.target_id, started, deadline_seconds
         )
         _preflight(target.control_dir, pre_manifest, scratch_dir, environment)
-        catalog_entries = _read_catalog(
-            target.control_dir, target.path, target.target_id
-        )
+        catalog = _read_catalog(target.control_dir, target.path, target.target_id)
     except TargetError as error:
         return _outcome(database, None, None, None, False, error.code)
     except CaptureError as error:
@@ -123,7 +135,7 @@ def capture_source_set(
             target.target_id,
             snapshot_id,
             operation_id,
-            catalog_entries,
+            catalog,
         )
         _write_json(snapshot_dir / "pre-manifest.json", pre_manifest.to_dict())
         copied_manifest = _copy_manifest(
@@ -419,6 +431,13 @@ def persist_candidate(
         value["candidate_size"] = size
         _write_json(report_path, value)
         _, report_digest = _hash_file(report_path, started, deadline_seconds)
+        _register_candidate(
+            snapshot,
+            candidate_id,
+            size,
+            digest,
+            report_digest,
+        )
     except (CaptureError, OSError) as error:
         destination.unlink(missing_ok=True)
         report_path.unlink(missing_ok=True)
@@ -426,6 +445,308 @@ def persist_candidate(
             raise
         raise CaptureError("candidate_persist_failed") from error
     return destination, report_path, report_digest
+
+
+def register_preview_scratch(
+    snapshot: AcceptedSnapshot, scratch_path: Path
+) -> OperationEvidence:
+    """Record exact host-local preview scratch before the directory is created.
+
+    Parameters: ``snapshot`` is freshly accepted retained source evidence and
+    ``scratch_path`` is the planned absolute operation-specific workspace.
+    Returns the persisted :class:`OperationEvidence`. Raises :class:`CaptureError`
+    for target/catalog mismatches or unsafe paths. The function updates only the
+    private target catalog; it neither creates scratch nor opens SQLite.
+    """
+    if not scratch_path.is_absolute() or scratch_path.name != snapshot.operation_id:
+        raise CaptureError("snapshot_invalid")
+    snapshots, candidates, operations = _read_catalog(
+        snapshot.snapshot_dir.parent.parent,
+        Path(snapshot.manifest.target),
+        snapshot.manifest.target_id,
+    )
+    if not any(
+        entry["snapshot_id"] == snapshot.snapshot_id
+        and entry["operation_id"] == snapshot.operation_id
+        for entry in snapshots
+    ):
+        raise CaptureError("snapshot_invalid")
+    evidence = OperationEvidence(
+        operation_id=snapshot.operation_id,
+        snapshot_id=snapshot.snapshot_id,
+        state="previewing",
+        host=socket.gethostname(),
+        scratch_path=str(scratch_path),
+    )
+    operations = [
+        entry for entry in operations if entry["operation_id"] != snapshot.operation_id
+    ]
+    operations.append(_operation_dict(evidence))
+    _write_catalog_state(
+        snapshot.snapshot_dir.parent.parent,
+        Path(snapshot.manifest.target),
+        snapshot.manifest.target_id,
+        snapshots,
+        candidates,
+        operations,
+    )
+    return evidence
+
+
+def bind_preview_scratch(snapshot: AcceptedSnapshot, scratch_path: Path) -> None:
+    """Write exact tool-owned authority inside a newly created scratch directory.
+
+    Parameters bind an accepted ``snapshot`` to its registered ``scratch_path``.
+    Returns ``None`` after a private durable marker is written. Raises
+    :class:`CaptureError` unless the path is the exact private operation
+    directory. It never opens SQLite or changes source/retained evidence.
+    """
+    if (
+        not scratch_path.is_absolute()
+        or scratch_path.name != snapshot.operation_id
+        or scratch_path.is_symlink()
+        or not scratch_path.is_dir()
+        or scratch_path.stat().st_mode & 0o777 != 0o700
+    ):
+        raise CaptureError("snapshot_invalid")
+    try:
+        _write_json(
+            scratch_path / ".opencode-db-operation.json",
+            {
+                "schema_version": 1,
+                "operation_id": snapshot.operation_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "target_id": snapshot.manifest.target_id,
+                "host": socket.gethostname(),
+            },
+        )
+    except OSError as error:
+        raise CaptureError("copy_failed") from error
+
+
+def finish_preview_operation(snapshot: AcceptedSnapshot, state: str) -> None:
+    """Mark one registered preview operation terminal after scratch cleanup.
+
+    Parameters: ``snapshot`` identifies a retained target-scoped operation and
+    ``state`` is one of ``complete``, ``uncertain``, or ``invalid``. Returns
+    ``None`` after updating only private catalog metadata. Raises
+    :class:`CaptureError` for malformed catalog state; it never opens SQLite or
+    changes source, candidate, report, or scratch files.
+    """
+    if state not in {"complete", "uncertain", "invalid"}:
+        raise CaptureError("snapshot_invalid")
+    root = snapshot.snapshot_dir.parent.parent
+    snapshots, candidates, operations = _read_catalog(
+        root, Path(snapshot.manifest.target), snapshot.manifest.target_id
+    )
+    replaced = False
+    updated: list[dict[str, str | None]] = []
+    for entry in operations:
+        if entry["operation_id"] == snapshot.operation_id:
+            updated.append({**entry, "state": state})
+            replaced = True
+        else:
+            updated.append(entry)
+    if not replaced:
+        raise CaptureError("snapshot_invalid")
+    _write_catalog_state(
+        root,
+        Path(snapshot.manifest.target),
+        snapshot.manifest.target_id,
+        snapshots,
+        candidates,
+        updated,
+    )
+
+
+def operation_status(database: str, operation_id: str) -> OperationEvidence:
+    """Read one exact target-scoped operation without touching SQLite or processes.
+
+    Parameters: ``database`` is an exact previously recorded target path and
+    ``operation_id`` is an exact opaque ID. Returns the recorded
+    :class:`OperationEvidence`. Raises :class:`CaptureError` when the target,
+    catalog, or operation reference is unavailable or foreign. This read-only
+    operation has no source, scratch, process, or SQLite side effects.
+    """
+    try:
+        target = resolve_recorded_target(database)
+        _, _, operations = _read_catalog(
+            target.control_dir, target.path, target.target_id
+        )
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    for entry in operations:
+        if entry["operation_id"] == operation_id:
+            return OperationEvidence(
+                operation_id=cast(str, entry["operation_id"]),
+                snapshot_id=cast(str, entry["snapshot_id"]),
+                state=cast(str, entry["state"]),
+                host=entry["host"],
+                scratch_path=entry["scratch_path"],
+            )
+    raise CaptureError("candidate_changed")
+
+
+def abort_preview_operation(database: str, operation_id: str) -> OperationEvidence:
+    """Remove only same-host registered preview scratch and then record abort.
+
+    Parameters: ``database`` and ``operation_id`` select exact catalog evidence.
+    Returns the post-operation evidence. Raises :class:`CaptureError` if the
+    operation is not a nonterminal preview or if exact safe scratch removal
+    fails. A foreign-host operation returns ``scratch_cleanup_required`` without
+    deletion. The function never inspects processes or alters SQLite/source data.
+    """
+    evidence = operation_status(database, operation_id)
+    try:
+        target = resolve_recorded_target(database)
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    if evidence.state != "previewing" or evidence.scratch_path is None:
+        raise CaptureError("candidate_changed")
+    if evidence.host != socket.gethostname():
+        return OperationEvidence(
+            evidence.operation_id,
+            evidence.snapshot_id,
+            "scratch_cleanup_required",
+            evidence.host,
+            evidence.scratch_path,
+        )
+    scratch = Path(evidence.scratch_path)
+    if not scratch.is_absolute() or scratch.name != evidence.operation_id:
+        raise CaptureError("candidate_changed")
+    try:
+        if scratch.is_symlink():
+            raise CaptureError("candidate_changed")
+        if scratch.exists():
+            _validate_scratch_marker(scratch, evidence, target.target_id)
+            shutil.rmtree(scratch)
+    except OSError as error:
+        raise CaptureError("copy_failed") from error
+    snapshots, candidates, operations = _read_catalog(
+        target.control_dir, target.path, target.target_id
+    )
+    updated = [
+        {**entry, "state": "aborted"}
+        if entry["operation_id"] == operation_id
+        else entry
+        for entry in operations
+    ]
+    _write_catalog_state(
+        target.control_dir,
+        target.path,
+        target.target_id,
+        snapshots,
+        candidates,
+        updated,
+    )
+    return OperationEvidence(
+        evidence.operation_id,
+        evidence.snapshot_id,
+        "aborted",
+        evidence.host,
+        evidence.scratch_path,
+    )
+
+
+def _validate_scratch_marker(
+    scratch: Path, evidence: OperationEvidence, target_id: str
+) -> None:
+    """Require exact private marker authority before recursive scratch deletion."""
+    marker = scratch / ".opencode-db-operation.json"
+    try:
+        if (
+            scratch.stat().st_mode & 0o777 != 0o700
+            or marker.is_symlink()
+            or not marker.is_file()
+            or marker.stat().st_mode & 0o777 != 0o600
+        ):
+            raise CaptureError("candidate_changed")
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CaptureError("candidate_changed") from error
+    if value != {
+        "schema_version": 1,
+        "operation_id": evidence.operation_id,
+        "snapshot_id": evidence.snapshot_id,
+        "target_id": target_id,
+        "host": evidence.host,
+    }:
+        raise CaptureError("candidate_changed")
+
+
+def select_candidate(
+    database: str, candidate_id: str, approve_uncertain_report: str | None = None
+) -> CandidateEvidence:
+    """Rehash and validate one exact candidate/report pair before later install work.
+
+    Parameters: ``database`` is the explicit target, ``candidate_id`` is an exact
+    catalog ID, and ``approve_uncertain_report`` optionally supplies the required
+    report SHA-256 for uncertain evidence. Returns verified
+    :class:`CandidateEvidence`. Raises :class:`CaptureError` with
+    ``candidate_changed`` or ``report_changed`` for altered or cross-target
+    evidence, and ``approval_required`` when uncertainty lacks its exact report
+    digest. It is read-only and performs no active-database mutation.
+    """
+    try:
+        target = resolve_target(database)
+        snapshots, candidates, _ = _read_catalog(
+            target.control_dir, target.path, target.target_id
+        )
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    record = next(
+        (item for item in candidates if item["candidate_id"] == candidate_id), None
+    )
+    if record is None:
+        raise CaptureError("candidate_changed")
+    snapshot_id = cast(str, record["snapshot_id"])
+    if not any(item["snapshot_id"] == snapshot_id for item in snapshots):
+        raise CaptureError("candidate_changed")
+    snapshot_dir = target.control_dir / "snapshots" / snapshot_id
+    candidate_path = snapshot_dir / f"{candidate_id}.sqlite"
+    report_path = snapshot_dir / f"{candidate_id}.report.json"
+    try:
+        snapshot = load_accepted_snapshot(snapshot_dir)
+    except CaptureError as error:
+        raise CaptureError("candidate_changed") from error
+    if snapshot.snapshot_id != snapshot_id:
+        raise CaptureError("candidate_changed")
+    try:
+        candidate_size, candidate_digest = _hash_file(
+            candidate_path, time.monotonic(), 1_800
+        )
+    except CaptureError as error:
+        raise CaptureError("candidate_changed") from error
+    if (candidate_size, candidate_digest) != (
+        record["candidate_size"],
+        record["candidate_sha256"],
+    ):
+        raise CaptureError("candidate_changed")
+    try:
+        _, report_digest = _hash_file(report_path, time.monotonic(), 1_800)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (CaptureError, OSError, json.JSONDecodeError) as error:
+        raise CaptureError("report_changed") from error
+    if report_digest != record["report_sha256"] or not _valid_report(
+        report,
+        target.path,
+        target.target_id,
+        record,
+        snapshot.manifest,
+    ):
+        raise CaptureError("report_changed")
+    completeness = cast(str, report["completeness"])
+    if completeness == "uncertain" and approve_uncertain_report != report_digest:
+        raise CaptureError("approval_required")
+    return CandidateEvidence(
+        snapshot_id=snapshot_id,
+        candidate_id=candidate_id,
+        candidate_path=candidate_path,
+        report_path=report_path,
+        candidate_sha256=candidate_digest,
+        report_sha256=report_digest,
+        completeness=completeness,
+    )
 
 
 def _preflight(
@@ -580,30 +901,34 @@ def _write_catalog(
     target_id: str,
     snapshot_id: str,
     operation_id: str,
-    existing_entries: list[dict[str, str]],
+    catalog: tuple[
+        list[dict[str, str]], list[dict[str, object]], list[dict[str, str | None]]
+    ],
 ) -> None:
-    """Persist the minimal private target catalog without opening source data."""
-    path = control_dir / "catalog.json"
-    entries = [*existing_entries]
-    entries.append({"snapshot_id": snapshot_id, "operation_id": operation_id})
-    _write_json(
-        path,
+    """Persist a new snapshot and its initial nonterminal operation record."""
+    snapshots, candidates, operations = catalog
+    snapshots = [*snapshots, {"snapshot_id": snapshot_id, "operation_id": operation_id}]
+    operations = [
+        *operations,
         {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "tool_version": __version__,
-            "target": str(target),
-            "target_id": target_id,
-            "snapshots": entries,
+            "operation_id": operation_id,
+            "snapshot_id": snapshot_id,
+            "state": "capturing",
+            "host": None,
+            "scratch_path": None,
         },
+    ]
+    _write_catalog_state(
+        control_dir, target, target_id, snapshots, candidates, operations
     )
 
 
 def _read_catalog(
     control_dir: Path, target: Path, target_id: str
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, object]], list[dict[str, str | None]]]:
     """Read one compatible catalog before allocating a snapshot directory.
 
-    Returns prior exact snapshot/operation ID pairs. Raises :class:`CaptureError`
+    Returns snapshot, candidate, and operation records. Raises :class:`CaptureError`
     for malformed, foreign-target, or future catalog state without creating a
     snapshot or copying source bytes. Catalog reads do not open SQLite.
     """
@@ -612,7 +937,7 @@ def _read_catalog(
         if path.is_symlink():
             raise CaptureError("artifact_schema_unsupported")
         if not path.exists():
-            return []
+            return [], [], []
         if path.stat().st_mode & 0o777 != 0o600:
             raise CaptureError("artifact_not_private")
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -620,24 +945,219 @@ def _read_catalog(
         raise CaptureError("artifact_schema_unsupported") from error
     if (
         not isinstance(value, dict)
-        or set(value)
-        != {"schema_version", "tool_version", "target", "target_id", "snapshots"}
-        or value["schema_version"] != MANIFEST_SCHEMA_VERSION
-        or value["target"] != str(target)
-        or value["target_id"] != target_id
-        or not isinstance(value["tool_version"], str)
-        or not isinstance(value["snapshots"], list)
+        or value.get("target") != str(target)
+        or value.get("target_id") != target_id
+        or not isinstance(value.get("tool_version"), str)
     ):
         raise CaptureError("artifact_schema_unsupported")
-    entries = value["snapshots"]
-    if any(
+    if value.get("schema_version") == MANIFEST_SCHEMA_VERSION and set(value) == {
+        "schema_version",
+        "tool_version",
+        "target",
+        "target_id",
+        "snapshots",
+    }:
+        entries = value["snapshots"]
+        candidates: list[dict[str, object]] = []
+        operations = [
+            {
+                "operation_id": item["operation_id"],
+                "snapshot_id": item["snapshot_id"],
+                "state": "captured",
+                "host": None,
+                "scratch_path": None,
+            }
+            for item in entries
+            if isinstance(item, dict)
+            and set(item) == {"snapshot_id", "operation_id"}
+            and all(isinstance(part, str) for part in item.values())
+        ]
+    elif value.get("schema_version") == CATALOG_SCHEMA_VERSION and set(value) == {
+        "schema_version",
+        "tool_version",
+        "target",
+        "target_id",
+        "snapshots",
+        "candidates",
+        "operations",
+    }:
+        entries = value["snapshots"]
+        candidates = value["candidates"]
+        operations = value["operations"]
+    else:
+        raise CaptureError("artifact_schema_unsupported")
+    if not isinstance(entries, list) or any(
         not isinstance(item, dict)
         or set(item) != {"snapshot_id", "operation_id"}
         or not all(isinstance(part, str) for part in item.values())
         for item in entries
     ):
         raise CaptureError("artifact_schema_unsupported")
-    return [dict(item) for item in entries]
+    if not isinstance(candidates, list) or any(
+        not isinstance(item, dict)
+        or set(item)
+        != {
+            "snapshot_id",
+            "candidate_id",
+            "candidate_size",
+            "candidate_sha256",
+            "report_sha256",
+        }
+        or not isinstance(item["snapshot_id"], str)
+        or not isinstance(item["candidate_id"], str)
+        or type(item["candidate_size"]) is not int
+        or item["candidate_size"] < 0
+        or any(
+            not _valid_digest(item[name])
+            for name in ("candidate_sha256", "report_sha256")
+        )
+        for item in candidates
+    ):
+        raise CaptureError("artifact_schema_unsupported")
+    if not isinstance(operations, list) or any(
+        not isinstance(item, dict)
+        or set(item) != {"operation_id", "snapshot_id", "state", "host", "scratch_path"}
+        or not all(
+            isinstance(item[name], str)
+            for name in ("operation_id", "snapshot_id", "state")
+        )
+        or any(
+            item[name] is not None and not isinstance(item[name], str)
+            for name in ("host", "scratch_path")
+        )
+        for item in operations
+    ):
+        raise CaptureError("artifact_schema_unsupported")
+    return (
+        [dict(item) for item in entries],
+        [dict(item) for item in candidates],
+        [dict(item) for item in operations],
+    )
+
+
+def _valid_digest(value: object) -> bool:
+    """Return whether one persisted value is a lowercase SHA-256 digest."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _write_catalog_state(
+    control_dir: Path,
+    target: Path,
+    target_id: str,
+    snapshots: list[dict[str, str]],
+    candidates: list[dict[str, object]],
+    operations: list[dict[str, str | None]],
+) -> None:
+    """Write one complete versioned target catalog with private atomic replacement."""
+    _write_json(
+        control_dir / "catalog.json",
+        {
+            "schema_version": CATALOG_SCHEMA_VERSION,
+            "tool_version": __version__,
+            "target": str(target),
+            "target_id": target_id,
+            "snapshots": snapshots,
+            "candidates": candidates,
+            "operations": operations,
+        },
+    )
+
+
+def _operation_dict(evidence: OperationEvidence) -> dict[str, str | None]:
+    """Return one closed catalog record for read-only operation status."""
+    return {
+        "operation_id": evidence.operation_id,
+        "snapshot_id": evidence.snapshot_id,
+        "state": evidence.state,
+        "host": evidence.host,
+        "scratch_path": evidence.scratch_path,
+    }
+
+
+def _register_candidate(
+    snapshot: AcceptedSnapshot,
+    candidate_id: str,
+    candidate_size: int,
+    candidate_sha256: str,
+    report_sha256: str,
+) -> None:
+    """Add one immutable candidate/report identity to its exact target catalog."""
+    root = snapshot.snapshot_dir.parent.parent
+    snapshots, candidates, operations = _read_catalog(
+        root, Path(snapshot.manifest.target), snapshot.manifest.target_id
+    )
+    if not any(item["snapshot_id"] == snapshot.snapshot_id for item in snapshots):
+        raise CaptureError("candidate_persist_failed")
+    candidates.append(
+        {
+            "snapshot_id": snapshot.snapshot_id,
+            "candidate_id": candidate_id,
+            "candidate_size": candidate_size,
+            "candidate_sha256": candidate_sha256,
+            "report_sha256": report_sha256,
+        }
+    )
+    _write_catalog_state(
+        root,
+        Path(snapshot.manifest.target),
+        snapshot.manifest.target_id,
+        snapshots,
+        candidates,
+        operations,
+    )
+
+
+def _valid_report(
+    report: object,
+    target: Path,
+    target_id: str,
+    record: dict[str, object],
+    manifest: SourceManifest,
+) -> bool:
+    """Check report references without exposing or repairing retained evidence."""
+    required = {
+        "schema_version",
+        "tool_version",
+        "snapshot_id",
+        "target",
+        "target_id",
+        "source_manifest_sha256",
+        "completeness",
+        "completeness_scope",
+        "historical_completeness",
+        "validation",
+        "passive_checkpoint",
+        "truncate_checkpoint",
+        "wal_evidence",
+        "sqlite_version",
+        "preview",
+        "candidate_id",
+        "candidate_sha256",
+        "candidate_size",
+    }
+    return (
+        isinstance(report, dict)
+        and set(report) == required
+        and report.get("schema_version") == 1
+        and isinstance(report.get("tool_version"), str)
+        and report.get("snapshot_id") == record["snapshot_id"]
+        and report.get("target") == str(target)
+        and report.get("target_id") == target_id
+        and isinstance(report.get("source_manifest_sha256"), str)
+        and report.get("source_manifest_sha256")
+        == hashlib.sha256(
+            json.dumps(
+                manifest.to_dict(),
+                sort_keys=True,
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+        ).hexdigest()
+        and report.get("candidate_id") == record["candidate_id"]
+        and report.get("candidate_sha256") == record["candidate_sha256"]
+        and report.get("candidate_size") == record["candidate_size"]
+        and report.get("completeness") in {"complete", "uncertain"}
+    )
 
 
 def _write_snapshot_manifest(

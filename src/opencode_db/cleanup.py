@@ -9,20 +9,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
-import secrets
+import re
 import shutil
 import sqlite3
+import subprocess
 import time
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from . import __version__
 from .artifacts import (
     CaptureError,
+    bind_preview_scratch,
+    finish_preview_operation,
     load_accepted_snapshot,
     new_artifact_id,
     persist_candidate,
+    register_preview_scratch,
     snapshot_source_path,
 )
 from .model import AcceptedSnapshot, Check, CleanupOutcome, Validation
@@ -38,6 +44,12 @@ WAL_HEADER_BYTES = 32
 
 WAL_FRAME_HEADER_BYTES = 24
 """Fixed byte length preceding each SQLite WAL frame page."""
+
+MAX_PREVIEW_ROWS = 4
+"""Maximum number of recent session records exposed in a preview."""
+
+MAX_PREVIEW_TEXT = 512
+"""Maximum UTF-8 character count exposed for one recognizable field."""
 
 
 class CleanupError(RuntimeError):
@@ -112,7 +124,9 @@ def clean_snapshot(
     validation = Validation()
     snapshot_id = "unknown"
     target = "unknown"
+    snapshot: AcceptedSnapshot | None = None
     workdir: Path | None = None
+    operation_finished = False
     try:
         if deadline_seconds < 1:
             raise CleanupError("deadline_exceeded")
@@ -149,7 +163,7 @@ def clean_snapshot(
             _backup(source, candidate, started, deadline_seconds)
         finally:
             source.close()
-        validation = _validate_candidate(
+        validation, preview = _validate_candidate(
             candidate, started, deadline_seconds, hooks, checkpoint
         )
         if validation != Validation(
@@ -159,7 +173,7 @@ def clean_snapshot(
             clean_reopen=Check.PASS,
             sidecars_absent=Check.PASS,
         ):
-            return _invalid(snapshot_id, target, validation, "cleanup_invalid")
+            return _invalid(snapshot_id, target, validation, "cleanup_invalid", preview)
         _check_deadline(started, deadline_seconds)
         # Catch retained-input tampering between initial staging and publication.
         snapshot = load_accepted_snapshot(
@@ -180,10 +194,15 @@ def clean_snapshot(
                 evidence,
                 passive_checkpoint,
                 truncate_checkpoint,
+                preview,
             ),
             started=started,
             deadline_seconds=deadline_seconds,
         )
+        shutil.rmtree(workdir)
+        workdir = None
+        finish_preview_operation(snapshot, completeness)
+        operation_finished = True
         return CleanupOutcome(
             snapshot_id=snapshot.snapshot_id,
             target=snapshot.manifest.target,
@@ -195,6 +214,7 @@ def clean_snapshot(
             candidate_path=retained,
             report_path=report_path,
             report_sha256=report_digest,
+            preview=preview,
         )
     except (CaptureError, CleanupError, TargetError, OSError, sqlite3.Error) as error:
         code = (
@@ -208,6 +228,11 @@ def clean_snapshot(
     finally:
         if workdir is not None:
             shutil.rmtree(workdir, ignore_errors=True)
+        if snapshot is not None and not operation_finished:
+            try:
+                finish_preview_operation(snapshot, "invalid")
+            except CaptureError:
+                pass
 
 
 def _create_scratch(
@@ -222,8 +247,10 @@ def _create_scratch(
     admitted = admit_scratch(root, required, 8, environment)
     ensure_private_directory(admitted)
     _check_deadline(started, deadline_seconds)
-    workdir = admitted / f"cleanup-{secrets.token_hex(12)}"
+    workdir = admitted / snapshot.operation_id
+    register_preview_scratch(snapshot, workdir)
     ensure_private_directory(workdir)
+    bind_preview_scratch(snapshot, workdir)
     return workdir
 
 
@@ -372,27 +399,30 @@ def _validate_candidate(
     deadline_seconds: int,
     hooks: CleanupHooks | None,
     checkpoint: Check,
-) -> Validation:
-    """Run full SQLite checks, clean reopen, and sidecar absence validation."""
+) -> tuple[Validation, dict[str, object] | None]:
+    """Run validation and collect only the bounded recognizable preview fields.
+
+    Parameters are a scratch ``candidate``, shared operation deadline, optional
+    scratch-only hooks, and the prior checkpoint outcome. Returns validation plus
+    a preview for readable databases, or ``None`` when SQLite cannot read the
+    candidate. The function opens only the scratch candidate and never returns
+    arbitrary table rows, SQL text, or SQLite integrity messages.
+    """
     integrity = Check.FAIL
     foreign_keys = Check.FAIL
     clean_reopen = Check.FAIL
     sidecars = Check.FAIL
+    preview: dict[str, object] | None = None
     try:
         connection = _connect_rw(candidate)
         try:
             _set_deadline_handler(connection, started, deadline_seconds)
             _check_deadline(started, deadline_seconds)
-            integrity = (
-                Check.PASS
-                if connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
-                else Check.FAIL
-            )
-            foreign_keys = (
-                Check.PASS
-                if connection.execute("PRAGMA foreign_key_check").fetchall() == []
-                else Check.FAIL
-            )
+            integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+            integrity = Check.PASS if integrity_rows == [("ok",)] else Check.FAIL
+            foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+            foreign_keys = Check.PASS if foreign_key_rows == [] else Check.FAIL
+            preview = _preview(connection, integrity_rows, foreign_key_rows)
         finally:
             connection.close()
         if hooks and hooks.before_reopen:
@@ -415,7 +445,207 @@ def _validate_candidate(
         )
     except (CleanupError, sqlite3.Error, OSError):
         _check_deadline(started, deadline_seconds)
-    return Validation(integrity, foreign_keys, checkpoint, clean_reopen, sidecars)
+    return (
+        Validation(integrity, foreign_keys, checkpoint, clean_reopen, sidecars),
+        preview,
+    )
+
+
+def _preview(
+    connection: sqlite3.Connection,
+    integrity_rows: list[tuple[object, ...]],
+    foreign_key_rows: list[tuple[object, ...]],
+) -> dict[str, object]:
+    """Build a fixed-size preview from known OpenCode fields and check outcomes.
+
+    Parameters are an open scratch connection and structured SQLite pragma rows.
+    Returns only project identity, up to four session identity records, and
+    counted issue summaries. Missing expected tables or columns make only their
+    respective domain summary ``"unavailable"``. This function never parses
+    integrity message text or exposes data from arbitrary application tables.
+    """
+    table_counts: dict[str, int] = {}
+    for row in foreign_key_rows:
+        if row and isinstance(row[0], str) and _safe_table_name(row[0]):
+            table_counts[row[0]] = table_counts.get(row[0], 0) + 1
+    database_issue_count = 0
+    if integrity_rows != [("ok",)]:
+        database_issue_count = len(integrity_rows)
+        for table in _schema_tables(connection):
+            quoted = table.replace('"', '""')
+            rows = connection.execute(f'PRAGMA integrity_check("{quoted}")').fetchall()
+            issues = sum(row != ("ok",) for row in rows)
+            if issues:
+                table_counts[table] = table_counts.get(table, 0) + issues
+    return {
+        "projects": _projects(connection),
+        "recent_sessions": _recent_sessions(connection),
+        "table_issue_counts": dict(sorted(table_counts.items())),
+        "database_issue_count": database_issue_count,
+    }
+
+
+def _projects(connection: sqlite3.Connection) -> list[dict[str, object]] | str:
+    """Return bounded OpenCode project identity records or ``"unavailable"``.
+
+    Parameters: ``connection`` is an already-open scratch candidate. Returns
+    stable project fields only. Missing project schema elements are not generic
+    validation failures; SQLite query errors return ``"unavailable"``.
+    """
+    if not _has_columns(connection, "project", {"id", "name", "worktree"}):
+        return "unavailable"
+    try:
+        rows = connection.execute(
+            "SELECT id, name, worktree FROM project ORDER BY id LIMIT 128"
+        ).fetchall()
+    except sqlite3.Error:
+        return "unavailable"
+    projects: list[dict[str, object]] = []
+    for project_id, name, worktree in rows:
+        if not isinstance(project_id, str) or not isinstance(worktree, str):
+            continue
+        projects.append(
+            {
+                "id": _bounded_text(project_id),
+                "name": _bounded_text(name) if isinstance(name, str) else None,
+                "worktree": _bounded_text(worktree),
+                "origin": _origin(worktree),
+            }
+        )
+    return projects
+
+
+def _recent_sessions(connection: sqlite3.Connection) -> list[dict[str, object]] | str:
+    """Return the four latest OpenCode session identities or ``"unavailable"``.
+
+    Parameters: ``connection`` is an open scratch candidate. Returns the four
+    greatest ``time_updated`` non-archived sessions when ``time_archived`` is
+    present; older compatible schemas fall back to the four greatest sessions.
+    Query failures and missing required columns return ``"unavailable"`` only
+    for the session summary.
+    """
+    required = {"id", "title", "project_id", "time_updated"}
+    if not _has_columns(connection, "session", required):
+        return "unavailable"
+    columns = _columns(connection, "session")
+    query = "SELECT id, title, project_id, time_updated FROM session"
+    if "time_archived" in columns:
+        query += " WHERE time_archived IS NULL"
+    query += " ORDER BY time_updated DESC, id ASC LIMIT 4"
+    try:
+        rows = connection.execute(query).fetchall()
+    except sqlite3.Error:
+        return "unavailable"
+    sessions: list[dict[str, object]] = []
+    for session_id, title, project_id, updated in rows:
+        if (
+            not isinstance(session_id, str)
+            or not isinstance(title, str)
+            or not isinstance(project_id, str)
+            or type(updated) is not int
+        ):
+            continue
+        sessions.append(
+            {
+                "id": _bounded_text(session_id),
+                "title": _bounded_text(title),
+                "project_id": _bounded_text(project_id),
+                "time_updated": updated,
+            }
+        )
+    return sessions
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    """Return recognized columns for one safe schema table without row access."""
+    try:
+        return {
+            row[1]
+            for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+            if len(row) > 1 and isinstance(row[1], str)
+        }
+    except sqlite3.Error:
+        return set()
+
+
+def _has_columns(
+    connection: sqlite3.Connection, table: str, required: set[str]
+) -> bool:
+    """Return whether one expected table exposes all required stable columns."""
+    return required <= _columns(connection, table)
+
+
+def _schema_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """Return a bounded deterministic list of safe non-system schema table names."""
+    rows = connection.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name LIMIT 128"
+    ).fetchall()
+    return tuple(
+        row[0] for row in rows if isinstance(row[0], str) and _safe_table_name(row[0])
+    )
+
+
+def _safe_table_name(value: str) -> bool:
+    """Return whether a schema table name is safe for the limited pragma query."""
+    return re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]{0,127}", value
+    ) is not None and not value.startswith("sqlite_")
+
+
+def _origin(worktree: str) -> str:
+    """Return a credential-redacted origin URL or ``"unknown"`` without errors.
+
+    Parameters: ``worktree`` is a recorded project location. Returns a bounded
+    read-only Git result; missing Git, invalid worktrees, nonzero exits, timeouts,
+    and malformed URLs all produce ``"unknown"``. The subprocess has no shell,
+    no stdin, a finite timeout, and no surfaced stderr.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", worktree, "remote", "get-url", "origin"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if completed.returncode != 0:
+        return "unknown"
+    return _redact_origin(completed.stdout.strip())
+
+
+def _redact_origin(origin: str) -> str:
+    """Strip URL credentials, query data, and fragments from one Git origin value."""
+    if not origin or len(origin) > MAX_PREVIEW_TEXT * 4:
+        return "unknown"
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return "unknown"
+    if parsed.scheme and parsed.netloc:
+        try:
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return "unknown"
+        if host is None:
+            return "unknown"
+        netloc = host if port is None else f"{host}:{port}"
+        return _bounded_text(urlunsplit((parsed.scheme, netloc, parsed.path, "", "")))
+    if "@" in origin and ":" in origin and not any(char.isspace() for char in origin):
+        return _bounded_text(origin.split("@", 1)[1].split("?", 1)[0].split("#", 1)[0])
+    return "unknown"
+
+
+def _bounded_text(value: str) -> str:
+    """Return one bounded single-line preview string without control characters."""
+    return "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in value[:MAX_PREVIEW_TEXT]
+    )
 
 
 def _refuse_journal(snapshot: AcceptedSnapshot) -> None:
@@ -441,6 +671,7 @@ def _report(
     evidence: _WalEvidence,
     passive_checkpoint: tuple[int, int, int],
     truncate_checkpoint: tuple[int, int, int],
+    preview: dict[str, object] | None,
 ) -> dict[str, object]:
     """Build a bounded immutable report without domain rows or SQLite messages."""
     return {
@@ -449,6 +680,14 @@ def _report(
         "snapshot_id": snapshot.snapshot_id,
         "target": snapshot.manifest.target,
         "target_id": snapshot.manifest.target_id,
+        "source_manifest_sha256": hashlib.sha256(
+            json.dumps(
+                snapshot.manifest.to_dict(),
+                sort_keys=True,
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+        ).hexdigest(),
         "completeness": completeness,
         "completeness_scope": "captured_source_set",
         "historical_completeness": "not_proven",
@@ -457,13 +696,18 @@ def _report(
         "truncate_checkpoint": list(truncate_checkpoint),
         "wal_evidence": evidence.to_dict(),
         "sqlite_version": sqlite3.sqlite_version,
+        "preview": preview,
     }
 
 
 def _invalid(
-    snapshot_id: str, target: str, validation: Validation, code: str
+    snapshot_id: str,
+    target: str,
+    validation: Validation,
+    code: str,
+    preview: dict[str, object] | None = None,
 ) -> CleanupOutcome:
-    """Return one non-installable outcome without persisting a candidate."""
+    """Return one non-installable outcome with preview only when SQLite read it."""
     return CleanupOutcome(
         snapshot_id=snapshot_id,
         target=target,
@@ -471,6 +715,7 @@ def _invalid(
         completeness="invalid",
         validation=validation,
         installable=False,
+        preview=preview,
         diagnostic_code=code,
     )
 

@@ -25,6 +25,15 @@ EXIT_MANUAL_RECOVERY_REQUIRED = 6
 MAX_DIAGNOSTICS = 8
 """Maximum number of safe diagnostic summaries in one result."""
 
+MAX_PREVIEW_PROJECTS = 128
+"""Maximum recognizable project records in a version-1 preview."""
+
+MAX_PREVIEW_SESSIONS = 4
+"""Maximum recent session records in a version-1 preview."""
+
+MAX_PREVIEW_TEXT = 512
+"""Maximum character length for one preview identity field or table name."""
+
 
 class Status(StrEnum):
     """Closed status values emitted by schema-version-1 results.
@@ -283,10 +292,12 @@ class CleanupOutcome:
     """Describe the result of creating and validating one SQLite candidate.
 
     Parameters identify the source snapshot, resulting ``completeness`` class,
-    required validation gates, and immutable retained candidate/report paths
-    when the candidate is installable. ``candidate_path`` and ``report_path``
-    remain ``None`` for invalid or operational outcomes. This value does not
-    itself write files or authorize installation.
+    required validation gates, an optional bounded ``preview``, and immutable
+    retained candidate/report paths when the candidate is installable.
+    ``candidate_path`` and ``report_path`` remain ``None`` for invalid or
+    operational outcomes, while a readable invalid candidate can still retain
+    its safe preview. This value does not itself write files or authorize
+    installation.
     """
 
     snapshot_id: str
@@ -299,7 +310,45 @@ class CleanupOutcome:
     candidate_path: Path | None = None
     report_path: Path | None = None
     report_sha256: str | None = None
+    preview: dict[str, Any] | None = None
     diagnostic_code: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidateEvidence:
+    """Bind one selected retained candidate to immutable target-scoped evidence.
+
+    Parameters identify the retained candidate and report paths, their verified
+    digests, the bound snapshot, and the candidate completeness class. Artifact
+    selection returns this type only after rehashing both files and validating
+    their closed report references. Constructing it performs no I/O and does not
+    authorize active-database mutation.
+    """
+
+    snapshot_id: str
+    candidate_id: str
+    candidate_path: Path
+    report_path: Path
+    candidate_sha256: str
+    report_sha256: str
+    completeness: str
+
+
+@dataclass(frozen=True)
+class OperationEvidence:
+    """Describe one target-scoped capture or preview operation for recovery.
+
+    Parameters retain the exact operation/snapshot IDs, state, creating host,
+    and registered scratch path. Status and abort use this type without process
+    inspection. It has no side effects and callers must verify target scope
+    before acting on the recorded scratch path.
+    """
+
+    operation_id: str
+    snapshot_id: str
+    state: str
+    host: str | None
+    scratch_path: str | None
 
 
 @dataclass(frozen=True)
@@ -309,8 +358,8 @@ class Result:
     Parameters correspond exactly to the public machine-result object. Values
     are serializable through :meth:`to_dict`; :meth:`from_json` rejects unknown
     schemas, fields, and enum values without reading or changing external
-    state. Preview contents remain ``None`` until a later unit implements the
-    approved lightweight preview object.
+    state. Preview contents, when present, use the approved bounded project,
+    session, and SQLite issue-count object.
     """
 
     schema_version: int = RESULT_SCHEMA_VERSION
@@ -363,6 +412,7 @@ class Result:
         diagnostic_message: str,
         target: str | None = None,
         snapshot_id: str | None = None,
+        candidate_id: str | None = None,
         operation_id: str | None = None,
     ) -> "Result":
         """Build a bounded safe failure result from an internal error context.
@@ -393,6 +443,9 @@ class Result:
             "checkpoint_incomplete": "SQLite could not complete the required checkpoint.",
             "backup_failed": "SQLite backup could not complete safely.",
             "candidate_persist_failed": "The validated candidate could not be retained safely.",
+            "candidate_changed": "The selected candidate is unavailable or has changed.",
+            "report_changed": "The selected immutable report is unavailable or has changed.",
+            "approval_required": "The uncertain candidate requires its exact report digest approval.",
             "unexpected_error": "An unexpected internal error occurred.",
         }
         return cls(
@@ -401,6 +454,7 @@ class Result:
             exit_code=exit_code,
             target=target,
             snapshot_id=snapshot_id,
+            candidate_id=candidate_id,
             operation_id=operation_id,
             diagnostics=(
                 Diagnostic(
@@ -485,7 +539,7 @@ class Result:
             raise ValueError("result has an invalid nullable string field")
         if value["completeness"] not in (None, "complete", "uncertain", "invalid"):
             raise ValueError("result has an invalid completeness value")
-        if value["preview"] is not None and not isinstance(value["preview"], dict):
+        if value["preview"] is not None and not _valid_preview(value["preview"]):
             raise ValueError("result has an invalid preview object")
         if not isinstance(value["next_actions"], list) or not all(
             isinstance(action, str) for action in value["next_actions"]
@@ -519,3 +573,75 @@ class Result:
             next_actions=tuple(value["next_actions"]),
             diagnostics=tuple(Diagnostic(**item) for item in diagnostics_value),
         )
+
+
+def _valid_preview(value: object) -> bool:
+    """Return whether one result preview has the closed bounded version-1 shape."""
+    if not isinstance(value, dict) or set(value) != {
+        "projects",
+        "recent_sessions",
+        "table_issue_counts",
+        "database_issue_count",
+    }:
+        return False
+    projects = value["projects"]
+    if projects != "unavailable":
+        if not isinstance(projects, list) or len(projects) > MAX_PREVIEW_PROJECTS:
+            return False
+        for project in projects:
+            if not isinstance(project, dict) or set(project) not in (
+                {"id", "name", "worktree"},
+                {"id", "name", "worktree", "origin"},
+            ):
+                return False
+            if (
+                not isinstance(project["id"], str)
+                or not isinstance(project["worktree"], str)
+                or project["name"] is not None
+                and not isinstance(project["name"], str)
+                or "origin" in project
+                and not isinstance(project["origin"], str)
+                or any(
+                    isinstance(item, str) and len(item) > MAX_PREVIEW_TEXT
+                    for item in project.values()
+                )
+            ):
+                return False
+    sessions = value["recent_sessions"]
+    if sessions != "unavailable":
+        if not isinstance(sessions, list) or len(sessions) > MAX_PREVIEW_SESSIONS:
+            return False
+        for session in sessions:
+            if not isinstance(session, dict) or set(session) != {
+                "id",
+                "title",
+                "project_id",
+                "time_updated",
+            }:
+                return False
+            if (
+                not all(
+                    isinstance(session[name], str)
+                    for name in ("id", "title", "project_id")
+                )
+                or type(session["time_updated"]) is not int
+                or any(
+                    len(session[name]) > MAX_PREVIEW_TEXT
+                    for name in ("id", "title", "project_id")
+                )
+            ):
+                return False
+    table_counts = value["table_issue_counts"]
+    return (
+        isinstance(table_counts, dict)
+        and len(table_counts) <= MAX_PREVIEW_PROJECTS
+        and all(
+            isinstance(name, str)
+            and len(name) <= MAX_PREVIEW_TEXT
+            and type(count) is int
+            and count >= 0
+            for name, count in table_counts.items()
+        )
+        and type(value["database_issue_count"]) is int
+        and value["database_issue_count"] >= 0
+    )

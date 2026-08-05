@@ -15,10 +15,17 @@ import sys
 import time
 from collections.abc import Sequence
 
-from .artifacts import capture_source_set
+from .artifacts import (
+    CaptureError,
+    abort_preview_operation,
+    capture_source_set,
+    operation_status,
+    select_candidate,
+)
 from .cleanup import clean_snapshot
 from .model import (
     EXIT_DECISION_REQUIRED,
+    EXIT_MANUAL_RECOVERY_REQUIRED,
     EXIT_OPERATIONAL_FAILURE,
     EXIT_PRECONDITION_REFUSED,
     EXIT_USAGE,
@@ -178,6 +185,38 @@ def render_human(result: Result) -> str:
     newline-terminated public diagnostic without exposing arbitrary exception
     text. Rendering has no filesystem, database, or process side effects.
     """
+    if result.preview is not None:
+        lines = [
+            f"opencode-db: {result.status.value}",
+            f"target: {result.target}",
+            f"snapshot: {result.snapshot_id}",
+            f"candidate: {result.candidate_id}",
+            f"report: {result.report_sha256}",
+        ]
+        projects = result.preview.get("projects")
+        if isinstance(projects, list):
+            lines.extend(
+                "project: "
+                + " | ".join(
+                    str(project.get(name, ""))
+                    for name in ("id", "name", "worktree", "origin")
+                )
+                for project in projects
+                if isinstance(project, dict)
+            )
+        sessions = result.preview.get("recent_sessions")
+        if isinstance(sessions, list):
+            lines.extend(
+                "session: "
+                + " | ".join(
+                    str(session.get(name, ""))
+                    for name in ("id", "title", "project_id", "time_updated")
+                )
+                for session in sessions
+                if isinstance(session, dict)
+            )
+        lines.extend(f"next: {action}" for action in result.next_actions)
+        return "\n".join(lines) + "\n"
     if result.diagnostics:
         return f"opencode-db: {result.diagnostics[0].message}\n"
     return f"opencode-db: {result.status.value}\n"
@@ -223,13 +262,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 
 def _execute(request: CommandRequest) -> Result:
-    """Execute the implemented preview flow or refuse deferred commands.
+    """Execute preview evidence operations or refuse deferred installation.
 
     Parameters: ``request`` is grammar-validated operator input. Returns one
     closed :class:`Result`, including actual cleanup classification for preview.
     Capture and SQLite cleanup write only private artifacts and scratch copies;
     all non-preview commands remain non-mutating precondition refusals.
     """
+    if request.command == "cleanup status":
+        return _status_result(request)
+    if request.command == "cleanup abort":
+        return _abort_result(request)
+    if request.command == "cleanup install":
+        return _install_selection_result(request)
     if request.command != "cleanup preview":
         return Result.failure(
             command=request.command,
@@ -315,9 +360,168 @@ def _execute(request: CommandRequest) -> Result:
         report_sha256=outcome.report_sha256,
         completeness=outcome.completeness,
         validation=outcome.validation,
-        preview=None,
+        preview=outcome.preview,
+        next_actions=_preview_actions(request, outcome),
         diagnostics=diagnostics,
     )
+
+
+def _status_result(request: CommandRequest) -> Result:
+    """Render one exact operation's host-local scratch recovery information.
+
+    Parameters: ``request`` contains an explicit target and optional operation
+    ID. Returns a read-only status result; no processes, SQLite connections, or
+    source files are inspected. Unknown or cross-target operation IDs are
+    precondition refusals.
+    """
+    if request.operation_id is None:
+        return Result(
+            command=request.command,
+            ok=True,
+            status=Status.STATUS_OK,
+            exit_code=0,
+            target=request.database,
+            diagnostics=(Diagnostic("operation_status", "No operation was selected."),),
+        )
+    try:
+        evidence = operation_status(request.database, request.operation_id)
+    except CaptureError as error:
+        return _artifact_failure(request, error.code)
+    location = evidence.scratch_path or "none"
+    return Result(
+        command=request.command,
+        ok=True,
+        status=Status.STATUS_OK,
+        exit_code=0,
+        target=request.database,
+        snapshot_id=evidence.snapshot_id,
+        operation_id=evidence.operation_id,
+        diagnostics=(
+            Diagnostic(
+                "operation_status",
+                f"operation {evidence.operation_id} is {evidence.state} on host "
+                f"{evidence.host or 'unknown'}; scratch {location}"[:1024],
+            ),
+        ),
+        next_actions=_status_actions(
+            request.database, evidence.operation_id, evidence.state
+        ),
+    )
+
+
+def _abort_result(request: CommandRequest) -> Result:
+    """Abort only an exact same-host registered preview scratch operation.
+
+    Parameters: ``request`` contains a parsed target and required operation ID.
+    Returns ``aborted`` only after exact scratch removal and catalog update, or
+    ``scratch_cleanup_required`` for another host. No process inspection occurs.
+    """
+    assert request.operation_id is not None
+    try:
+        evidence = abort_preview_operation(request.database, request.operation_id)
+    except CaptureError as error:
+        return _artifact_failure(request, error.code)
+    if evidence.state == "scratch_cleanup_required":
+        return Result(
+            command=request.command,
+            ok=False,
+            status=Status.SCRATCH_CLEANUP_REQUIRED,
+            exit_code=EXIT_MANUAL_RECOVERY_REQUIRED,
+            target=request.database,
+            snapshot_id=evidence.snapshot_id,
+            operation_id=evidence.operation_id,
+            diagnostics=(
+                Diagnostic(
+                    "scratch_cleanup_required",
+                    (
+                        f"scratch remains on host {evidence.host}; path "
+                        f"{evidence.scratch_path}"
+                    )[:1024],
+                ),
+            ),
+        )
+    return Result(
+        command=request.command,
+        ok=True,
+        status=Status.ABORTED,
+        exit_code=0,
+        target=request.database,
+        snapshot_id=evidence.snapshot_id,
+        operation_id=evidence.operation_id,
+        diagnostics=(Diagnostic("aborted", "Registered preview scratch was removed."),),
+    )
+
+
+def _install_selection_result(request: CommandRequest) -> Result:
+    """Rehash exact review evidence before refusing U6-deferred installation.
+
+    Parameters: ``request`` selects a candidate/report pair. Returns a bounded
+    refusal after read-only evidence verification because active installation is
+    intentionally deferred to U6. Changed, foreign, or unapproved evidence is
+    refused before any mutation.
+    """
+    assert request.candidate_id is not None
+    try:
+        select_candidate(
+            request.database, request.candidate_id, request.approve_uncertain_report
+        )
+    except CaptureError as error:
+        return _artifact_failure(request, error.code)
+    return Result.failure(
+        command=request.command,
+        status=Status.PRECONDITION_REFUSED,
+        exit_code=EXIT_PRECONDITION_REFUSED,
+        diagnostic_code="bootstrap_unavailable",
+        diagnostic_message="installation is deferred",
+        target=request.database,
+    )
+
+
+def _artifact_failure(request: CommandRequest, code: str) -> Result:
+    """Map one retained-evidence refusal to a credential-free result object."""
+    return Result.failure(
+        command=request.command,
+        status=Status.PRECONDITION_REFUSED,
+        exit_code=EXIT_PRECONDITION_REFUSED,
+        diagnostic_code=code,
+        diagnostic_message=code,
+        target=request.database,
+        candidate_id=request.candidate_id,
+        operation_id=request.operation_id,
+    )
+
+
+def _status_actions(database: str, operation_id: str, state: str) -> tuple[str, ...]:
+    """Return valid bounded next actions for one read-only operation status."""
+    if state == "previewing":
+        return (
+            f"opencode-db cleanup abort --database {database} --operation {operation_id}",
+        )
+    return ()
+
+
+def _preview_actions(request: CommandRequest, outcome: object) -> tuple[str, ...]:
+    """Return exact bounded follow-up commands for one retained preview result.
+
+    Parameters: ``request`` supplies the explicit target and ``outcome`` is the
+    cleanup result. Returns no action for invalid candidates, one exact install
+    action for complete candidates, and a report-digest-bound install action for
+    uncertain candidates. The helper reads and writes no external state.
+    """
+    candidate_id = getattr(outcome, "candidate_id", None)
+    completeness = getattr(outcome, "completeness", None)
+    report_sha256 = getattr(outcome, "report_sha256", None)
+    if not isinstance(candidate_id, str):
+        return ()
+    base = (
+        f"opencode-db cleanup install --database {request.database} "
+        f"--candidate {candidate_id}"
+    )
+    if completeness == "complete":
+        return (base,)
+    if completeness == "uncertain" and isinstance(report_sha256, str):
+        return (f"{base} --approve-uncertain-report {report_sha256}",)
+    return ()
 
 
 def _option(options: dict[str, str | bool], name: str) -> str:

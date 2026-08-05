@@ -7,7 +7,9 @@ import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -176,7 +178,7 @@ class CliContractTests(unittest.TestCase):
     def test_preview_renders_the_actual_cleanup_class_not_capture_completion(
         self,
     ) -> None:
-        """Run real capture and cleanup while U5 domain preview remains unavailable."""
+        """Run real capture and cleanup while missing OpenCode domains stay unavailable."""
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             database = Path(directory) / "opencode.db"
             with sqlite3.connect(database) as connection:
@@ -189,9 +191,215 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, EXIT_DECISION_REQUIRED)
         self.assertEqual(payload["status"], Status.UNCERTAIN.value)
         self.assertEqual(payload["completeness"], "uncertain")
-        self.assertEqual(payload["preview"], None)
+        preview = payload["preview"]
+        assert isinstance(preview, dict)
+        self.assertEqual(preview["projects"], "unavailable")
+        self.assertEqual(preview["recent_sessions"], "unavailable")
         self.assertIsNotNone(payload["snapshot_id"])
         self.assertIsNotNone(payload["candidate_id"])
+        self.assertEqual(
+            payload["next_actions"],
+            [
+                "opencode-db cleanup install "
+                f"--database {database} --candidate {payload['candidate_id']} "
+                f"--approve-uncertain-report {payload['report_sha256']}"
+            ],
+        )
+
+    def test_preview_exposes_only_bounded_opencode_project_and_session_fields(
+        self,
+    ) -> None:
+        """Render four newest non-archived OpenCode sessions from a real candidate."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT)"
+                )
+                connection.execute(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                    "title TEXT NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO project VALUES (?, ?, ?)",
+                    [("project-1", str(Path(directory) / "missing-worktree"), "One")],
+                )
+                connection.executemany(
+                    "INSERT INTO session VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (f"session-{index}", "project-1", f"Title {index}", index, None)
+                        for index in range(6)
+                    ]
+                    + [("archived", "project-1", "Archived", 99, 1)],
+                )
+
+            exit_code, payload, stdout, stderr = self._run_json_details(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+            human_stderr = io.StringIO()
+            with redirect_stderr(human_stderr):
+                human_exit_code = cli.main(
+                    ["cleanup", "preview", "--database", str(database)]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["status"], Status.COMPLETE.value)
+        self.assertEqual(
+            payload["preview"],
+            {
+                "projects": [
+                    {
+                        "id": "project-1",
+                        "name": "One",
+                        "origin": "unknown",
+                        "worktree": str(Path(directory) / "missing-worktree"),
+                    }
+                ],
+                "recent_sessions": [
+                    {
+                        "id": f"session-{index}",
+                        "project_id": "project-1",
+                        "time_updated": index,
+                        "title": f"Title {index}",
+                    }
+                    for index in (5, 4, 3, 2)
+                ],
+                "table_issue_counts": {},
+                "database_issue_count": 0,
+            },
+        )
+        self.assertEqual(
+            payload["next_actions"],
+            [
+                f"opencode-db cleanup install --database {database} --candidate {payload['candidate_id']}"
+            ],
+        )
+        self.assertIn("project-1", stdout)
+        self.assertNotIn("Archived", stdout)
+        self.assertEqual(human_exit_code, 0)
+        self.assertIn("project: project-1 | One", human_stderr.getvalue())
+        self.assertIn(
+            "session: session-5 | Title 5 | project-1 | 5", human_stderr.getvalue()
+        )
+        self.assertNotIn("Archived", human_stderr.getvalue())
+
+    def test_preview_falls_back_without_archival_column_and_redacts_git_origin(
+        self,
+    ) -> None:
+        """Use compatible session shape and a real read-only credential-bearing Git remote."""
+        if shutil.which("git") is None:
+            self.skipTest("Git is unavailable on this test host")
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(worktree)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://user:token@example.test/org/repo?secret=1",
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            database = root / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT)"
+                )
+                connection.execute(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                    "title TEXT NOT NULL, time_updated INTEGER NOT NULL)"
+                )
+                connection.execute("CREATE TABLE message (secret TEXT)")
+                connection.execute(
+                    "INSERT INTO project VALUES ('p', ?, 'Project')", (str(worktree),)
+                )
+                connection.executemany(
+                    "INSERT INTO session VALUES (?, 'p', ?, ?)",
+                    [(f"s-{index}", f"Title {index}", index) for index in range(5)],
+                )
+                connection.execute(
+                    "INSERT INTO message VALUES ('prompt token=do-not-show')"
+                )
+
+            exit_code, payload, stdout, _ = self._run_json_details(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        preview = payload["preview"]
+        assert isinstance(preview, dict)
+        projects = preview["projects"]
+        assert isinstance(projects, list)
+        self.assertEqual(projects[0]["origin"], "https://example.test/org/repo")
+        self.assertEqual(
+            [item["id"] for item in preview["recent_sessions"]],
+            ["s-4", "s-3", "s-2", "s-1"],
+        )
+        self.assertNotIn("user:token", stdout)
+        self.assertNotIn("do-not-show", stdout)
+
+    def test_readable_invalid_candidate_keeps_bounded_foreign_key_summary(self) -> None:
+        """Expose grouped foreign-key counts without offering an install action."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+                connection.execute(
+                    "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))"
+                )
+                connection.execute("INSERT INTO child VALUES (1)")
+
+            exit_code, payload = self._run_json(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertEqual(payload["status"], Status.INVALID.value)
+        preview = payload["preview"]
+        assert isinstance(preview, dict)
+        self.assertEqual(preview["table_issue_counts"], {"child": 1})
+        self.assertEqual(payload["next_actions"], [])
+
+    def test_failed_global_integrity_uses_table_scoped_counts_without_messages(
+        self,
+    ) -> None:
+        """Count structured table and database failures without rendering SQLite text."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE checked (value INTEGER CHECK (value > 0))"
+                )
+                connection.execute("PRAGMA ignore_check_constraints = ON")
+                connection.execute("INSERT INTO checked VALUES (-1)")
+
+            exit_code, payload, stdout, _ = self._run_json_details(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        preview = payload["preview"]
+        assert isinstance(preview, dict)
+        self.assertGreaterEqual(preview["table_issue_counts"].get("checked", 0), 1)
+        self.assertGreaterEqual(preview["database_issue_count"], 1)
+        self.assertNotIn("CHECK constraint failed", stdout)
 
     def test_rejects_path_ids_prefixes_overlong_and_nonfinite_deadlines(self) -> None:
         """Reject ambiguous identifiers and malformed bounded option values before execution."""

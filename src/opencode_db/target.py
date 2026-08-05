@@ -120,6 +120,29 @@ def resolve_target(database: str) -> ResolvedTarget:
     )
 
 
+def resolve_recorded_target(database: str) -> ResolvedTarget:
+    """Resolve an absolute target identity without requiring its main file.
+
+    Parameters: ``database`` is the exact absolute path previously used for a
+    target catalog. Returns its canonical lexical identity and adjacent control
+    directory so status and recovery can work while installation has moved the
+    main file. Raises :class:`TargetError` for relative, in-memory, or malformed
+    paths. It creates nothing and never opens SQLite or source files.
+    """
+    if not database or database == ":memory:" or "\x00" in database:
+        raise TargetError("target_invalid")
+    supplied = Path(database)
+    if not supplied.is_absolute():
+        raise TargetError("target_invalid")
+    canonical = supplied.resolve(strict=False)
+    target_id = hashlib.sha256(os.fsencode(str(canonical))).hexdigest()[:32]
+    return ResolvedTarget(
+        path=canonical,
+        target_id=target_id,
+        control_dir=canonical.parent / ".opencode-db" / target_id,
+    )
+
+
 def admit_scratch(
     scratch_dir: Path,
     required_bytes: int,

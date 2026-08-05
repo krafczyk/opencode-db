@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,9 +18,14 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db.artifacts import (
     CaptureError,
+    abort_preview_operation,
     capture_source_set,
     load_accepted_snapshot,
+    operation_status,
+    register_preview_scratch,
+    select_candidate,
 )
+from opencode_db.cleanup import clean_snapshot
 from opencode_db.model import SourceManifest
 from opencode_db.target import StorageSpace, TargetEnvironment
 
@@ -324,6 +331,157 @@ class ArtifactTests(unittest.TestCase):
 
             with self.assertRaises(CaptureError):
                 load_accepted_snapshot(renamed)
+
+    def test_candidate_selection_rehashes_exact_report_and_candidate_bytes(
+        self,
+    ) -> None:
+        """Reject candidate and report byte changes after one successful preview."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+            capture = capture_source_set(
+                str(database),
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert capture.snapshot_dir is not None
+            outcome = clean_snapshot(
+                capture.snapshot_dir,
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert outcome.candidate_id is not None
+            assert outcome.candidate_path is not None
+            assert outcome.report_path is not None
+
+            selected = select_candidate(str(database), outcome.candidate_id)
+            self.assertEqual(selected.report_sha256, outcome.report_sha256)
+
+            original_candidate = outcome.candidate_path.read_bytes()
+            outcome.candidate_path.write_bytes(original_candidate + b"changed")
+            with self.assertRaisesRegex(CaptureError, "candidate_changed"):
+                select_candidate(str(database), outcome.candidate_id)
+            outcome.candidate_path.write_bytes(original_candidate)
+
+            report = json.loads(outcome.report_path.read_text())
+            report["schema_version"] = 2
+            outcome.report_path.write_text(json.dumps(report, sort_keys=True) + "\n")
+            with self.assertRaisesRegex(CaptureError, "report_changed"):
+                select_candidate(str(database), outcome.candidate_id)
+
+    def test_byte_identical_candidate_and_operation_ids_are_not_cross_target_authority(
+        self,
+    ) -> None:
+        """Refuse candidate, status, and abort selection through another target catalog."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            first = root / "first.db"
+            second = root / "second.db"
+            with sqlite3.connect(first) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+            shutil.copyfile(first, second)
+            first_capture = capture_source_set(
+                str(first),
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert first_capture.snapshot_dir is not None
+            first_outcome = clean_snapshot(
+                first_capture.snapshot_dir,
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert first_outcome.candidate_id is not None
+
+            with self.assertRaisesRegex(CaptureError, "candidate_changed"):
+                select_candidate(str(second), first_outcome.candidate_id)
+            assert first_capture.operation_id is not None
+            with self.assertRaisesRegex(CaptureError, "candidate_changed"):
+                operation_status(str(second), first_capture.operation_id)
+            with self.assertRaisesRegex(CaptureError, "candidate_changed"):
+                abort_preview_operation(str(second), first_capture.operation_id)
+
+    def test_abrupt_preview_scratch_has_exact_read_only_status_and_same_host_abort(
+        self,
+    ) -> None:
+        """Recover only a subprocess-abandoned scratch registered before creation."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            database.write_bytes(b"main")
+            capture = capture_source_set(
+                str(database),
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert capture.snapshot_dir is not None
+            snapshot = load_accepted_snapshot(capture.snapshot_dir)
+            scratch = root / "scratch" / snapshot.operation_id
+            script = """
+import os
+import sys
+from pathlib import Path
+from opencode_db.artifacts import bind_preview_scratch, load_accepted_snapshot, register_preview_scratch
+
+snapshot = load_accepted_snapshot(Path(sys.argv[1]))
+scratch = Path(sys.argv[2]) / snapshot.operation_id
+scratch.parent.mkdir()
+register_preview_scratch(snapshot, scratch)
+scratch.mkdir(mode=0o700)
+os.chmod(scratch, 0o700)
+bind_preview_scratch(snapshot, scratch)
+os._exit(0)
+"""
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(capture.snapshot_dir),
+                    str(root / "scratch"),
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+                },
+            )
+
+            status = operation_status(str(database), snapshot.operation_id)
+            self.assertEqual(status.scratch_path, str(scratch))
+            self.assertEqual(status.state, "previewing")
+
+            aborted = abort_preview_operation(str(database), snapshot.operation_id)
+            self.assertEqual(aborted.state, "aborted")
+            self.assertFalse(scratch.exists())
+
+    def test_abort_refuses_unmarked_catalog_directed_directory(self) -> None:
+        """Never recursively delete a directory lacking exact tool-owned evidence."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            database.write_bytes(b"main")
+            capture = capture_source_set(
+                str(database),
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            assert capture.snapshot_dir is not None
+            snapshot = load_accepted_snapshot(capture.snapshot_dir)
+            scratch = root / snapshot.operation_id
+            scratch.mkdir(mode=0o700)
+            protected = scratch / "protected"
+            protected.write_text("keep")
+            register_preview_scratch(snapshot, scratch)
+
+            with self.assertRaises(CaptureError):
+                abort_preview_operation(str(database), snapshot.operation_id)
+            self.assertEqual(protected.read_text(), "keep")
 
     @staticmethod
     def _mountinfo(root: Path) -> str:
