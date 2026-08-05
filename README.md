@@ -2,8 +2,9 @@
 
 `opencode-db` is a standalone Linux command-line tool for making a validated,
 sidecar-free SQLite candidate from an explicit OpenCode database. It is owned
-by this repository; installing or running it does not modify OpenCode, MkChad,
-or container tooling.
+by this repository; standalone installation and ordinary use do not modify
+OpenCode, MkChad, or container tooling. MkChad deployment can additionally
+install the same tool through the child-owned action described below.
 
 The tool is an operator-run recovery aid for the supported normal SQLite WAL
 path. It is not an OpenCode integration, a service manager, or a general SQLite
@@ -28,7 +29,7 @@ scratch storage, unknown retained schemas, and candidates that cannot validate
 are refused. The tool never creates an empty, in-memory, or replacement
 database as a fallback.
 
-## Install
+## Standalone install
 
 Build a committed local wheel from a temporary source tree without contacting a
 package index, then install that wheel into an isolated environment:
@@ -47,6 +48,31 @@ python3 -m venv /tmp/opencode-db-v1/venv
 The `--no-isolation` build assumes the local build backend is already
 provisioned. Building from the temporary archive keeps setuptools intermediates
 out of the source checkout. The package is not published by this repository.
+
+## MkChad-managed deploy install
+
+The standalone wheel and virtual-environment installation above remains fully
+supported for independent use. MkChad release and developer deployment may
+additionally invoke the child-owned action from its pinned checkout. It installs an
+exact launcher at `~/.local/bin/opencode-db` without building a wheel, contacting
+a package index, or adding runtime dependencies:
+
+```bash
+COMPONENT="${XDG_DATA_HOME:-$HOME/.local/share}/mkchad/components/opencode-db"
+RECOVERY_DIR=/private/caller-created/recovery-directory
+"$COMPONENT/bin/install_opencode_db.sh" --check --recovery-dir "$RECOVERY_DIR"
+"$COMPONENT/bin/install_opencode_db.sh" --recovery-dir "$RECOVERY_DIR"
+"$COMPONENT/bin/install_opencode_db.sh" --check
+```
+
+The preflight form is read-only and validates Python 3.11+, the pinned source,
+target safety, and replacement eligibility. The apply form requires a mode-0700
+private recovery directory; if it replaces a noncompliant regular launcher, it
+retains that file as `opencode-db` in that directory. The final check compares
+the installed launcher byte-for-byte with the pinned launcher and runs only
+`opencode-db --help` under a short timeout. At runtime the launcher derives the
+pinned checkout from `XDG_DATA_HOME`, sets `PYTHONPATH` to only that checkout's
+`src`, and executes `python3 -m opencode_db` with unchanged arguments.
 
 ## Operator workflow
 
