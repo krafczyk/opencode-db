@@ -7,6 +7,7 @@ import json
 import os
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db import cli
 from opencode_db.model import (
-    EXIT_PRECONDITION_REFUSED,
+    EXIT_OPERATIONAL_FAILURE,
+    EXIT_DECISION_REQUIRED,
     EXIT_USAGE,
     RESULT_SCHEMA_VERSION,
     Result,
@@ -166,10 +168,30 @@ class CliContractTests(unittest.TestCase):
             finally:
                 sys.stdin = original_stdin
 
-        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-        self.assertEqual(payload["status"], Status.PRECONDITION_REFUSED.value)
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertEqual(payload["status"], Status.INVALID.value)
         self.assertNotIn("confirm", stdout.lower())
         self.assertNotIn("confirm", stderr.lower())
+
+    def test_preview_renders_the_actual_cleanup_class_not_capture_completion(
+        self,
+    ) -> None:
+        """Run real capture and cleanup while U5 domain preview remains unavailable."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+            Path(f"{database}-shm").write_bytes(b"stale shared memory")
+            exit_code, payload = self._run_json(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+
+        self.assertEqual(exit_code, EXIT_DECISION_REQUIRED)
+        self.assertEqual(payload["status"], Status.UNCERTAIN.value)
+        self.assertEqual(payload["completeness"], "uncertain")
+        self.assertEqual(payload["preview"], None)
+        self.assertIsNotNone(payload["snapshot_id"])
+        self.assertIsNotNone(payload["candidate_id"])
 
     def test_rejects_path_ids_prefixes_overlong_and_nonfinite_deadlines(self) -> None:
         """Reject ambiguous identifiers and malformed bounded option values before execution."""

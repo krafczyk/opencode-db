@@ -262,6 +262,47 @@ class CaptureOutcome:
 
 
 @dataclass(frozen=True)
+class AcceptedSnapshot:
+    """Identify one revalidated accepted retained source snapshot.
+
+    Parameters bind a private ``snapshot_dir`` to its captured manifest and
+    target-scoped identifiers. Artifact readers return this type only after
+    checking every manifest and retained source digest. Constructing it has no
+    filesystem effects; consuming SQLite must still occur only on a scratch
+    copy.
+    """
+
+    snapshot_dir: Path
+    snapshot_id: str
+    operation_id: str
+    manifest: SourceManifest
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    """Describe the result of creating and validating one SQLite candidate.
+
+    Parameters identify the source snapshot, resulting ``completeness`` class,
+    required validation gates, and immutable retained candidate/report paths
+    when the candidate is installable. ``candidate_path`` and ``report_path``
+    remain ``None`` for invalid or operational outcomes. This value does not
+    itself write files or authorize installation.
+    """
+
+    snapshot_id: str
+    target: str
+    status: str
+    completeness: str
+    validation: Validation
+    installable: bool
+    candidate_id: str | None = None
+    candidate_path: Path | None = None
+    report_path: Path | None = None
+    report_sha256: str | None = None
+    diagnostic_code: str | None = None
+
+
+@dataclass(frozen=True)
 class Result:
     """Represent one complete closed schema-version-1 command result.
 
@@ -347,6 +388,11 @@ class Result:
             "scratch_invalid": "Scratch storage must be an absolute filesystem path.",
             "deadline_exceeded": "The operation deadline expired before capture completed.",
             "copy_failed": "Source capture could not complete safely.",
+            "snapshot_invalid": "The retained source snapshot is not accepted or has changed.",
+            "cleanup_invalid": "Normal SQLite recovery could not produce a valid candidate.",
+            "checkpoint_incomplete": "SQLite could not complete the required checkpoint.",
+            "backup_failed": "SQLite backup could not complete safely.",
+            "candidate_persist_failed": "The validated candidate could not be retained safely.",
             "unexpected_error": "An unexpected internal error occurred.",
         }
         return cls(

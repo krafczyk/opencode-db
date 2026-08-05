@@ -1,8 +1,8 @@
 """Parse and render the closed OpenCode database cleanup command contract.
 
-The module freezes the version-1 grammar and result encoding. It does not open
-SQLite, inspect processes, read stdin, create databases, or mutate artifacts;
-those explicit operations belong to later implementation units.
+The module freezes the version-1 grammar and result encoding. Preview composes
+immutable capture with normal SQLite cleanup; it never inspects processes,
+reads stdin, or opens an active or retained database through SQLite.
 """
 
 from __future__ import annotations
@@ -12,12 +12,18 @@ import math
 import os
 import re
 import sys
+import time
 from collections.abc import Sequence
 
+from .artifacts import capture_source_set
+from .cleanup import clean_snapshot
 from .model import (
+    EXIT_DECISION_REQUIRED,
+    EXIT_OPERATIONAL_FAILURE,
     EXIT_PRECONDITION_REFUSED,
     EXIT_USAGE,
     CommandRequest,
+    Diagnostic,
     Result,
     Status,
 )
@@ -182,9 +188,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     Parameters: ``arguments`` optionally replaces ``sys.argv[1:]``. Returns the
     documented exit class. Machine-mode parse errors emit one JSON result on
-    stdout and no diagnostics there; valid commands safely refuse execution
-    until later units implement target and artifact operations. The function
-    does not prompt, read stdin, open SQLite, create databases, or mutate files.
+    stdout and no diagnostics there. ``cleanup preview`` captures an explicit
+    target and cleans only a fresh scratch copy; other commands safely refuse
+    execution until later units implement their artifact operations. The
+    function does not prompt or read stdin.
     """
     values = list(sys.argv[1:] if arguments is None else arguments)
     if _wants_help(values):
@@ -207,19 +214,110 @@ def main(arguments: Sequence[str] | None = None) -> int:
             sys.stderr.write(render_human(result))
         return EXIT_USAGE
 
-    result = Result.failure(
-        command=request.command,
-        status=Status.PRECONDITION_REFUSED,
-        exit_code=EXIT_PRECONDITION_REFUSED,
-        diagnostic_code="bootstrap_unavailable",
-        diagnostic_message="execution is deferred",
-        target=request.database,
-    )
+    result = _execute(request)
     if request.json:
         sys.stdout.write(render_json(result))
     else:
         sys.stderr.write(render_human(result))
     return result.exit_code
+
+
+def _execute(request: CommandRequest) -> Result:
+    """Execute the implemented preview flow or refuse deferred commands.
+
+    Parameters: ``request`` is grammar-validated operator input. Returns one
+    closed :class:`Result`, including actual cleanup classification for preview.
+    Capture and SQLite cleanup write only private artifacts and scratch copies;
+    all non-preview commands remain non-mutating precondition refusals.
+    """
+    if request.command != "cleanup preview":
+        return Result.failure(
+            command=request.command,
+            status=Status.PRECONDITION_REFUSED,
+            exit_code=EXIT_PRECONDITION_REFUSED,
+            diagnostic_code="bootstrap_unavailable",
+            diagnostic_message="execution is deferred",
+            target=request.database,
+        )
+    deadline = request.deadline_seconds or DEFAULT_DEADLINE_SECONDS
+    started = time.monotonic()
+    capture = capture_source_set(
+        request.database,
+        scratch_dir=request.scratch_dir,
+        deadline_seconds=deadline,
+    )
+    if not capture.accepted or capture.snapshot_dir is None:
+        if capture.status == "source_changed":
+            status = Status.SOURCE_CHANGED
+            exit_code = EXIT_PRECONDITION_REFUSED
+        elif capture.status == "target_invalid":
+            status = Status.TARGET_INVALID
+            exit_code = EXIT_PRECONDITION_REFUSED
+        elif capture.status in {
+            "unsupported_journal",
+            "storage_capacity",
+            "scratch_not_local",
+            "scratch_not_private",
+            "scratch_capacity",
+            "artifact_not_private",
+            "artifact_schema_unsupported",
+            "scratch_invalid",
+        }:
+            status = Status.PRECONDITION_REFUSED
+            exit_code = EXIT_PRECONDITION_REFUSED
+        else:
+            status = Status.OPERATIONAL_FAILURE
+            exit_code = EXIT_OPERATIONAL_FAILURE
+        return Result.failure(
+            command=request.command,
+            status=status,
+            exit_code=exit_code,
+            diagnostic_code=capture.status,
+            diagnostic_message=capture.status,
+            target=capture.target or request.database,
+            snapshot_id=capture.snapshot_id,
+            operation_id=capture.operation_id,
+        )
+    scratch = request.scratch_dir or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "opencode-db"
+    )
+    remaining = max(0, deadline - math.ceil(time.monotonic() - started))
+    outcome = clean_snapshot(
+        capture.snapshot_dir,
+        scratch_dir=scratch,
+        deadline_seconds=remaining,
+    )
+    status = Status(outcome.status)
+    exit_code = (
+        0
+        if outcome.completeness == "complete"
+        else EXIT_DECISION_REQUIRED
+        if outcome.completeness == "uncertain"
+        else EXIT_OPERATIONAL_FAILURE
+    )
+    diagnostics: tuple[Diagnostic, ...] = ()
+    if outcome.diagnostic_code is not None:
+        diagnostics = Result.failure(
+            command=request.command,
+            status=Status.INVALID,
+            exit_code=EXIT_OPERATIONAL_FAILURE,
+            diagnostic_code=outcome.diagnostic_code,
+            diagnostic_message=outcome.diagnostic_code,
+        ).diagnostics
+    return Result(
+        command=request.command,
+        ok=outcome.completeness == "complete",
+        status=status,
+        exit_code=exit_code,
+        target=outcome.target,
+        snapshot_id=outcome.snapshot_id,
+        candidate_id=outcome.candidate_id,
+        report_sha256=outcome.report_sha256,
+        completeness=outcome.completeness,
+        validation=outcome.validation,
+        preview=None,
+        diagnostics=diagnostics,
+    )
 
 
 def _option(options: dict[str, str | bool], name: str) -> str:

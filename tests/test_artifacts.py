@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -13,7 +14,11 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from opencode_db.artifacts import capture_source_set
+from opencode_db.artifacts import (
+    CaptureError,
+    capture_source_set,
+    load_accepted_snapshot,
+)
 from opencode_db.model import SourceManifest
 from opencode_db.target import StorageSpace, TargetEnvironment
 
@@ -300,6 +305,25 @@ class ArtifactTests(unittest.TestCase):
         boolean_schema["schema_version"] = True
         with self.assertRaises(ValueError):
             SourceManifest.from_dict(boolean_schema)
+
+    def test_accepted_snapshot_is_bound_to_its_target_scoped_directory(self) -> None:
+        """Reject copied manifests outside their exact retained snapshot location."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            database.write_bytes(b"main")
+            capture = capture_source_set(
+                str(database),
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+            snapshot_dir = capture.snapshot_dir
+            assert snapshot_dir is not None
+            renamed = snapshot_dir.parent / "snapshot-wrong-location"
+            shutil.copytree(snapshot_dir, renamed)
+
+            with self.assertRaises(CaptureError):
+                load_accepted_snapshot(renamed)
 
     @staticmethod
     def _mountinfo(root: Path) -> str:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import ParamSpec, TypeVar
 
 from . import __version__
-from .model import CaptureOutcome, SourceFile, SourceManifest
+from .model import AcceptedSnapshot, CaptureOutcome, SourceFile, SourceManifest
 from .target import (
     TargetEnvironment,
     TargetError,
@@ -111,8 +112,8 @@ def capture_source_set(
             str(target.path), target.target_id, None, None, False, error.code
         )
 
-    snapshot_id = _new_id("snapshot")
-    operation_id = _new_id("operation")
+    snapshot_id = new_artifact_id("snapshot")
+    operation_id = new_artifact_id("operation")
     snapshot_dir: Path | None = None
     try:
         snapshot_dir = _create_snapshot_directory(target.control_dir, snapshot_id)
@@ -226,6 +227,205 @@ def capture_source_set(
             reason,
             snapshot_dir,
         )
+
+
+def load_accepted_snapshot(
+    snapshot_dir: Path,
+    *,
+    started: float | None = None,
+    deadline_seconds: int = 1_800,
+) -> AcceptedSnapshot:
+    """Load and rehash one accepted snapshot without opening SQLite.
+
+    Parameters: ``snapshot_dir`` is the exact private retained snapshot
+    directory. Returns an :class:`AcceptedSnapshot` only when its closed
+    manifest is accepted, its path matches its target-scoped IDs, all three
+    capture manifests agree, and every retained source file has its recorded
+    digest. ``started`` and ``deadline_seconds`` optionally preserve a caller's
+    finite operation budget. Raises :class:`CaptureError` for a changed,
+    malformed, non-private, misplaced, expired, or diagnostic-only snapshot.
+    The function uses read-only ordinary file I/O and never modifies retained
+    evidence.
+    """
+    operation_started = time.monotonic() if started is None else started
+    try:
+        if (
+            snapshot_dir.is_symlink()
+            or not snapshot_dir.is_dir()
+            or snapshot_dir.stat().st_mode & 0o777 != 0o700
+        ):
+            raise CaptureError("snapshot_invalid")
+        manifest_path = snapshot_dir / "manifest.json"
+        if manifest_path.is_symlink() or manifest_path.stat().st_mode & 0o777 != 0o600:
+            raise CaptureError("snapshot_invalid")
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CaptureError("snapshot_invalid") from error
+    required = {
+        "schema_version",
+        "tool_version",
+        "target",
+        "target_id",
+        "snapshot_id",
+        "operation_id",
+        "state",
+        "reason",
+        "pre_copy_manifest",
+        "copied_manifest",
+        "post_copy_manifest",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise CaptureError("snapshot_invalid")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != MANIFEST_SCHEMA_VERSION
+        or value["state"] != "accepted"
+        or value["reason"] is not None
+        or not all(
+            isinstance(value[name], str)
+            for name in (
+                "tool_version",
+                "target",
+                "target_id",
+                "snapshot_id",
+                "operation_id",
+            )
+        )
+    ):
+        raise CaptureError("snapshot_invalid")
+    if (
+        snapshot_dir.name != value["snapshot_id"]
+        or snapshot_dir.parent.name != "snapshots"
+        or snapshot_dir.parent.parent.name != value["target_id"]
+        or snapshot_dir.parent.parent.parent.name != ".opencode-db"
+    ):
+        raise CaptureError("snapshot_invalid")
+    try:
+        manifests = tuple(
+            SourceManifest.from_dict(value[name])
+            for name in ("pre_copy_manifest", "copied_manifest", "post_copy_manifest")
+        )
+    except ValueError as error:
+        raise CaptureError("snapshot_invalid") from error
+    manifest = manifests[0]
+    if (
+        manifests[1:] != (manifest, manifest)
+        or manifest.target != value["target"]
+        or manifest.target_id != value["target_id"]
+        or hashlib.sha256(os.fsencode(manifest.target)).hexdigest()[:32]
+        != manifest.target_id
+        or re.fullmatch(r"snapshot-\d{8}T\d{6}Z-[0-9a-f]{24}", value["snapshot_id"])
+        is None
+        or re.fullmatch(r"operation-\d{8}T\d{6}Z-[0-9a-f]{24}", value["operation_id"])
+        is None
+    ):
+        raise CaptureError("snapshot_invalid")
+    for source_file in manifest.files:
+        path = _snapshot_source_path(snapshot_dir, manifest, source_file.name)
+        if source_file.present:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_mode & 0o777 != 0o600
+            ):
+                raise CaptureError("snapshot_invalid")
+            try:
+                size, digest = _hash_file(
+                    path,
+                    operation_started,
+                    deadline_seconds,
+                )
+            except CaptureError as error:
+                raise CaptureError("snapshot_invalid") from error
+            if size != source_file.size or digest != source_file.sha256:
+                raise CaptureError("snapshot_invalid")
+        elif path.exists() or path.is_symlink():
+            raise CaptureError("snapshot_invalid")
+    return AcceptedSnapshot(
+        snapshot_dir=snapshot_dir,
+        snapshot_id=value["snapshot_id"],
+        operation_id=value["operation_id"],
+        manifest=manifest,
+    )
+
+
+def snapshot_source_path(
+    snapshot_dir: Path, manifest: SourceManifest, source_name: str
+) -> Path:
+    """Return the retained filename for one named source file without opening it.
+
+    Parameters: ``snapshot_dir`` is a retained group, ``manifest`` supplies the
+    original main basename, and ``source_name`` is one supported logical source
+    name. Returns the captured filename. Raises :class:`CaptureError` for an
+    unsupported name. The function has no filesystem side effects.
+    """
+    return _snapshot_source_path(snapshot_dir, manifest, source_name)
+
+
+def _snapshot_source_path(
+    snapshot_dir: Path, manifest: SourceManifest, source_name: str
+) -> Path:
+    """Map one fixed logical source name to capture's preserved basename."""
+    main = Path(manifest.target).name
+    suffix = {"main": "", "wal": "-wal", "shm": "-shm", "journal": "-journal"}.get(
+        source_name
+    )
+    if suffix is None:
+        raise CaptureError("snapshot_invalid")
+    return snapshot_dir / f"{main}{suffix}"
+
+
+@_private_umask
+def persist_candidate(
+    snapshot: AcceptedSnapshot,
+    candidate: Path,
+    candidate_id: str,
+    report: dict[str, object],
+    *,
+    started: float,
+    deadline_seconds: int,
+) -> tuple[Path, Path, str]:
+    """Persist one closed, validated candidate and immutable report privately.
+
+    Parameters: ``snapshot`` is a freshly revalidated accepted source,
+    ``candidate`` is a closed scratch database, ``candidate_id`` is its opaque
+    identifier, and ``report`` is a canonical safe report mapping. ``started``
+    and ``deadline_seconds`` preserve the caller's finite operation budget.
+    Returns the retained candidate path, report path, and report SHA-256 digest.
+    Raises :class:`CaptureError` if source revalidation, private writes, digest
+    verification, or the deadline fails. It writes only inside the bound
+    snapshot directory and never writable-opens any retained input.
+    """
+    snapshot = load_accepted_snapshot(
+        snapshot.snapshot_dir, started=started, deadline_seconds=deadline_seconds
+    )
+    if not re.fullmatch(r"candidate-[A-Za-z0-9-]{1,80}", candidate_id):
+        raise CaptureError("candidate_persist_failed")
+    if candidate.is_symlink() or not candidate.is_file():
+        raise CaptureError("candidate_persist_failed")
+    expected_size, expected_digest = _hash_file(candidate, started, deadline_seconds)
+    destination = snapshot.snapshot_dir / f"{candidate_id}.sqlite"
+    report_path = snapshot.snapshot_dir / f"{candidate_id}.report.json"
+    if destination.exists() or report_path.exists():
+        raise CaptureError("candidate_persist_failed")
+    try:
+        _copy_file(candidate, destination, started, deadline_seconds, None)
+        size, digest = _hash_file(destination, started, deadline_seconds)
+        if (size, digest) != (expected_size, expected_digest):
+            raise CaptureError("candidate_persist_failed")
+        value = dict(report)
+        value["candidate_id"] = candidate_id
+        value["candidate_sha256"] = digest
+        value["candidate_size"] = size
+        _write_json(report_path, value)
+        _, report_digest = _hash_file(report_path, started, deadline_seconds)
+    except (CaptureError, OSError) as error:
+        destination.unlink(missing_ok=True)
+        report_path.unlink(missing_ok=True)
+        if isinstance(error, CaptureError):
+            raise
+        raise CaptureError("candidate_persist_failed") from error
+    return destination, report_path, report_digest
 
 
 def _preflight(
@@ -540,8 +740,15 @@ def _has_journal(manifest: SourceManifest) -> bool:
     return manifest.files[-1].present
 
 
-def _new_id(prefix: str) -> str:
-    """Return a UTC-sortable, random, target-scoped-by-location artifact ID."""
+def new_artifact_id(prefix: str) -> str:
+    """Return a UTC-sortable random ID for an artifact bound by catalog path.
+
+    Parameters: ``prefix`` is a trusted lowercase artifact kind. Returns a
+    timestamp-plus-random identifier. Raises :class:`ValueError` for an invalid
+    prefix and has no filesystem or database side effects.
+    """
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,31}", prefix) is None:
+        raise ValueError("invalid artifact ID prefix")
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{prefix}-{timestamp}-{secrets.token_hex(12)}"
 
