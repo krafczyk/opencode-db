@@ -103,6 +103,15 @@ validate_output() {
   [[ $uid == "$EUID" ]] || die "foreign-owned output is unsafe: $target"
 }
 
+validate_existing_backup() {
+  local backup="$recovery_dir/opencode-db" mode uid
+  [[ ! -L $backup && -f $backup ]] || die "unsafe existing recovery asset: $backup"
+  uid=$(stat -Lc '%u' -- "$backup") || die "cannot inspect recovery asset: $backup"
+  mode=$(stat -Lc '%a' -- "$backup") || die "cannot inspect recovery asset mode: $backup"
+  [[ $uid == "$EUID" && $mode == 600 ]] || die "unsafe existing recovery asset: $backup"
+  cmp -s -- "$target" "$backup" || die "existing recovery asset differs from output: $backup"
+}
+
 output_is_compliant() {
   local mode
   validate_output
@@ -127,15 +136,19 @@ preflight_install() {
   validate_output
   validate_recovery_dir
   if [[ -f $target ]] && ! output_is_compliant; then
-    [[ ! -e $recovery_dir/opencode-db && ! -L $recovery_dir/opencode-db ]] \
-      || die "recovery asset already exists: $recovery_dir/opencode-db"
+    if [[ -e $recovery_dir/opencode-db || -L $recovery_dir/opencode-db ]]; then
+      validate_existing_backup
+    fi
   fi
 }
 
 backup_output() {
   local backup="$recovery_dir/opencode-db"
   [[ -f $target ]] || return 0
-  [[ ! -e $backup && ! -L $backup ]] || die "recovery asset already exists: $backup"
+  if [[ -e $backup || -L $backup ]]; then
+    validate_existing_backup
+    return
+  fi
   recovery_stage=$(mktemp "$recovery_dir/.opencode-db.XXXXXX")
   cp -- "$target" "$recovery_stage"
   chmod 600 -- "$recovery_stage"
@@ -179,7 +192,7 @@ verify_installed() {
   [[ $mode == 755 ]] || die "installed launcher must have mode 0755: $target"
   cmp -s -- "$source_launcher" "$target" || die "installed launcher differs from source"
   command -v timeout >/dev/null 2>&1 || die "timeout is unavailable for launcher verification"
-  timeout --foreground 10 "$target" --help >/dev/null \
+  timeout --foreground --kill-after=2 10 "$target" --help >/dev/null \
     || die "installed launcher --help verification failed"
 }
 
