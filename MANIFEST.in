@@ -1,0 +1,3 @@
+include docs/protocol.md
+include tests/private_acceptance.py
+include tests/sqlite_fixtures.py

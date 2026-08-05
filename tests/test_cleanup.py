@@ -15,7 +15,7 @@ from opencode_db.artifacts import capture_source_set
 from opencode_db.cleanup import CleanupHooks, clean_snapshot
 from opencode_db.target import StorageSpace, TargetEnvironment
 
-from sqlite_fixtures import create_abrupt_wal_database
+from sqlite_fixtures import create_abrupt_wal_database, create_generated_wal_fixtures
 
 
 class CleanupTests(unittest.TestCase):
@@ -84,6 +84,30 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(
                     candidate.execute("SELECT value FROM entries").fetchall(), []
                 )
+
+    def test_generated_wal_fixture_set_preserves_both_real_writer_states(self) -> None:
+        """Generate default-suite WAL cases without shipping a database fixture."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            fixtures = create_generated_wal_fixtures(root)
+
+            self.assertEqual(set(fixtures), {"committed", "uncommitted"})
+            expected_rows = {
+                "committed": [("committed-value",)],
+                "uncommitted": [],
+            }
+            for state, database in fixtures.items():
+                self.assertTrue(database.is_file())
+                self.assertTrue(Path(f"{database}-wal").is_file())
+                self.assertTrue(Path(f"{database}-shm").is_file())
+                outcome = self._capture_and_clean(database, root)
+                self.assertTrue(outcome.installable)
+                assert outcome.candidate_path is not None
+                with sqlite3.connect(outcome.candidate_path) as candidate:
+                    self.assertEqual(
+                        candidate.execute("SELECT value FROM entries").fetchall(),
+                        expected_rows[state],
+                    )
 
     def test_clean_main_and_incomplete_wal_evidence_have_distinct_classes(self) -> None:
         """Classify only contradictory captured sidecar evidence as uncertain."""

@@ -6,10 +6,24 @@ build-backend = "setuptools.build_meta"
 name = "opencode-db"
 version = "0.1.0"
 description = "Explicit OpenCode SQLite cleanup contract"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "opencode-db contributors" }]
 dependencies = []
+keywords = ["opencode", "sqlite", "recovery", "wal"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Database",
+]
+
+[project.urls]
+Documentation = "https://github.com/krafczyk/opencode-db#readme"
 
 [project.scripts]
 opencode-db = "opencode_db.cli:main"
@@ -19,6 +33,7 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["opencode_db*"]
 
 [tool.unittest]
 start-directory = "tests"

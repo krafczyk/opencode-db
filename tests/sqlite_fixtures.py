@@ -11,6 +11,21 @@ import subprocess
 import sys
 
 
+def create_generated_wal_fixtures(directory: Path) -> dict[str, Path]:
+    """Create deterministic committed and uncommitted abrupt-WAL fixtures.
+
+    Parameters: ``directory`` is a caller-owned disposable directory. Returns
+    paths keyed by ``committed`` and ``uncommitted`` after writers have exited
+    without closing SQLite. Raises :class:`subprocess.CalledProcessError` when
+    fixture creation fails. The helper never reads an operator database.
+    """
+    committed = directory / "committed.db"
+    uncommitted = directory / "uncommitted.db"
+    create_abrupt_wal_database(committed, committed=True)
+    create_abrupt_wal_database(uncommitted, committed=False)
+    return {"committed": committed, "uncommitted": uncommitted}
+
+
 def create_abrupt_wal_database(path: Path, *, committed: bool) -> None:
     """Create a WAL database whose writer exits without closing.
 

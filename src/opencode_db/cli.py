@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import time
 from collections.abc import Sequence
@@ -453,8 +454,7 @@ def _abort_result(request: CommandRequest) -> Result:
                 Diagnostic(
                     "scratch_cleanup_required",
                     (
-                        f"scratch remains on host {evidence.host}; path "
-                        f"{evidence.scratch_path}"
+                        f"scratch remains on host {evidence.host}; path {evidence.scratch_path}"
                     )[:1024],
                 ),
             ),
@@ -600,14 +600,16 @@ def _install_actions(
     database: str, operation_id: object, state: object
 ) -> tuple[str, ...]:
     """Return exact recovery actions only for an incomplete persisted install."""
-    if not isinstance(operation_id, str) or state not in {
-        "install_incomplete",
-        "rolling_back",
-    }:
+    if (
+        not isinstance(operation_id, str)
+        or operation_id == "unknown"
+        or state not in {"install_incomplete", "rolling_back"}
+    ):
         return ()
+    target = shlex.quote(database)
     return (
-        f"opencode-db cleanup resume --database {database} --operation {operation_id}",
-        f"opencode-db cleanup rollback --database {database} --operation {operation_id}",
+        f"opencode-db cleanup resume --database {target} --operation {operation_id}",
+        f"opencode-db cleanup rollback --database {target} --operation {operation_id}",
     )
 
 
@@ -630,7 +632,8 @@ def _status_actions(database: str, operation_id: str, state: str) -> tuple[str, 
     """Return valid bounded next actions for one read-only operation status."""
     if state == "previewing":
         return (
-            f"opencode-db cleanup abort --database {database} --operation {operation_id}",
+            "opencode-db cleanup abort "
+            f"--database {shlex.quote(database)} --operation {operation_id}",
         )
     return ()
 
@@ -649,8 +652,8 @@ def _preview_actions(request: CommandRequest, outcome: object) -> tuple[str, ...
     if not isinstance(candidate_id, str):
         return ()
     base = (
-        f"opencode-db cleanup install --database {request.database} "
-        f"--candidate {candidate_id}"
+        "opencode-db cleanup install "
+        f"--database {shlex.quote(request.database)} --candidate {candidate_id}"
     )
     if completeness == "complete":
         return (base,)

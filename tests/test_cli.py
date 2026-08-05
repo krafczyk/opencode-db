@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import shutil
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -20,6 +22,7 @@ from opencode_db import cli
 from opencode_db.model import (
     EXIT_OPERATIONAL_FAILURE,
     EXIT_DECISION_REQUIRED,
+    EXIT_PRECONDITION_REFUSED,
     EXIT_USAGE,
     RESULT_SCHEMA_VERSION,
     Result,
@@ -108,6 +111,38 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result[0], EXIT_USAGE)
         self.assertEqual(result[1]["status"], Status.SYNTAX_ERROR.value)
 
+    def test_documentation_and_package_metadata_match_public_contract(self) -> None:
+        """Keep install metadata and operator docs aligned with actual command names."""
+        root = Path(__file__).parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        protocol = (root / "docs" / "protocol.md").read_text(encoding="utf-8")
+        metadata = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        normalized_readme = " ".join(readme.split())
+        normalized_protocol = " ".join(protocol.split())
+
+        project = metadata["project"]
+        self.assertEqual(project["readme"], "README.md")
+        self.assertEqual(project["requires-python"], ">=3.11")
+        self.assertEqual(project["dependencies"], [])
+        self.assertEqual(
+            metadata["project"]["scripts"]["opencode-db"], "opencode_db.cli:main"
+        )
+        for text in (readme, protocol):
+            self.assertIn("prune-backup", text)
+            self.assertIn("`cleanup prune`", text)
+            self.assertIn("absolute", text)
+            self.assertIn("OpenCode", text)
+        self.assertIn("Linux only", readme)
+        self.assertIn("do not prompt for confirmation", normalized_readme)
+        self.assertIn("never starts OpenCode", normalized_readme)
+        self.assertIn("complete", readme)
+        self.assertIn("uncertain", readme)
+        self.assertIn("invalid", readme)
+        self.assertIn("schema_version, command, ok", normalized_protocol)
+        self.assertIn("manual_recovery_required", normalized_protocol)
+        self.assertIn("destination paths", normalized_protocol)
+        self.assertIn("source manifest", normalized_protocol)
+
     def test_prune_backup_rejects_nonexact_snapshot_selectors_before_execution(
         self,
     ) -> None:
@@ -133,6 +168,55 @@ class CliContractTests(unittest.TestCase):
                 )
                 self.assertEqual(exit_code, EXIT_USAGE)
                 self.assertEqual(payload["status"], Status.SYNTAX_ERROR.value)
+
+    def test_private_acceptance_uses_only_explicit_copies_and_bounded_output(
+        self,
+    ) -> None:
+        """Keep the opt-in observed-case entry point credential-free by default."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "copied.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+                connection.execute("INSERT INTO entries VALUES ('value')")
+            source_bytes = database.read_bytes()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("private_acceptance.py")),
+                    "--database",
+                    str(database),
+                    "--work-directory",
+                    str(root / "private-work"),
+                    "--scratch-dir",
+                    str(root / "private-scratch"),
+                    "--expected-status",
+                    "complete",
+                    "--expect-candidate",
+                    "present",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(database.read_bytes(), source_bytes)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "observed_status",
+                "source_unchanged",
+                "candidate_present",
+                "outcome",
+            },
+        )
+        self.assertEqual(payload["outcome"], "matched")
+        self.assertTrue(payload["source_unchanged"])
 
     def test_prune_backup_reports_success_only_after_exact_group_removal(self) -> None:
         """Return backup_pruned without opening or changing active database bytes."""
@@ -289,6 +373,43 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(install_exit, 0)
         self.assertEqual(installed["status"], Status.INSTALLED.value)
         self.assertEqual(stderr, "")
+
+    def test_follow_up_actions_quote_targets_and_omit_unpersisted_recovery(
+        self,
+    ) -> None:
+        """Render pasteable paths and never invent an installation operation."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "database with spaces.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+
+            preview_exit, preview = self._run_json(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+            missing_exit, missing = self._run_json(
+                [
+                    "cleanup",
+                    "install",
+                    "--database",
+                    str(database),
+                    "--candidate",
+                    "candidate-20260805T000000Z-0123456789abcdef01234567",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(preview_exit, 0)
+        self.assertEqual(
+            preview["next_actions"],
+            [
+                "opencode-db cleanup install "
+                f"--database {shlex.quote(str(database))} "
+                f"--candidate {preview['candidate_id']}"
+            ],
+        )
+        self.assertEqual(missing_exit, EXIT_PRECONDITION_REFUSED)
+        self.assertIsNone(missing["operation_id"])
+        self.assertEqual(missing["next_actions"], [])
 
     def test_preview_exposes_only_bounded_opencode_project_and_session_fields(
         self,
