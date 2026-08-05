@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
+import re
 from typing import Any, ClassVar
 
-from . import RESULT_SCHEMA_VERSION
+from . import RESULT_SCHEMA_VERSION, __version__
 
 EXIT_SUCCESS = 0
 EXIT_USAGE = 2
@@ -120,6 +122,146 @@ class Diagnostic:
 
 
 @dataclass(frozen=True)
+class SourceFile:
+    """Record the observed content identity of one supported source file.
+
+    Parameters identify the fixed ``name`` (``main``, ``wal``, ``shm``, or
+    ``journal``), whether it was ``present``, and, when present, its exact
+    ``size`` and SHA-256 ``sha256`` digest. :meth:`to_dict` returns a canonical
+    JSON-ready representation. Construction and serialization have no
+    filesystem side effects.
+    """
+
+    name: str
+    present: bool
+    size: int | None
+    sha256: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the closed JSON representation without reading the source."""
+        return {
+            "name": self.name,
+            "present": self.present,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class SourceManifest:
+    """Bind an exact captured SQLite source set to one canonical target.
+
+    Parameters record the schema and tool versions, canonical ``target``,
+    opaque target-scoped ``target_id``, and all four standard ``files``. The
+    manifest is persisted by the artifact layer and can be read with
+    :meth:`from_dict`, which rejects unknown future shapes. It does not open
+    SQLite or modify source files.
+    """
+
+    target: str
+    target_id: str
+    files: tuple[SourceFile, ...]
+    schema_version: int = 1
+    tool_version: str = __version__
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the versioned canonical JSON-ready manifest mapping."""
+        return {
+            "schema_version": self.schema_version,
+            "tool_version": self.tool_version,
+            "target": self.target,
+            "target_id": self.target_id,
+            "files": [source_file.to_dict() for source_file in self.files],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SourceManifest":
+        """Parse one version-1 manifest without accepting future extensions.
+
+        Parameters: ``value`` is a JSON-decoded manifest object. Returns the
+        immutable :class:`SourceManifest`. Raises :class:`ValueError` when the
+        version, fields, file set, or file identities are invalid. Parsing has
+        no filesystem or SQLite side effects.
+        """
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "tool_version",
+            "target",
+            "target_id",
+            "files",
+        }:
+            raise ValueError("manifest does not match the version-1 closed schema")
+        if (
+            type(value["schema_version"]) is not int
+            or value["schema_version"] != 1
+            or not all(
+                isinstance(value[name], str)
+                for name in ("tool_version", "target", "target_id")
+            )
+        ):
+            raise ValueError("unsupported or invalid manifest metadata")
+        files = value["files"]
+        if not isinstance(files, list) or len(files) != 4:
+            raise ValueError("manifest has an invalid source-file set")
+        parsed: list[SourceFile] = []
+        for item in files:
+            if not isinstance(item, dict) or set(item) != {
+                "name",
+                "present",
+                "size",
+                "sha256",
+            }:
+                raise ValueError("manifest has an invalid source-file record")
+            if (
+                not isinstance(item["name"], str)
+                or not isinstance(item["present"], bool)
+                or item["size"] is not None
+                and (type(item["size"]) is not int or item["size"] < 0)
+                or item["sha256"] is not None
+                and (
+                    not isinstance(item["sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+                )
+            ):
+                raise ValueError("manifest has an invalid source-file identity")
+            if item["present"] != (
+                item["size"] is not None and item["sha256"] is not None
+            ):
+                raise ValueError("manifest has inconsistent source-file presence")
+            parsed.append(SourceFile(**item))
+        if tuple(item.name for item in parsed) != ("main", "wal", "shm", "journal"):
+            raise ValueError("manifest has an unsupported source-file set")
+        return cls(
+            target=value["target"],
+            target_id=value["target_id"],
+            files=tuple(parsed),
+            schema_version=value["schema_version"],
+            tool_version=value["tool_version"],
+        )
+
+
+@dataclass(frozen=True)
+class CaptureOutcome:
+    """Describe one copy-only source capture attempt and its retained evidence.
+
+    Parameters identify the canonical ``target`` when it resolved and opaque
+    target-scoped IDs, state whether the snapshot was ``accepted``, classify the
+    bounded ``status``, and name the private ``snapshot_dir`` when capture
+    reached artifact creation.
+    The artifact layer returns this type without opening SQLite or producing a
+    candidate; callers must not treat an unaccepted outcome as installable.
+    """
+
+    target: str | None
+    target_id: str | None
+    snapshot_id: str | None
+    operation_id: str | None
+    snapshot_dir: Path | None
+    accepted: bool
+    status: str
+
+
+@dataclass(frozen=True)
 class Result:
     """Represent one complete closed schema-version-1 command result.
 
@@ -179,17 +321,32 @@ class Result:
         diagnostic_code: str,
         diagnostic_message: str,
         target: str | None = None,
+        snapshot_id: str | None = None,
+        operation_id: str | None = None,
     ) -> "Result":
         """Build a bounded safe failure result from an internal error context.
 
         ``diagnostic_message`` is intentionally not emitted: it can contain
         secrets or arbitrary exception data. The returned result instead uses a
         fixed public message selected by ``diagnostic_code`` and has no side
-        effects.
+        effects. Optional target-scoped IDs retain existing diagnostic evidence
+        without authorizing a candidate.
         """
         safe_messages = {
             "bootstrap_unavailable": "Cleanup execution is not available in this bootstrap release.",
             "invalid_arguments": "Command arguments do not match the supported grammar.",
+            "target_invalid": "The database target must be one existing absolute regular file.",
+            "source_changed": "The source database set changed during capture.",
+            "unsupported_journal": "Rollback-journal evidence was preserved but is unsupported.",
+            "storage_capacity": "Required storage capacity or inodes are unavailable.",
+            "scratch_not_local": "Scratch storage is not on an admitted local filesystem.",
+            "scratch_not_private": "Scratch storage is not private.",
+            "scratch_capacity": "Scratch storage capacity or inodes are unavailable.",
+            "artifact_not_private": "Private artifact storage cannot be established.",
+            "artifact_schema_unsupported": "Retained artifact state is not a supported schema.",
+            "scratch_invalid": "Scratch storage must be an absolute filesystem path.",
+            "deadline_exceeded": "The operation deadline expired before capture completed.",
+            "copy_failed": "Source capture could not complete safely.",
             "unexpected_error": "An unexpected internal error occurred.",
         }
         return cls(
@@ -197,6 +354,8 @@ class Result:
             status=status,
             exit_code=exit_code,
             target=target,
+            snapshot_id=snapshot_id,
+            operation_id=operation_id,
             diagnostics=(
                 Diagnostic(
                     code=diagnostic_code,
