@@ -20,6 +20,7 @@ from .artifacts import (
     abort_preview_operation,
     capture_source_set,
     operation_status,
+    prune_backup,
 )
 from .cleanup import clean_snapshot
 from .install import (
@@ -138,7 +139,7 @@ def parse_command(arguments: Sequence[str]) -> CommandRequest:
     deadline = _optional_deadline(options, command)
     candidate_id = _optional_id(options, "candidate", command)
     operation_id = _optional_id(options, "operation", command)
-    snapshot_id = _optional_id(options, "snapshot", command)
+    snapshot_id = _optional_snapshot_id(options, command)
     report = _optional_digest(options, "approve-uncertain-report", command)
     return CommandRequest(
         command=command,
@@ -271,8 +272,9 @@ def _execute(request: CommandRequest) -> Result:
 
     Parameters: ``request`` is grammar-validated operator input. Returns one
     closed :class:`Result`, including actual cleanup classification for preview.
-    Capture and SQLite cleanup write only private artifacts and scratch copies;
-    all non-preview commands remain non-mutating precondition refusals.
+    Capture, cleanup, installation recovery, and exact backup pruning use only
+    their corresponding private artifact protocols. The function never invokes
+    OpenCode or performs active-database retention.
     """
     if request.command == "cleanup status":
         return _status_result(request)
@@ -284,6 +286,8 @@ def _execute(request: CommandRequest) -> Result:
         return _resume_result(request)
     if request.command == "cleanup rollback":
         return _rollback_result(request)
+    if request.command == "cleanup prune-backup":
+        return _prune_backup_result(request)
     if request.command != "cleanup preview":
         return Result.failure(
             command=request.command,
@@ -512,6 +516,31 @@ def _rollback_result(request: CommandRequest) -> Result:
     )
 
 
+def _prune_backup_result(request: CommandRequest) -> Result:
+    """Prune one catalog-selected retained snapshot without touching the target DB.
+
+    ``request`` supplies an exact parsed target and complete snapshot ID. Returns
+    ``backup_pruned`` only after the artifact layer durably removes that group
+    and its catalog record; malformed, foreign, changed, or required evidence
+    becomes a precondition refusal. The helper never opens SQLite or inspects
+    processes.
+    """
+    assert request.snapshot_id is not None
+    try:
+        prune_backup(request.database, request.snapshot_id)
+    except CaptureError as error:
+        return _artifact_failure(request, error.code)
+    return Result(
+        command=request.command,
+        ok=True,
+        status=Status.BACKUP_PRUNED,
+        exit_code=0,
+        target=request.database,
+        snapshot_id=request.snapshot_id,
+        diagnostics=(Diagnostic("backup_pruned", "The selected backup was pruned."),),
+    )
+
+
 def _install_outcome_result(request: CommandRequest, outcome: object) -> Result:
     """Map one durable installation observation to the closed result schema."""
     state = getattr(outcome, "state", "install_incomplete")
@@ -591,6 +620,7 @@ def _artifact_failure(request: CommandRequest, code: str) -> Result:
         diagnostic_code=code,
         diagnostic_message=code,
         target=request.database,
+        snapshot_id=request.snapshot_id,
         candidate_id=request.candidate_id,
         operation_id=request.operation_id,
     )
@@ -658,6 +688,18 @@ def _optional_id(options: dict[str, str | bool], name: str, command: str) -> str
     value = _option(options, name)
     if len(value) > MAX_ID_LENGTH or not _ID_PATTERN.fullmatch(value):
         raise CliUsageError(command, f"--{name} requires one exact identifier.")
+    return value
+
+
+def _optional_snapshot_id(options: dict[str, str | bool], command: str) -> str | None:
+    """Return only a complete opaque snapshot ID for the prune-backup selector."""
+    if "snapshot" not in options:
+        return None
+    value = _option(options, "snapshot")
+    if re.fullmatch(r"snapshot-\d{8}T\d{6}Z-[0-9a-f]{24}", value) is None:
+        raise CliUsageError(
+            command, "--snapshot requires one complete snapshot identifier."
+        )
     return value
 
 

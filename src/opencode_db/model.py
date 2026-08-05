@@ -464,6 +464,7 @@ class Result:
             "candidate_changed": "The selected candidate is unavailable or has changed.",
             "report_changed": "The selected immutable report is unavailable or has changed.",
             "approval_required": "The uncertain candidate requires its exact report digest approval.",
+            "snapshot_required": "The selected backup is required by a nonterminal recovery operation.",
             "unexpected_error": "An unexpected internal error occurred.",
         }
         return cls(

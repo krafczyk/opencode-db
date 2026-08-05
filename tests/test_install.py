@@ -15,7 +15,12 @@ import unittest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from opencode_db.artifacts import capture_source_set, select_candidate
+from opencode_db.artifacts import (
+    CaptureError,
+    capture_source_set,
+    prune_backup,
+    select_candidate,
+)
 from opencode_db.cleanup import clean_snapshot
 from opencode_db.install import (
     InstallHooks,
@@ -284,6 +289,47 @@ install_candidate(database, selected, scratch_dir=scratch,
             )
             self.assertEqual(resumed.state, "manual_recovery_required")
             self.assertEqual(protected.read_bytes(), b"keep")
+
+    def test_prune_refuses_snapshot_required_by_an_incomplete_install(self) -> None:
+        """Keep rollback authority when an interrupted installation references it."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database, selected = self._candidate(root)
+            interrupted = install_candidate(
+                str(database),
+                selected,
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+                hooks=InstallHooks(
+                    after_original_retained=lambda _: (_ for _ in ()).throw(
+                        InterruptedError()
+                    )
+                ),
+            )
+
+            with self.assertRaisesRegex(CaptureError, "snapshot_required"):
+                prune_backup(str(database), selected.snapshot_id)
+
+            self.assertTrue(selected.candidate_path.parent.exists())
+            self.assertEqual(interrupted.state, "install_incomplete")
+
+    def test_prune_allows_a_terminal_installation_group(self) -> None:
+        """Remove retired recovery evidence only after its install reaches terminal state."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database, selected = self._candidate(root)
+            installed = install_candidate(
+                str(database),
+                selected,
+                scratch_dir=str(root / "scratch"),
+                environment=self._environment(root),
+            )
+
+            prune_backup(str(database), selected.snapshot_id)
+
+            self.assertEqual(installed.state, "installed")
+            self.assertFalse(selected.candidate_path.parent.exists())
+            self.assertTrue(database.exists())
 
     def _candidate(self, root: Path, *, wal: bool = False):
         """Create one generated preview candidate without accessing user state."""

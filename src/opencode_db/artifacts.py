@@ -50,6 +50,19 @@ MANIFEST_SCHEMA_VERSION = 1
 CATALOG_SCHEMA_VERSION = 2
 """Current schema version for target-scoped catalog coordination state."""
 
+_SNAPSHOT_ID_PATTERN = re.compile(r"snapshot-\d{8}T\d{6}Z-[0-9a-f]{24}\Z")
+_TERMINAL_PRUNE_STATES = frozenset(
+    {
+        "captured",
+        "complete",
+        "uncertain",
+        "invalid",
+        "aborted",
+        "installed",
+        "rolled_back",
+    }
+)
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -875,6 +888,407 @@ def select_candidate(
         report_sha256=report_digest,
         completeness=completeness,
     )
+
+
+def prune_backup(
+    database: str,
+    snapshot_id: str,
+    *,
+    after_unlink: Callable[[Path], None] | None = None,
+) -> None:
+    """Delete one exact eligible retained snapshot group and its catalog records.
+
+    Parameters: ``database`` is an explicit recorded target and ``snapshot_id``
+    is one complete catalog-selected snapshot ID. ``after_unlink`` is a
+    test-only interruption seam called after each exact file removal. Returns
+    ``None`` after every listed file and tool-owned empty directory is gone and
+    the catalog update is durable. Raises :class:`CaptureError` when selection,
+    artifact identity, private paths, or terminal operation eligibility cannot
+    be proved. An interruption leaves the catalog record in place so the same
+    ID can remove only its remaining files on retry. This function never opens
+    SQLite, inspects processes, or changes active database paths.
+    """
+    if _SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id) is None:
+        raise CaptureError("snapshot_invalid")
+    try:
+        target = resolve_recorded_target(database)
+        snapshots, candidates, operations = _read_catalog(
+            target.control_dir, target.path, target.target_id
+        )
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    if sum(entry["snapshot_id"] == snapshot_id for entry in snapshots) != 1:
+        raise CaptureError("snapshot_invalid")
+    selected_operations = [
+        entry for entry in operations if entry["snapshot_id"] == snapshot_id
+    ]
+    if not selected_operations or any(
+        entry["state"] not in _TERMINAL_PRUNE_STATES for entry in selected_operations
+    ):
+        raise CaptureError("snapshot_required")
+
+    snapshot_dir = target.control_dir / "snapshots" / snapshot_id
+    if snapshot_dir.is_symlink():
+        raise CaptureError("snapshot_invalid")
+    if not snapshot_dir.exists():
+        _remove_pruned_catalog_records(
+            target.control_dir,
+            target.path,
+            target.target_id,
+            snapshot_id,
+            snapshots,
+            candidates,
+            operations,
+        )
+        return
+    files, directories = _prune_group_plan(
+        snapshot_dir,
+        target.path,
+        target.target_id,
+        snapshot_id,
+        candidates,
+        selected_operations,
+    )
+    _validate_prune_group(files, directories)
+
+    if not files:
+        _remove_empty_prune_directory(snapshot_dir, directories)
+        _remove_pruned_catalog_records(
+            target.control_dir,
+            target.path,
+            target.target_id,
+            snapshot_id,
+            snapshots,
+            candidates,
+            operations,
+        )
+        return
+
+    manifest = snapshot_dir / "manifest.json"
+    state_paths = {path for path in files if path.name.endswith(".install.json")}
+    payloads = sorted(
+        (path for path in files if path != manifest and path not in state_paths),
+        key=str,
+    )
+    for path in payloads:
+        _unlink_prune_file(path, files[path], after_unlink)
+    for directory in sorted(
+        directories - {snapshot_dir}, key=lambda item: len(item.parts), reverse=True
+    ):
+        _remove_empty_prune_directory(directory, directories)
+    for path in sorted(state_paths, key=str):
+        _unlink_prune_file(path, files[path], after_unlink)
+    _unlink_prune_file(manifest, files[manifest], after_unlink)
+    _remove_empty_prune_directory(snapshot_dir, directories)
+    _remove_pruned_catalog_records(
+        target.control_dir,
+        target.path,
+        target.target_id,
+        snapshot_id,
+        snapshots,
+        candidates,
+        operations,
+    )
+
+
+def _prune_group_plan(
+    snapshot_dir: Path,
+    target: Path,
+    target_id: str,
+    snapshot_id: str,
+    candidates: list[dict[str, object]],
+    operations: list[dict[str, str | None]],
+) -> tuple[dict[Path, tuple[int, str] | bytes], set[Path]]:
+    """Derive the sole allowed prune paths from closed group evidence."""
+    _require_private_directory(snapshot_dir.parent.parent.parent, ".opencode-db")
+    _require_private_directory(snapshot_dir.parent.parent, target_id)
+    _require_private_directory(snapshot_dir.parent, "snapshots")
+    _require_private_directory(snapshot_dir, snapshot_id)
+    manifest_path = snapshot_dir / "manifest.json"
+    if not manifest_path.exists():
+        if any(snapshot_dir.iterdir()):
+            raise CaptureError("snapshot_invalid")
+        return {}, {snapshot_dir}
+    manifest_value, manifest_bytes = _read_canonical_json(manifest_path)
+    manifest = _prune_manifest(
+        manifest_value, target, target_id, snapshot_id, snapshot_dir
+    )
+    files: dict[Path, tuple[int, str] | bytes] = {manifest_path: manifest_bytes}
+    files[snapshot_dir / "pre-manifest.json"] = _canonical_json_bytes(
+        manifest.to_dict()
+    )
+    for source in manifest.files:
+        if source.present:
+            assert source.size is not None and source.sha256 is not None
+            files[_snapshot_source_path(snapshot_dir, manifest, source.name)] = (
+                source.size,
+                source.sha256,
+            )
+    directories = {snapshot_dir}
+    for record in candidates:
+        if record["snapshot_id"] != snapshot_id:
+            continue
+        candidate_id = record["candidate_id"]
+        if (
+            not isinstance(candidate_id, str)
+            or re.fullmatch(r"candidate-[A-Za-z0-9-]{1,80}", candidate_id) is None
+        ):
+            raise CaptureError("snapshot_invalid")
+        files[snapshot_dir / f"{candidate_id}.sqlite"] = (
+            cast(int, record["candidate_size"]),
+            cast(str, record["candidate_sha256"]),
+        )
+        files[snapshot_dir / f"{candidate_id}.report.json"] = (
+            -1,
+            cast(str, record["report_sha256"]),
+        )
+    for operation in operations:
+        operation_id = cast(str, operation["operation_id"])
+        if not operation_id.startswith("install-"):
+            continue
+        state_path = snapshot_dir / f"{operation_id}.install.json"
+        if not state_path.exists():
+            if any(path.exists() for path in files if path != manifest_path):
+                raise CaptureError("snapshot_invalid")
+            continue
+        state = _read_terminal_prune_state(
+            state_path, target, target_id, snapshot_dir, snapshot_id, operation_id
+        )
+        if state["state"] != operation["state"]:
+            raise CaptureError("snapshot_invalid")
+        files[state_path] = _canonical_json_bytes(state)
+        quarantine = snapshot_dir / "quarantine" / operation_id
+        directories.update(
+            {snapshot_dir / "quarantine", quarantine, snapshot_dir / "staging"}
+        )
+        for source in manifest.files:
+            if source.present:
+                assert source.size is not None and source.sha256 is not None
+                files[quarantine / source.name] = (source.size, source.sha256)
+        if state["state"] == "rolled_back":
+            directories.update(
+                {snapshot_dir / "rollback", snapshot_dir / "rollback" / operation_id}
+            )
+    return files, directories
+
+
+def _prune_manifest(
+    value: object,
+    target: Path,
+    target_id: str,
+    snapshot_id: str,
+    snapshot_dir: Path,
+) -> SourceManifest:
+    """Validate the remaining manifest that authorizes an interrupted retry."""
+    required = {
+        "schema_version",
+        "tool_version",
+        "target",
+        "target_id",
+        "snapshot_id",
+        "operation_id",
+        "state",
+        "reason",
+        "pre_copy_manifest",
+        "copied_manifest",
+        "post_copy_manifest",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or value.get("target") != str(target)
+        or value.get("target_id") != target_id
+        or value.get("snapshot_id") != snapshot_id
+        or value.get("state") != "accepted"
+        or value.get("reason") is not None
+        or not isinstance(value.get("operation_id"), str)
+        or snapshot_dir.name != snapshot_id
+    ):
+        raise CaptureError("snapshot_invalid")
+    try:
+        manifests = tuple(
+            SourceManifest.from_dict(value[name])
+            for name in (
+                "pre_copy_manifest",
+                "copied_manifest",
+                "post_copy_manifest",
+            )
+        )
+    except (KeyError, ValueError) as error:
+        raise CaptureError("snapshot_invalid") from error
+    manifest = manifests[0]
+    if (
+        manifests[1:] != (manifest, manifest)
+        or manifest.target != str(target)
+        or manifest.target_id != target_id
+    ):
+        raise CaptureError("snapshot_invalid")
+    return manifest
+
+
+def _read_terminal_prune_state(
+    path: Path,
+    target: Path,
+    target_id: str,
+    snapshot_dir: Path,
+    snapshot_id: str,
+    operation_id: str,
+) -> dict[str, object]:
+    """Read only one terminal install state needed to enumerate its group paths."""
+    from .install import _read_state
+
+    try:
+        state = _read_state(path, str(target), operation_id)
+    except RuntimeError as error:
+        raise CaptureError("snapshot_invalid") from error
+    if (
+        state.get("state") not in {"installed", "rolled_back"}
+        or state.get("snapshot_dir") != str(snapshot_dir)
+        or state.get("snapshot_id") != snapshot_id
+        or state.get("target_id") != target_id
+    ):
+        raise CaptureError("snapshot_invalid")
+    return state
+
+
+def _validate_prune_group(
+    files: dict[Path, tuple[int, str] | bytes], directories: set[Path]
+) -> None:
+    """Prove an exact group has no unlisted content before any unlink occurs."""
+    for directory in directories:
+        if directory.exists() or directory.is_symlink():
+            _require_private_directory(directory, directory.name)
+    for directory in directories:
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        try:
+            entries = tuple(directory.iterdir())
+        except OSError as error:
+            raise CaptureError("snapshot_invalid") from error
+        if any(entry not in files and entry not in directories for entry in entries):
+            raise CaptureError("snapshot_invalid")
+    for path, identity in files.items():
+        if path.exists() or path.is_symlink():
+            _validate_prune_file(path, identity)
+
+
+def _unlink_prune_file(
+    path: Path,
+    identity: tuple[int, str] | bytes,
+    after_unlink: Callable[[Path], None] | None,
+) -> None:
+    """Revalidate and unlink one catalog-derived file without recursive deletion."""
+    if not path.exists() and not path.is_symlink():
+        return
+    _validate_prune_file(path, identity)
+    try:
+        path.unlink()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise CaptureError("copy_failed") from error
+    if after_unlink is not None:
+        after_unlink(path)
+
+
+def _validate_prune_file(path: Path, identity: tuple[int, str] | bytes) -> None:
+    """Require one listed private regular file still has its expected identity."""
+    try:
+        mode = path.stat().st_mode & 0o777
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or (mode != 0o600 and path.parent.parent.name != "quarantine")
+        ):
+            raise CaptureError("snapshot_invalid")
+        if isinstance(identity, bytes):
+            if path.read_bytes() != identity:
+                raise CaptureError("snapshot_invalid")
+            return
+        size, digest = _hash_file(path, time.monotonic(), 1_800)
+        expected_size, expected_digest = identity
+        if (expected_size >= 0 and size != expected_size) or digest != expected_digest:
+            raise CaptureError("snapshot_invalid")
+    except OSError as error:
+        raise CaptureError("snapshot_invalid") from error
+
+
+def _remove_empty_prune_directory(path: Path, directories: set[Path]) -> None:
+    """Remove one exact known empty private directory without traversing children."""
+    if path not in directories or not path.exists():
+        return
+    _require_private_directory(path, path.name)
+    try:
+        if any(path.iterdir()):
+            raise CaptureError("snapshot_invalid")
+        path.rmdir()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise CaptureError("snapshot_invalid") from error
+
+
+def _remove_pruned_catalog_records(
+    control_dir: Path,
+    target: Path,
+    target_id: str,
+    snapshot_id: str,
+    snapshots: list[dict[str, str]],
+    candidates: list[dict[str, object]],
+    operations: list[dict[str, str | None]],
+) -> None:
+    """Durably remove only an absent exact group's catalog records after pruning."""
+    _write_catalog_state(
+        control_dir,
+        target,
+        target_id,
+        [entry for entry in snapshots if entry["snapshot_id"] != snapshot_id],
+        [entry for entry in candidates if entry["snapshot_id"] != snapshot_id],
+        [entry for entry in operations if entry["snapshot_id"] != snapshot_id],
+    )
+
+
+def _read_canonical_json(path: Path) -> tuple[object, bytes]:
+    """Read one exact private canonical JSON file without accepting alternate bytes."""
+    try:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_mode & 0o777 != 0o600
+        ):
+            raise CaptureError("snapshot_invalid")
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CaptureError("snapshot_invalid") from error
+    expected = _canonical_json_bytes(value)
+    if raw != expected:
+        raise CaptureError("snapshot_invalid")
+    return value, expected
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    """Encode one closed retained value using the writer's canonical JSON form."""
+    try:
+        return (
+            json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise CaptureError("snapshot_invalid") from error
+
+
+def _require_private_directory(path: Path, expected_name: str) -> None:
+    """Require one generated exact path component before it can be removed."""
+    try:
+        if (
+            path.name != expected_name
+            or path.is_symlink()
+            or not path.is_dir()
+            or path.stat().st_mode & 0o777 != 0o700
+        ):
+            raise CaptureError("snapshot_invalid")
+    except OSError as error:
+        raise CaptureError("snapshot_invalid") from error
 
 
 def _preflight(

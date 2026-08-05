@@ -87,7 +87,7 @@ class CliContractTests(unittest.TestCase):
                     "--database",
                     database,
                     "--snapshot",
-                    "snapshot-1",
+                    "snapshot-20260805T000000Z-000000000000000000000000",
                 ],
                 "cleanup prune-backup",
             ),
@@ -107,6 +107,60 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(result[0], EXIT_USAGE)
         self.assertEqual(result[1]["status"], Status.SYNTAX_ERROR.value)
+
+    def test_prune_backup_rejects_nonexact_snapshot_selectors_before_execution(
+        self,
+    ) -> None:
+        """Reject paths, prefixes, and globs without reaching retained artifacts."""
+        for selector in (
+            "../snapshot",
+            "snapshot-",
+            "snapshot-*",
+            "snapshot/child",
+            "candidate-20260805T000000Z-000000000000000000000000",
+        ):
+            with self.subTest(selector=selector):
+                exit_code, payload = self._run_json(
+                    [
+                        "cleanup",
+                        "prune-backup",
+                        "--database",
+                        "/tmp/opencode.db",
+                        "--snapshot",
+                        selector,
+                        "--json",
+                    ]
+                )
+                self.assertEqual(exit_code, EXIT_USAGE)
+                self.assertEqual(payload["status"], Status.SYNTAX_ERROR.value)
+
+    def test_prune_backup_reports_success_only_after_exact_group_removal(self) -> None:
+        """Return backup_pruned without opening or changing active database bytes."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+            active_bytes = database.read_bytes()
+            preview_exit, preview = self._run_json(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+            assert isinstance(preview["snapshot_id"], str)
+            prune_exit, pruned = self._run_json(
+                [
+                    "cleanup",
+                    "prune-backup",
+                    "--database",
+                    str(database),
+                    "--snapshot",
+                    preview["snapshot_id"],
+                    "--json",
+                ]
+            )
+            self.assertEqual(database.read_bytes(), active_bytes)
+
+        self.assertEqual(preview_exit, 0)
+        self.assertEqual(prune_exit, 0)
+        self.assertEqual(pruned["status"], Status.BACKUP_PRUNED.value)
 
     def test_help_lists_each_normative_synopsis_without_mutation(self) -> None:
         """Keep help read-only while exposing the frozen command names and selectors."""

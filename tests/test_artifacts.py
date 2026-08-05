@@ -22,6 +22,7 @@ from opencode_db.artifacts import (
     capture_source_set,
     load_accepted_snapshot,
     operation_status,
+    prune_backup,
     register_preview_scratch,
     select_candidate,
 )
@@ -482,6 +483,148 @@ os._exit(0)
             with self.assertRaises(CaptureError):
                 abort_preview_operation(str(database), snapshot.operation_id)
             self.assertEqual(protected.read_text(), "keep")
+
+    def test_prune_removes_only_one_exact_terminal_snapshot_group(self) -> None:
+        """Delete one catalog-selected group while preserving siblings and active bytes."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+                connection.execute("INSERT INTO entries VALUES ('active')")
+            active_bytes = database.read_bytes()
+            first = self._terminal_snapshot(database, root)
+            second = self._terminal_snapshot(database, root)
+            second_bytes = {
+                path.relative_to(second): path.read_bytes()
+                for path in second.iterdir()
+                if path.is_file()
+            }
+
+            prune_backup(str(database), first.name)
+
+            self.assertFalse(first.exists())
+            self.assertEqual(database.read_bytes(), active_bytes)
+            self.assertEqual(
+                {
+                    path.relative_to(second): path.read_bytes()
+                    for path in second.iterdir()
+                    if path.is_file()
+                },
+                second_bytes,
+            )
+
+    def test_prune_refuses_changed_or_unlisted_group_files_without_deletion(
+        self,
+    ) -> None:
+        """Fail closed before unlinking changed evidence or a user-added group file."""
+        for mutation in ("changed", "unlisted"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory(dir="/tmp") as directory,
+            ):
+                root = Path(directory)
+                database = root / "opencode.db"
+                database.write_bytes(b"active")
+                snapshot = self._terminal_snapshot(database, root)
+                protected = snapshot / database.name
+                if mutation == "changed":
+                    protected.write_bytes(b"changed")
+                else:
+                    protected = snapshot / "unlisted"
+                    protected.write_bytes(b"keep")
+
+                with self.assertRaisesRegex(CaptureError, "snapshot_invalid"):
+                    prune_backup(str(database), snapshot.name)
+
+                self.assertEqual(
+                    protected.read_bytes(),
+                    b"changed" if mutation == "changed" else b"keep",
+                )
+                self.assertTrue(snapshot.exists())
+
+    def test_prune_rejects_nonexact_unknown_and_wrong_target_selectors(self) -> None:
+        """Resolve only one complete snapshot ID through its own target catalog."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            database.write_bytes(b"active")
+            snapshot = self._terminal_snapshot(database, root)
+            other = root / "other.db"
+            other.write_bytes(b"other")
+            selectors = (
+                (str(database), "../snapshot"),
+                (str(database), "snapshot-"),
+                (str(database), "snapshot-*"),
+                (
+                    str(database),
+                    "candidate-20260805T000000Z-000000000000000000000000",
+                ),
+                (str(database), "snapshot-20260805T000000Z-000000000000000000000000"),
+                (str(other), snapshot.name),
+            )
+
+            for target, selector in selectors:
+                with self.subTest(selector=selector):
+                    with self.assertRaisesRegex(CaptureError, "snapshot_invalid"):
+                        prune_backup(target, selector)
+                    self.assertTrue(snapshot.exists())
+
+    def test_interrupted_prune_retries_only_the_remaining_exact_group_files(
+        self,
+    ) -> None:
+        """Keep the catalog record until a retry removes every validated listed file."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            database = root / "opencode.db"
+            database.write_bytes(b"active")
+            selected = self._terminal_snapshot(database, root)
+            sibling = self._terminal_snapshot(database, root)
+            sibling_bytes = {
+                path.name: path.read_bytes()
+                for path in sibling.iterdir()
+                if path.is_file()
+            }
+            unlinked: list[Path] = []
+
+            def interrupt_after_first(path: Path) -> None:
+                unlinked.append(path)
+                raise InterruptedError()
+
+            with self.assertRaises(InterruptedError):
+                prune_backup(
+                    str(database), selected.name, after_unlink=interrupt_after_first
+                )
+            self.assertEqual(len(unlinked), 1)
+            self.assertFalse(unlinked[0].exists())
+            self.assertTrue(selected.exists())
+
+            prune_backup(str(database), selected.name)
+
+            self.assertFalse(selected.exists())
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in sibling.iterdir()
+                    if path.is_file()
+                },
+                sibling_bytes,
+            )
+
+    def _terminal_snapshot(self, database: Path, root: Path) -> Path:
+        """Create one generated accepted snapshot with a terminal preview operation."""
+        capture = capture_source_set(
+            str(database),
+            scratch_dir=str(root / "scratch"),
+            environment=self._environment(root),
+        )
+        assert capture.snapshot_dir is not None
+        clean_snapshot(
+            capture.snapshot_dir,
+            scratch_dir=str(root / "scratch"),
+            environment=self._environment(root),
+        )
+        return capture.snapshot_dir
 
     @staticmethod
     def _mountinfo(root: Path) -> str:
