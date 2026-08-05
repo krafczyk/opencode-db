@@ -206,6 +206,36 @@ class CliContractTests(unittest.TestCase):
             ],
         )
 
+    def test_install_runs_the_exact_preview_candidate_without_confirmation(
+        self,
+    ) -> None:
+        """Install a reviewed candidate directly from explicit CLI evidence."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+                connection.execute("INSERT INTO entries VALUES ('value')")
+            preview_exit, preview = self._run_json(
+                ["cleanup", "preview", "--database", str(database), "--json"]
+            )
+            assert isinstance(preview["candidate_id"], str)
+            install_exit, installed, _, stderr = self._run_json_details(
+                [
+                    "cleanup",
+                    "install",
+                    "--database",
+                    str(database),
+                    "--candidate",
+                    preview["candidate_id"],
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(preview_exit, 0)
+        self.assertEqual(install_exit, 0)
+        self.assertEqual(installed["status"], Status.INSTALLED.value)
+        self.assertEqual(stderr, "")
+
     def test_preview_exposes_only_bounded_opencode_project_and_session_fields(
         self,
     ) -> None:

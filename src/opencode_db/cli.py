@@ -20,9 +20,14 @@ from .artifacts import (
     abort_preview_operation,
     capture_source_set,
     operation_status,
-    select_candidate,
 )
 from .cleanup import clean_snapshot
+from .install import (
+    install_from_selection,
+    install_status,
+    resume_install,
+    rollback_install,
+)
 from .model import (
     EXIT_DECISION_REQUIRED,
     EXIT_MANUAL_RECOVERY_REQUIRED,
@@ -274,7 +279,11 @@ def _execute(request: CommandRequest) -> Result:
     if request.command == "cleanup abort":
         return _abort_result(request)
     if request.command == "cleanup install":
-        return _install_selection_result(request)
+        return _install_result(request)
+    if request.command == "cleanup resume":
+        return _resume_result(request)
+    if request.command == "cleanup rollback":
+        return _rollback_result(request)
     if request.command != "cleanup preview":
         return Result.failure(
             command=request.command,
@@ -383,6 +392,12 @@ def _status_result(request: CommandRequest) -> Result:
             target=request.database,
             diagnostics=(Diagnostic("operation_status", "No operation was selected."),),
         )
+    if request.operation_id.startswith("install-"):
+        try:
+            outcome = install_status(request.database, request.operation_id)
+        except Exception:
+            return _artifact_failure(request, "candidate_changed")
+        return _install_outcome_result(request, outcome)
     try:
         evidence = operation_status(request.database, request.operation_id)
     except CaptureError as error:
@@ -452,28 +467,118 @@ def _abort_result(request: CommandRequest) -> Result:
     )
 
 
-def _install_selection_result(request: CommandRequest) -> Result:
-    """Rehash exact review evidence before refusing U6-deferred installation.
+def _install_result(request: CommandRequest) -> Result:
+    """Install one exact selected candidate without service-state coordination.
 
-    Parameters: ``request`` selects a candidate/report pair. Returns a bounded
-    refusal after read-only evidence verification because active installation is
-    intentionally deferred to U6. Changed, foreign, or unapproved evidence is
-    refused before any mutation.
+    The request binds uncertainty approval to the immutable report digest and
+    delegates all active mutations to the durable installation state machine.
+    It never reads stdin, inspects processes, or invokes OpenCode.
     """
     assert request.candidate_id is not None
-    try:
-        select_candidate(
-            request.database, request.candidate_id, request.approve_uncertain_report
-        )
-    except CaptureError as error:
-        return _artifact_failure(request, error.code)
-    return Result.failure(
+    outcome = install_from_selection(
+        request.database,
+        request.candidate_id,
+        request.approve_uncertain_report,
+        scratch_dir=request.scratch_dir
+        or os.path.join(os.environ.get("TMPDIR", "/tmp"), "opencode-db"),
+        deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
+    )
+    return _install_outcome_result(request, outcome)
+
+
+def _resume_result(request: CommandRequest) -> Result:
+    """Resume only the exact durable installation operation selected by the CLI."""
+    assert request.operation_id is not None
+    return _install_outcome_result(
+        request,
+        resume_install(
+            request.database,
+            request.operation_id,
+            deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
+        ),
+    )
+
+
+def _rollback_result(request: CommandRequest) -> Result:
+    """Explicitly restore exact retained source bytes for one incomplete install."""
+    assert request.operation_id is not None
+    return _install_outcome_result(
+        request,
+        rollback_install(
+            request.database,
+            request.operation_id,
+            deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
+        ),
+    )
+
+
+def _install_outcome_result(request: CommandRequest, outcome: object) -> Result:
+    """Map one durable installation observation to the closed result schema."""
+    state = getattr(outcome, "state", "install_incomplete")
+    state_name = state if isinstance(state, str) else "install_incomplete"
+    code = getattr(outcome, "code", None)
+    code_name = code if isinstance(code, str) else ""
+    status = {
+        "installed": Status.INSTALLED,
+        "rolled_back": Status.ROLLED_BACK,
+        "manual_recovery_required": Status.MANUAL_RECOVERY_REQUIRED,
+        "source_changed": Status.SOURCE_CHANGED,
+        "approval_required": Status.UNCERTAIN,
+        "candidate_changed": Status.PRECONDITION_REFUSED,
+        "report_changed": Status.PRECONDITION_REFUSED,
+        "snapshot_invalid": Status.PRECONDITION_REFUSED,
+    }.get(
+        code_name,
+        {
+            "installed": Status.INSTALLED,
+            "rolled_back": Status.ROLLED_BACK,
+            "manual_recovery_required": Status.MANUAL_RECOVERY_REQUIRED,
+        }.get(state_name, Status.INSTALL_INCOMPLETE),
+    )
+    exit_code = (
+        0
+        if status in {Status.INSTALLED, Status.ROLLED_BACK}
+        else EXIT_DECISION_REQUIRED
+        if status is Status.UNCERTAIN
+        else EXIT_PRECONDITION_REFUSED
+        if status in {Status.SOURCE_CHANGED, Status.PRECONDITION_REFUSED}
+        else EXIT_MANUAL_RECOVERY_REQUIRED
+        if status is Status.MANUAL_RECOVERY_REQUIRED
+        else EXIT_OPERATIONAL_FAILURE
+    )
+    operation_id = getattr(outcome, "operation_id", None)
+    candidate_id = getattr(outcome, "candidate_id", request.candidate_id)
+    snapshot_id = getattr(outcome, "snapshot_id", None)
+    validation = getattr(outcome, "validation", None)
+    return Result(
         command=request.command,
-        status=Status.PRECONDITION_REFUSED,
-        exit_code=EXIT_PRECONDITION_REFUSED,
-        diagnostic_code="bootstrap_unavailable",
-        diagnostic_message="installation is deferred",
+        ok=status in {Status.INSTALLED, Status.ROLLED_BACK, Status.STATUS_OK},
+        status=status,
+        exit_code=exit_code,
         target=request.database,
+        snapshot_id=snapshot_id if snapshot_id != "unknown" else None,
+        candidate_id=candidate_id if candidate_id != "unknown" else None,
+        operation_id=operation_id
+        if operation_id != "unknown"
+        else request.operation_id,
+        validation=validation if validation is not None else Result().validation,
+        next_actions=_install_actions(request.database, operation_id, state_name),
+        diagnostics=(Diagnostic("install_state", f"installation is {state_name}"),),
+    )
+
+
+def _install_actions(
+    database: str, operation_id: object, state: object
+) -> tuple[str, ...]:
+    """Return exact recovery actions only for an incomplete persisted install."""
+    if not isinstance(operation_id, str) or state not in {
+        "install_incomplete",
+        "rolling_back",
+    }:
+        return ()
+    return (
+        f"opencode-db cleanup resume --database {database} --operation {operation_id}",
+        f"opencode-db cleanup rollback --database {database} --operation {operation_id}",
     )
 
 

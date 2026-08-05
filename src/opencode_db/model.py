@@ -335,6 +335,24 @@ class CandidateEvidence:
 
 
 @dataclass(frozen=True)
+class InstallOutcome:
+    """Describe a durable installation or recovery operation.
+
+    ``operation_id`` identifies the persisted intent log, ``state`` is the
+    recorded installation phase, and ``validation`` contains only non-migrating
+    SQLite checks performed at the active target.  Construction is read-only;
+    :mod:`opencode_db.install` performs the associated filesystem work.
+    """
+
+    operation_id: str
+    snapshot_id: str
+    candidate_id: str
+    state: str
+    validation: Validation = field(default_factory=Validation)
+    code: str | None = None
+
+
+@dataclass(frozen=True)
 class OperationEvidence:
     """Describe one target-scoped capture or preview operation for recovery.
 

@@ -587,6 +587,134 @@ def operation_status(database: str, operation_id: str) -> OperationEvidence:
     raise CaptureError("candidate_changed")
 
 
+def register_install_operation(
+    database: str, candidate: CandidateEvidence, operation_id: str
+) -> AcceptedSnapshot:
+    """Register one exact candidate installation in its target catalog.
+
+    Parameters bind the explicit ``database``, rehashed target-scoped
+    ``candidate``, and newly allocated ``operation_id``.  Returns the accepted
+    snapshot only after it and the candidate record are revalidated.  Raises
+    :class:`CaptureError` for cross-target, changed, or incompatible evidence.
+    The function changes only the private catalog; it never opens SQLite or an
+    active source file.
+    """
+    try:
+        target = resolve_target(database)
+        snapshots, candidates, operations = _read_catalog(
+            target.control_dir, target.path, target.target_id
+        )
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    if not re.fullmatch(r"install-\d{8}T\d{6}Z-[0-9a-f]{24}", operation_id) or any(
+        item["operation_id"] == operation_id for item in operations
+    ):
+        raise CaptureError("candidate_changed")
+    record = next(
+        (item for item in candidates if item["candidate_id"] == candidate.candidate_id),
+        None,
+    )
+    if (
+        record is None
+        or record["snapshot_id"] != candidate.snapshot_id
+        or record["candidate_sha256"] != candidate.candidate_sha256
+        or record["report_sha256"] != candidate.report_sha256
+        or not any(item["snapshot_id"] == candidate.snapshot_id for item in snapshots)
+    ):
+        raise CaptureError("candidate_changed")
+    snapshot = load_accepted_snapshot(
+        target.control_dir / "snapshots" / candidate.snapshot_id
+    )
+    operations.append(
+        {
+            "operation_id": operation_id,
+            "snapshot_id": candidate.snapshot_id,
+            "state": "prepared",
+            "host": None,
+            "scratch_path": None,
+        }
+    )
+    _write_catalog_state(
+        target.control_dir,
+        target.path,
+        target.target_id,
+        snapshots,
+        candidates,
+        operations,
+    )
+    return snapshot
+
+
+def load_install_operation(database: str, operation_id: str) -> AcceptedSnapshot:
+    """Load the accepted source snapshot bound to one installation operation.
+
+    Parameters select an explicit recorded target and exact ``operation_id``.
+    Returns the immutable accepted snapshot.  Raises :class:`CaptureError` for
+    foreign, malformed, future, or changed evidence without modifying state or
+    opening SQLite.
+    """
+    evidence = operation_status(database, operation_id)
+    if not operation_id.startswith("install-"):
+        raise CaptureError("candidate_changed")
+    try:
+        target = resolve_recorded_target(database)
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    return load_accepted_snapshot(
+        target.control_dir / "snapshots" / evidence.snapshot_id
+    )
+
+
+def set_install_operation_state(database: str, operation_id: str, state: str) -> None:
+    """Persist one allowed installation state in the target catalog.
+
+    ``database`` and ``operation_id`` select an existing installation record;
+    ``state`` is a closed install lifecycle value.  Raises :class:`CaptureError`
+    for incompatible catalog data.  This updates only catalog metadata and never
+    opens SQLite or mutates active database files.
+    """
+    allowed = {
+        "prepared",
+        "quarantining",
+        "promoting",
+        "validating",
+        "installed",
+        "install_incomplete",
+        "rolling_back",
+        "rolled_back",
+        "manual_recovery_required",
+    }
+    if state not in allowed:
+        raise CaptureError("artifact_schema_unsupported")
+    try:
+        target = resolve_recorded_target(database)
+        snapshots, candidates, operations = _read_catalog(
+            target.control_dir, target.path, target.target_id
+        )
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    changed = False
+    updated: list[dict[str, str | None]] = []
+    for entry in operations:
+        if entry["operation_id"] == operation_id and entry["operation_id"].startswith(
+            "install-"
+        ):
+            updated.append({**entry, "state": state})
+            changed = True
+        else:
+            updated.append(entry)
+    if not changed:
+        raise CaptureError("candidate_changed")
+    _write_catalog_state(
+        target.control_dir,
+        target.path,
+        target.target_id,
+        snapshots,
+        candidates,
+        updated,
+    )
+
+
 def abort_preview_operation(database: str, operation_id: str) -> OperationEvidence:
     """Remove only same-host registered preview scratch and then record abort.
 
