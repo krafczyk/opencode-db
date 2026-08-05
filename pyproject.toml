@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-db"
+version = "0.1.0"
+description = "Explicit OpenCode SQLite cleanup contract"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "opencode-db contributors" }]
+dependencies = []
+
+[project.scripts]
+opencode-db = "opencode_db.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.unittest]
+start-directory = "tests"
