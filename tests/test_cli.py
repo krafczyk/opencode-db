@@ -15,10 +15,12 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db import cli
+from opencode_db.transfer import TransferError, TransferOperationalError
 from opencode_db.model import (
     EXIT_OPERATIONAL_FAILURE,
     EXIT_DECISION_REQUIRED,
@@ -102,6 +104,71 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(request.command, command)
                 self.assertEqual(request.database, database)
 
+    def test_transfer_commands_have_closed_top_level_grammar(self) -> None:
+        """Accept the explicit transfer synopses and reject cleanup-only options."""
+        cases = [
+            (
+                [
+                    "export",
+                    "--db",
+                    "/tmp/opencode.db",
+                    "--project-dir",
+                    "/tmp/project",
+                    "--export-dir",
+                    "/tmp/exports",
+                ],
+                "export",
+            ),
+            (
+                [
+                    "import",
+                    "--target-project-dir",
+                    "/tmp/project",
+                    "--db",
+                    "/tmp/opencode.db",
+                    "--import",
+                    "/tmp/transfer.sqlite",
+                ],
+                "import",
+            ),
+        ]
+        for arguments, command in cases:
+            with self.subTest(command=command):
+                request = cli.parse_command(arguments)
+                self.assertEqual(request.command, command)
+
+        exit_code, payload = self._run_json(
+            ["export", "--db", "/tmp/opencode.db", "--json"]
+        )
+        self.assertEqual(exit_code, EXIT_USAGE)
+        self.assertEqual(payload["status"], Status.SYNTAX_ERROR.value)
+
+    def test_transfer_failures_use_operational_or_safety_exit_classes(self) -> None:
+        """Classify transfer operational failures separately from safety refusals."""
+        arguments = [
+            "export",
+            "--db",
+            "/tmp/opencode.db",
+            "--project-dir",
+            "/tmp/project",
+            "--export-dir",
+            "/tmp/exports",
+        ]
+        cases = (
+            (TransferError("project directory resolves ambiguously or not at all"), EXIT_PRECONDITION_REFUSED),
+            (TransferOperationalError("database integrity check failed"), EXIT_OPERATIONAL_FAILURE),
+        )
+
+        for failure, expected_exit in cases:
+            with self.subTest(failure=type(failure).__name__):
+                stderr = io.StringIO()
+                with patch.object(cli, "export_sessions", side_effect=failure):
+                    with redirect_stderr(stderr):
+                        exit_code = cli.main(arguments)
+
+                self.assertEqual(exit_code, expected_exit)
+                self.assertEqual(stderr.getvalue(), f"opencode-db: {failure}\n")
+
     def test_prune_is_not_an_exposed_command(self) -> None:
         """Reserve the future short prune name outside the version-1 grammar."""
         result = self._run_json(
@@ -129,6 +196,8 @@ class CliContractTests(unittest.TestCase):
         )
         for text in (readme, protocol):
             self.assertIn("prune-backup", text)
+            self.assertIn("opencode-db export --db", text)
+            self.assertIn("opencode-db import --target-project-dir", text)
             self.assertIn("`cleanup prune`", text)
             self.assertIn("absolute", text)
             self.assertIn("OpenCode", text)
@@ -253,6 +322,8 @@ class CliContractTests(unittest.TestCase):
             database.write_bytes(b"unchanged")
             before = database.read_bytes()
             actions = [
+                "export",
+                "import",
                 "preview",
                 "install",
                 "status",
@@ -266,9 +337,11 @@ class CliContractTests(unittest.TestCase):
                 with self.subTest(action=action):
                     stdout = io.StringIO()
                     with redirect_stdout(stdout):
-                        self.assertEqual(cli.main(["cleanup", action, "--help"]), 0)
-                    self.assertIn(f"cleanup {action}", stdout.getvalue())
-                    self.assertIn("--database ABSOLUTE_PATH", stdout.getvalue())
+                        arguments = [action, "--help"] if action in {"export", "import"} else ["cleanup", action, "--help"]
+                        self.assertEqual(cli.main(arguments), 0)
+                    self.assertIn(action, stdout.getvalue())
+                    option = "--db ABSOLUTE_DB" if action in {"export", "import"} else "--database ABSOLUTE_PATH"
+                    self.assertIn(option, stdout.getvalue())
 
             self.assertEqual(database.read_bytes(), before)
 

@@ -5,6 +5,54 @@ It is intentionally a fail-closed retained-evidence protocol, not an OpenCode
 database schema specification. The command never discovers targets, starts
 OpenCode, inspects processes, or coordinates database users.
 
+## Session transfer
+
+Top-level transfer commands have separate, human-only output from the closed
+cleanup result schema, accept no `--json` option, and accept no implicit target
+selection:
+
+```text
+opencode-db export --db ABSOLUTE_DB --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR
+opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR --db ABSOLUTE_DB --import ABSOLUTE_IMPORT_FILE
+```
+
+Both `--db` values must name existing regular SQLite files and are opened with
+SQLite `mode=rw`; the tool never creates a replacement, empty, or in-memory
+database. Project directories must be existing absolute directories. Export
+resolves one project ID from canonical equality with
+`project.worktree`, `project_directory.directory`, or `session.directory`.
+Multiple IDs or no ID are refusals. A global project resolves only from an exact
+session-directory match. Global session rows are selected only when
+their directory canonically matches the source project directory, preventing
+unrelated global state from crossing projects.
+
+An export creates the requested directory with mode `0700`, then atomically
+publishes exactly one mode-`0600` SQLite archive. Its closed schema contains the
+version, canonical export directory, and source project ID in metadata plus these current
+session-owned tables: `session`, `message`, `part`, `todo`, `session_message`,
+`session_input`, `session_context_epoch`, `session_share`, `event_sequence`,
+and `event`. It retains every table column and SQLite scalar or blob value. The
+human result reports the canonical export directory, source project ID, archive
+path, and session count only; it never reports session contents.
+
+Import validates the closed archive schema before changing the target database.
+It requires target table column and foreign-key layouts to match the archive,
+refuses unknown tables that carry `session_id` or reference a session-owned
+table, and refuses integrity or foreign-key failures. In one deferred-
+foreign-key transaction it deletes only rows owned by imported session IDs,
+replaces their `session` and child-table state, maps `session.project_id` to the
+resolved target project, sets `session.directory` to the absolute target,
+updates `session.path` relative to target `project.worktree` when present, and
+clears `workspace_id` when present.
+Before deletion, an existing imported ID must already belong to the target
+project or be a global session whose canonical directory is the target; another
+project's ID is refused without mutation. Export and import also require every
+foreign key between archived session-owned tables to have its parent in the
+transfer scope; `session.project_id` is intentionally outside that scope.
+Session IDs and parent relationships are retained. A failed insert, check, or
+commit rolls back the entire import; repeating a successful archive import is
+idempotent and does not alter unrelated project state.
+
 ## Target and identities
 
 Each command starts with one exact absolute `--database` path. Preview requires
@@ -108,8 +156,10 @@ reported as `scratch_cleanup_required` and is not removed remotely.
 
 ## Result and exits
 
-`--json` emits exactly one UTF-8, ASCII-safe, newline-terminated object on
-stdout, capped at 64 KiB. It has no unknown version-1 fields:
+Cleanup commands with `--json` emit exactly one UTF-8, ASCII-safe,
+newline-terminated object on stdout, capped at 64 KiB. Top-level transfer
+commands instead use their documented human-only output. The cleanup result has
+no unknown version-1 fields:
 
 ```text
 schema_version, command, ok, status, exit_code, target, snapshot_id,
@@ -129,8 +179,8 @@ mutate active files.
 | 0 | terminal success | complete preview, installed, rolled back, status, backup pruned |
 | 2 | syntax/input shape | malformed command, relative path, incomplete ID |
 | 3 | decision required | validated uncertain preview or missing exact uncertain approval |
-| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence |
-| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure |
+| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence, malformed transfer archive, ambiguous project, incompatible schema |
+| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure, transfer filesystem/SQLite/integrity/publication failure |
 | 6 | manual recovery required | unreconcilable active installation or cross-host scratch cleanup |
 
 Stable status values are `complete`, `uncertain`, `source_changed`, `invalid`,

@@ -23,6 +23,56 @@ salvage tool.
 - The tool never starts OpenCode. After a successful install, start OpenCode
   separately using its unchanged normal command and configuration.
 
+## Session transfer
+
+Session transfer is an explicit, project-scoped workflow for moving complete
+current OpenCode session state between projects known to separate databases. It
+does not discover a database, project, or directory. Arrange database shutdown
+and concurrent-use safety before starting.
+
+Export from an existing absolute database and existing source project directory:
+
+```bash
+opencode-db export --db /absolute/path/opencode.db \
+  --project-dir /absolute/source/project \
+  --export-dir /absolute/private/exports
+```
+
+The command prints the canonical export directory, resolved source project ID,
+and one import-file path, never session content. It creates the export directory
+as mode `0700` and publishes one SQLite import file as mode `0600` atomically.
+The archive contains all rows and columns from `session`, `message`, `part`,
+`todo`, `session_message`, `session_input`, `session_context_epoch`,
+`session_share`, `event_sequence`, and `event` for the selected project. Global
+sessions are included only when their recorded directory matches the selected
+project directory.
+
+Import that exact file into an existing target database and project directory:
+
+```bash
+opencode-db import --target-project-dir /absolute/target/project \
+  --db /absolute/path/target-opencode.db \
+  --import /absolute/private/exports/opencode-session-YYYYMMDDTHHMMSSZ-HEX.sqlite
+```
+
+Import resolves exactly one target project, preserves session IDs and parent
+relationships, changes imported `session.project_id` to that target, stores the
+absolute target in `session.directory`, updates `session.path` relative to
+`project.worktree` when those columns are available, and clears `workspace_id`
+when that column exists. It replaces only imported session rows
+and their child-table rows in one SQLite transaction, so rerunning the same
+import is idempotent and unrelated projects remain untouched.
+If an imported session ID is already owned by another target project, import
+refuses before changing any target row. Archives with a transferred-table
+foreign key whose parent is outside the archive are also refused.
+
+Export and import require existing regular SQLite databases opened in
+`mode=rw`, enable foreign keys, and validate integrity before success. They
+refuse malformed archives, ambiguous project matches, incompatible schemas, or
+unknown tables that carry `session_id` or reference session-owned tables. The
+transfer archive is private session data: keep its path private and delete it
+only when it is no longer needed.
+
 Normal WAL replay, checkpoint, and SQLite backup are the only recovery method.
 Rollback-journal evidence, malformed inputs, changed source files, unsupported
 scratch storage, unknown retained schemas, and candidates that cannot validate
@@ -170,11 +220,13 @@ space in an OpenCode database.
 
 ## Results, deadlines, and storage
 
-Add `--json` to any command for exactly one newline-terminated schema-version-1
-JSON object on stdout. Diagnostics are bounded and all human diagnostics use
-stderr. Exit classes are `0` success, `2` syntax/input shape, `3` uncertain
-decision required, `4` safety-precondition refusal, `5` operational or
-validation failure, and `6` manual recovery required.
+Cleanup commands accept `--json` for exactly one newline-terminated
+schema-version-1 JSON object on stdout. Top-level `export` and `import` do not
+accept `--json`; their separate human-only success output is written to stdout
+and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
+syntax/input shape, `3` uncertain decision required, `4` safety-precondition
+refusal, `5` operational or validation failure, and `6` manual recovery
+required.
 
 The default deadline is 30 minutes. `--deadline-seconds` accepts finite whole
 seconds from 1 through 86400. SQLite busy waits are finite. The tool requires

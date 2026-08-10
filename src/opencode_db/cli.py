@@ -41,6 +41,15 @@ from .model import (
     Result,
     Status,
 )
+from .transfer import (
+    TransferError,
+    TransferOperationalError,
+    TransferRequest,
+    TransferUsageError,
+    export_sessions,
+    import_sessions,
+    parse_transfer_command,
+)
 
 MAX_JSON_BYTES = 64 * 1024
 """Maximum UTF-8 byte length for a machine-mode result, including its newline."""
@@ -96,16 +105,19 @@ class CliUsageError(ValueError):
         self.command = command
 
 
-def parse_command(arguments: Sequence[str]) -> CommandRequest:
-    """Parse a normative cleanup command without accessing external state.
+def parse_command(arguments: Sequence[str]) -> CommandRequest | TransferRequest:
+    """Parse one cleanup or top-level transfer command without accessing state.
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
-    Returns a :class:`CommandRequest` with only validated, explicit fields.
-    Raises :class:`CliUsageError` for unknown commands, missing options, invalid
+    Returns a :class:`CommandRequest` or :class:`TransferRequest` with only
+    validated explicit fields. Raises :class:`CliUsageError` or
+    :class:`TransferUsageError` for unknown commands, missing options, invalid
     absolute paths, ambiguous IDs, duplicate options, and non-finite deadlines.
     The function never reads stdin, creates a database, or mutates a file.
     """
     values = list(arguments)
+    if values and values[0] in {"export", "import"}:
+        return parse_transfer_command(values)
     if len(values) < 2 or values[0] != "cleanup":
         raise CliUsageError("unknown", "Expected a cleanup command.")
     action = values[1]
@@ -246,7 +258,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     json_mode = "--json" in values
     try:
         request = parse_command(values)
-    except CliUsageError as error:
+    except (CliUsageError, TransferUsageError) as error:
         result = Result.failure(
             command=error.command,
             status=Status.SYNTAX_ERROR,
@@ -260,12 +272,66 @@ def main(arguments: Sequence[str] | None = None) -> int:
             sys.stderr.write(render_human(result))
         return EXIT_USAGE
 
+    if isinstance(request, TransferRequest):
+        return _execute_transfer(request)
     result = _execute(request)
     if request.json:
         sys.stdout.write(render_json(result))
     else:
         sys.stderr.write(render_human(result))
     return result.exit_code
+
+
+def _execute_transfer(request: TransferRequest) -> int:
+    """Run one transfer command without using the closed cleanup result schema.
+
+    Parameters: ``request`` is a grammar-validated explicit transfer selection.
+    Returns zero after successful export or import, the operational-failure exit
+    class for filesystem, SQLite, integrity, or publication failures, and the
+    precondition-refusal class for safety refusals. It reports only paths,
+    project IDs, and row counts, not session content; archive/database work is
+    delegated to :mod:`transfer`.
+    """
+    try:
+        if request.command == "export":
+            assert request.export_dir is not None
+            outcome = export_sessions(
+                request.database, request.project_dir, request.export_dir
+            )
+            sys.stdout.write(
+                "\n".join(
+                    (
+                        "opencode-db: exported",
+                        f"export_dir: {outcome.export_dir}",
+                        f"source_project_id: {outcome.source_project_id}",
+                        f"import_file: {outcome.import_file}",
+                        f"exported_sessions: {outcome.exported_sessions}",
+                    )
+                )
+                + "\n"
+            )
+            return 0
+        assert request.import_file is not None
+        outcome = import_sessions(
+            request.project_dir, request.database, request.import_file
+        )
+        sys.stdout.write(
+            "\n".join(
+                (
+                    "opencode-db: imported",
+                    f"target_project_id: {outcome.target_project_id}",
+                    f"imported_sessions: {outcome.imported_sessions}",
+                )
+            )
+            + "\n"
+        )
+        return 0
+    except TransferOperationalError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_OPERATIONAL_FAILURE
+    except TransferError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_PRECONDITION_REFUSED
 
 
 def _execute(request: CommandRequest) -> Result:
@@ -745,6 +811,8 @@ def _wants_help(values: Sequence[str]) -> bool:
 def _help_text(values: Sequence[str]) -> str:
     command = " ".join(values[:2])
     synopses = {
+        "export": "opencode-db export --db ABSOLUTE_DB --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
+        "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR --db ABSOLUTE_DB --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview --database ABSOLUTE_PATH [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
         "cleanup install": "opencode-db cleanup install --database ABSOLUTE_PATH --candidate ID [--approve-uncertain-report SHA256] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
         "cleanup status": "opencode-db cleanup status --database ABSOLUTE_PATH [--operation ID] [--json]",
@@ -753,9 +821,13 @@ def _help_text(values: Sequence[str]) -> str:
         "cleanup rollback": "opencode-db cleanup rollback --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]",
         "cleanup prune-backup": "opencode-db cleanup prune-backup --database ABSOLUTE_PATH --snapshot ID [--json]",
     }
+    if values and values[0] in {"export", "import"}:
+        return synopses[values[0]] + "\n"
     if command in synopses:
         return synopses[command] + "\n"
     return (
-        "\n".join(["usage: opencode-db cleanup COMMAND [OPTIONS]", *synopses.values()])
+        "\n".join(
+            ["usage: opencode-db (cleanup COMMAND | export | import) [OPTIONS]", *synopses.values()]
+        )
         + "\n"
     )
