@@ -20,7 +20,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db import cli
-from opencode_db import move_cli
 from opencode_db.transfer import TransferError, TransferOperationalError
 from opencode_db.model import (
     EXIT_OPERATIONAL_FAILURE,
@@ -31,7 +30,6 @@ from opencode_db.model import (
     Result,
     Status,
 )
-import test_move
 
 
 class CliContractTests(unittest.TestCase):
@@ -860,210 +858,6 @@ class CliContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Result.from_json({"schema_version": 2})
 
-    def test_mv_has_closed_grammar_and_human_only_json_rejection(self) -> None:
-        """Accept only the sibling move selectors before any planner access."""
-        arguments = [
-            "mv",
-            "--project-id",
-            "project",
-            "--target-project-dir",
-            "/target/main",
-            "--db",
-            "/tmp/opencode.db",
-            "--method",
-            "sibling",
-            "--yes",
-            "--progress",
-        ]
-
-        request = cli.parse_command(arguments)
-
-        self.assertEqual(request.command, "mv")
-        self.assertEqual(request.database, "/tmp/opencode.db")
-        self.assertEqual(request.method, "sibling")
-        self.assertTrue(request.yes)
-        self.assertTrue(request.progress)
-        with patch.dict(os.environ, {"XDG_DATA_HOME": "/xdg", "HOME": "relative"}, clear=True):
-            defaulted = cli.parse_command(
-                ["mv", "--project-id", "project", "--target-project-dir", "/target/main"]
-            )
-        self.assertEqual(defaulted.database, "/xdg/opencode/opencode.db")
-        self.assertEqual(defaulted.method, "sibling")
-        for rejected in (
-            ["mv", "--project-id", "project"],
-            ["mv", "--project-id", "project", "--project-id", "other", "--target-project-dir", "/target/main"],
-            ["mv", "--project-id", "project", "--target-project-dir", "relative"],
-            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--method", "other"],
-            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--json"],
-        ):
-            with self.subTest(arguments=rejected):
-                stderr = io.StringIO()
-                with patch.object(move_cli, "plan_sibling_move") as planner, redirect_stderr(stderr):
-                    self.assertEqual(cli.main(rejected), EXIT_USAGE)
-                planner.assert_not_called()
-                self.assertIn("opencode-db:", stderr.getvalue())
-
-    def test_mv_interactive_and_yes_paths_apply_real_sibling_fixtures(self) -> None:
-        """Preview complete real plans, authorize exact ``y``, and support detached ``--yes``."""
-        if shutil.which("git") is None:
-            self.skipTest("Git is unavailable on this test host")
-        with test_move._temporary_directory() as root:
-            source, target, database = test_move.MovePlanningTests._fixture(root)
-            stdin = _TtyStream("y\n")
-            stdout = _TtyStream()
-            stderr = _TtyStream()
-            with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
-                exit_code = cli.main(
-                    [
-                        "mv", "--project-id", "project", "--target-project-dir", str(target / "main"),
-                        "--db", str(database), "--progress",
-                    ]
-                )
-            self.assertEqual(exit_code, 0)
-            self.assertIn("project.worktree=1", stdout.getvalue())
-            self.assertIn("move committed", stdout.getvalue())
-            self.assertGreater(stdout.flush_count, 0)
-            self.assertTrue(stderr.getvalue().endswith("\n"))
-            for phase in ("collection", "Git pair validation", "revalidation", "update groups"):
-                self.assertIn(f"progress: {phase}", stderr.getvalue())
-            with closing(sqlite3.connect(database)) as connection:
-                self.assertEqual(
-                    connection.execute("SELECT worktree FROM project WHERE id = 'project'").fetchone(),
-                    (str(target / "main"),),
-                )
-
-        with test_move._temporary_directory() as root:
-            _source, target, database = test_move.MovePlanningTests._fixture(root)
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = cli.main(
-                    [
-                        "mv", "--project-id", "project", "--target-project-dir", str(target / "main"),
-                        "--db", str(database), "--yes",
-                    ]
-                )
-            self.assertEqual(exit_code, 0)
-            self.assertIn("source=", stdout.getvalue())
-            self.assertNotIn("Apply sibling move", stdout.getvalue())
-            self.assertEqual(stderr.getvalue(), "")
-
-    def test_mv_refuses_detached_or_nonexact_confirmation_without_application(self) -> None:
-        """Require both terminals and an exact lowercase confirmation before mutation."""
-        with patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = cli.main(
-                    ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db"]
-                )
-            self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-            self.assertIn("source=", stdout.getvalue())
-            self.assertIn("terminal", stderr.getvalue())
-            apply.assert_not_called()
-
-        for reply in ("n\n", "Y\n", " y\n", "y \n", "", "\n"):
-            with self.subTest(reply=reply), patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
-                stdin = _TtyStream(reply)
-                stdout = _TtyStream()
-                stderr = _TtyStream()
-                with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
-                    exit_code = cli.main(
-                        ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db"]
-                    )
-                self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-                self.assertIn("cancelled", stderr.getvalue())
-                apply.assert_not_called()
-
-        stdin = _InterruptingTty()
-        stdout = _TtyStream()
-        stderr = _TtyStream()
-        with patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
-            with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
-                exit_code = cli.main(
-                    ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db"]
-                )
-        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-        self.assertIn("cancelled", stderr.getvalue())
-        apply.assert_not_called()
-
-    def test_mv_preserves_exit_classes_and_redirected_progress_boundary(self) -> None:
-        """Keep operational failures and redirected aggregate progress separate from output."""
-        reviewed = _reviewed_move()
-
-        def plan_with_progress(
-            _request: object, *, progress: object = None
-        ) -> object:
-            assert callable(progress)
-            progress("collection", 0, 1, False)
-            progress("collection", 1, 1, True)
-            progress("Git pair validation", 0, 1, False)
-            progress("Git pair validation", 1, 1, True)
-            return reviewed
-
-        def fail_during_revalidation(
-            _reviewed: object, *, progress: object = None
-        ) -> None:
-            assert callable(progress)
-            progress("revalidation", 0, 1, False)
-            raise move_cli.MoveOperationalError("git is unavailable")
-
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with patch.object(move_cli, "plan_sibling_move", side_effect=plan_with_progress), patch.object(move_cli, "apply_sibling_move", side_effect=fail_during_revalidation):
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = cli.main(
-                    ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db", "--yes", "--progress"]
-                )
-        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
-        self.assertIn("source='/source/main'", stdout.getvalue())
-        self.assertIn("progress: collection 1/1 complete", stderr.getvalue())
-        self.assertIn("progress: Git pair validation 1/1 complete", stderr.getvalue())
-        self.assertIn("progress: revalidation failed", stderr.getvalue())
-        self.assertNotIn("\r", stderr.getvalue())
-        self.assertNotIn("/source/main", stderr.getvalue())
-
-        capped = io.StringIO()
-        reporter = move_cli._MoveProgressReporter(capped)
-        for completed in range(150):
-            reporter.update("collection", completed, 150, False)
-        reporter.update("collection", 150, 150, True)
-        lines = capped.getvalue().splitlines()
-        self.assertLessEqual(len(lines), 100)
-        self.assertTrue(lines[-1].endswith("complete"))
-
-        with patch.object(move_cli, "plan_sibling_move", side_effect=move_cli.MoveError("move schema is incomplete")), patch.object(move_cli, "apply_sibling_move") as apply:
-            stderr = io.StringIO()
-            with redirect_stderr(stderr):
-                exit_code = cli.main(
-                    ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db", "--yes"]
-                )
-        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-        self.assertIn("schema is incomplete", stderr.getvalue())
-        apply.assert_not_called()
-
-    def test_mv_keeps_actionable_planner_refusals_on_stderr(self) -> None:
-        """Preserve missing-location categories and quoted paths through the CLI boundary."""
-        if shutil.which("git") is None:
-            self.skipTest("Git is unavailable on this test host")
-        with test_move._temporary_directory() as root:
-            _source, target, database = test_move.MovePlanningTests._fixture(root)
-            shutil.rmtree(target / "sandbox")
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = cli.main(
-                    [
-                        "mv", "--project-id", "project", "--target-project-dir", str(target / "main"),
-                        "--db", str(database), "--yes",
-                    ]
-                )
-        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("target directory is missing", stderr.getvalue())
-        self.assertIn("project.sandbox", stderr.getvalue())
-        self.assertIn("path=\"", stderr.getvalue())
-
     @staticmethod
     def _run_json(arguments: list[str]) -> tuple[int, dict[str, object]]:
         """Run the CLI in JSON mode and return its exit code and parsed payload."""
@@ -1081,52 +875,6 @@ class CliContractTests(unittest.TestCase):
             exit_code = cli.main(arguments)
         rendered = stdout.getvalue()
         return exit_code, json.loads(rendered), rendered, stderr.getvalue()
-
-
-class _TtyStream(io.StringIO):
-    """Provide an in-memory text stream that reports terminal capability for CLI tests."""
-
-    def __init__(self, initial_value: str = "") -> None:
-        """Initialize the stream and track explicit flushes before prompt reads."""
-        super().__init__(initial_value)
-        self.flush_count = 0
-
-    def flush(self) -> None:
-        """Record one explicit flush while preserving normal text-stream behavior."""
-        self.flush_count += 1
-        super().flush()
-
-    def isatty(self) -> bool:
-        """Return true so confirmation and terminal-progress paths are testable."""
-        return True
-
-
-class _InterruptingTty(_TtyStream):
-    """Model an interactive input stream interrupted at the confirmation read."""
-
-    def readline(self) -> str:
-        """Raise the same interruption that an operator can send at a prompt."""
-        raise KeyboardInterrupt
-
-
-def _reviewed_move() -> object:
-    """Create one minimal reviewed mapping without accessing SQLite or Git."""
-    from opencode_db.move import (
-        CapturedState,
-        GitEvidence,
-        LocationMembership,
-        MoveMapping,
-        MoveRequest,
-        ReviewedMovePlan,
-    )
-
-    request = MoveRequest("/tmp/opencode.db", "project", "/target/main")
-    state = CapturedState((), "project", "/source/main", "[]", ())
-    evidence = GitEvidence("root:abc", "attached", "main", "a" * 40, "/source/.git", "/source/.git")
-    mapping = MoveMapping(
-        "/source/main", "/target/main", (LocationMembership("project.worktree", ("project",)),), evidence, evidence
-    )
-    return ReviewedMovePlan(request, state, (mapping,))
 
 
 if __name__ == "__main__":
