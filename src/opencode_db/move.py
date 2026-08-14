@@ -56,6 +56,12 @@ SQLITE_BUSY_TIMEOUT_MS = 2_000
 REVALIDATION_TIMEOUT_SECONDS = 10.0
 """Maximum wall-clock time allowed for application-time freshness validation."""
 
+_ROW_LOCATION_CATEGORIES = {
+    "project_directory": "project_directory.directory",
+    "session": "session.directory",
+    "workspace": "workspace.directory",
+}
+
 
 class MoveError(RuntimeError):
     """Report a bounded sibling-move safety refusal without mutable side effects.
@@ -280,29 +286,28 @@ def apply_sibling_move(
         _report_progress(progress, "revalidation", 0, 1, False)
         current, mappings = _revalidate_reviewed_plan(connection, reviewed)
         _report_progress(progress, "revalidation", 1, 1, True)
+        targets = _mapping_targets(mappings)
         _report_progress(progress, "update groups", 0, 5, False)
-        _apply_project_locations(connection, current, mappings)
+        _apply_project_locations(connection, current, targets)
         _after_move_update_group("project")
         _report_progress(progress, "update groups", 1, 5, False)
-        _apply_project_directory_locations(connection, current, mappings)
+        _apply_project_directory_locations(connection, current, targets)
         _after_move_update_group("project_directory")
         _report_progress(progress, "update groups", 2, 5, False)
-        _apply_row_locations(connection, current, mappings, "session")
+        _apply_row_locations(connection, current, targets, "session")
         _after_move_update_group("session")
         _report_progress(progress, "update groups", 3, 5, False)
-        _apply_row_locations(connection, current, mappings, "workspace")
+        _apply_row_locations(connection, current, targets, "workspace")
         _after_move_update_group("workspace")
         _report_progress(progress, "update groups", 4, 5, False)
-        _verify_applied_locations(connection, current, mappings)
+        _verify_applied_locations(connection, current, targets)
         _validate_database_health(connection)
         _after_move_update_group("pre_commit")
         connection.commit()
         _report_progress(progress, "update groups", 5, 5, True)
     except MoveError:
-        _rollback(connection)
         raise
     except (sqlite3.Error, OSError, ValueError, TypeError) as error:
-        _rollback(connection)
         raise MoveOperationalError("move application could not complete") from error
     finally:
         _rollback(connection)
@@ -386,10 +391,11 @@ def _mapping_targets(mappings: tuple[MoveMapping, ...]) -> dict[tuple[str, tuple
 
 
 def _apply_project_locations(
-    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+    connection: sqlite3.Connection,
+    state: CapturedState,
+    targets: dict[tuple[str, tuple[str, ...]], str],
 ) -> None:
     """Update the selected project's exact worktree and sandbox JSON together."""
-    targets = _mapping_targets(mappings)
     worktree = targets.get(("project.worktree", (state.project_id,)))
     if worktree is None:
         raise MoveError("move reviewed worktree membership is missing")
@@ -410,10 +416,11 @@ def _apply_project_locations(
 
 
 def _apply_project_directory_locations(
-    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+    connection: sqlite3.Connection,
+    state: CapturedState,
+    targets: dict[tuple[str, tuple[str, ...]], str],
 ) -> None:
     """Transition every original project-directory key only into a vacant target key."""
-    targets = _mapping_targets(mappings)
     for row in (item for item in state.rows if item.table == "project_directory"):
         target = targets.get(("project_directory.directory", row.identity))
         if target is None or row.directory is None or len(row.identity) != 2:
@@ -438,16 +445,14 @@ def _apply_project_directory_locations(
 def _apply_row_locations(
     connection: sqlite3.Connection,
     state: CapturedState,
-    mappings: tuple[MoveMapping, ...],
+    targets: dict[tuple[str, tuple[str, ...]], str],
     table: str,
 ) -> None:
     """Update exact selected session or non-null workspace directory rows."""
-    categories = {"session": "session.directory", "workspace": "workspace.directory"}
-    if table not in categories:
+    if table not in {"session", "workspace"}:
         raise MoveError("move location table is unsupported")
-    targets = _mapping_targets(mappings)
     for row in (item for item in state.rows if item.table == table and item.directory is not None):
-        target = targets.get((categories[table], row.identity))
+        target = targets.get((_ROW_LOCATION_CATEGORIES[table], row.identity))
         if target is None or len(row.identity) != 1:
             raise MoveError("move reviewed row membership is malformed")
         result = connection.execute(
@@ -459,10 +464,11 @@ def _apply_row_locations(
 
 
 def _verify_applied_locations(
-    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+    connection: sqlite3.Connection,
+    state: CapturedState,
+    targets: dict[tuple[str, tuple[str, ...]], str],
 ) -> None:
     """Confirm selected row membership, exact targets, and null workspaces after updates."""
-    targets = _mapping_targets(mappings)
     project = connection.execute(
         "SELECT worktree, sandboxes FROM project WHERE id = ?", (state.project_id,)
     ).fetchall()
@@ -473,35 +479,33 @@ def _verify_applied_locations(
     expected_project = (targets[("project.worktree", (state.project_id,))], json.dumps(expected_sandboxes))
     if project != [expected_project]:
         raise MoveError("move project post-update validation failed")
-    for table, category in (
-        ("project_directory", "project_directory.directory"),
-        ("session", "session.directory"),
-        ("workspace", "workspace.directory"),
-    ):
+    for table in _ROW_LOCATION_CATEGORIES:
+        category = _ROW_LOCATION_CATEGORIES[table]
         expected = [row for row in state.rows if row.table == table]
-        count = connection.execute(
-            f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (state.project_id,)
-        ).fetchone()
-        if count != (len(expected),):
-            raise MoveError(f"move {table} row count changed")
+        columns = (
+            "project_id, directory, type, strategy, time_created"
+            if table == "project_directory"
+            else "id, project_id, directory"
+        )
+        order = "project_id, directory" if table == "project_directory" else "id"
+        observed = iter(
+            connection.execute(
+                f"SELECT {columns} FROM {_quote(table)} WHERE project_id = ? ORDER BY {order}",
+                (state.project_id,),
+            )
+        )
         for row in expected:
             directory = targets[(category, row.identity)] if row.directory is not None else None
             if table == "project_directory":
                 if len(row.payload) != 3:
                     raise MoveError("move reviewed project-directory payload is malformed")
-                found = connection.execute(
-                    "SELECT COUNT(*) FROM project_directory "
-                    "WHERE project_id = ? AND directory = ? AND type IS ? "
-                    "AND strategy IS ? AND time_created IS ?",
-                    (state.project_id, directory, *row.payload),
-                ).fetchone()
+                expected_row = (state.project_id, directory, *row.payload)
             else:
-                found = connection.execute(
-                    f"SELECT COUNT(*) FROM {_quote(table)} WHERE id = ? AND project_id = ? AND directory IS ?",
-                    (row.identity[0], state.project_id, directory),
-                ).fetchone()
-            if found != (1,):
+                expected_row = (row.identity[0], state.project_id, directory)
+            if next(observed, None) != expected_row:
                 raise MoveError(f"move {table} post-update validation failed")
+        if next(observed, None) is not None:
+            raise MoveError(f"move {table} row count changed")
 
 
 def _after_move_update_group(group: str) -> None:
@@ -668,18 +672,20 @@ def _capture_project(
     totals are known. It does not change the snapshot queries or captured state.
     """
     row_tables = ("project_directory", "session", "workspace")
-    counts = [
-        connection.execute(
-            f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (project_id,)
-        ).fetchone()
-        for table in row_tables
-    ]
-    if any(count is None or len(count) != 1 or type(count[0]) is not int for count in counts):
-        raise MoveError("move selected row count is malformed")
-    total = 1 + sum(count[0] for count in counts)
-    if total > MAX_SELECTED_ROWS:
-        raise MoveError("move selected row limit exceeded")
-    _report_progress(progress, "collection", 0, total, False)
+    total: int | None = None
+    if progress is not None:
+        counts = [
+            connection.execute(
+                f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            for table in row_tables
+        ]
+        if any(count is None or len(count) != 1 or type(count[0]) is not int for count in counts):
+            raise MoveError("move selected row count is malformed")
+        total = 1 + sum(count[0] for count in counts)
+        if total > MAX_SELECTED_ROWS:
+            raise MoveError("move selected row limit exceeded")
+        _report_progress(progress, "collection", 0, total, False)
     projects = connection.execute(
         "SELECT id, worktree, sandboxes FROM project WHERE id = ?", (project_id,)
     ).fetchall()
@@ -756,13 +762,12 @@ def _sandbox_text(value: object) -> str:
 
 def _capture_size(project: dict[str, str], rows: list[CapturedRow]) -> None:
     """Enforce aggregate scalar bounds before immutable plan construction."""
-    values = list(project.values())
+    total = sum(_captured_scalar_size(value) for value in project.values())
     for row in rows:
-        values.extend(row.identity)
+        total += sum(_captured_scalar_size(value) for value in row.identity)
         if row.directory is not None:
-            values.append(row.directory)
-        values.extend(row.payload)
-    total = sum(_captured_scalar_size(value) for value in values)
+            total += _captured_scalar_size(row.directory)
+        total += sum(_captured_scalar_size(value) for value in row.payload)
     if total > MAX_CAPTURE_BYTES:
         raise MoveError("move captured scalar limit exceeded")
 
@@ -801,14 +806,13 @@ def _build_mappings(
     sandboxes = json.loads(state.sandboxes)
     for index, sandbox in enumerate(sandboxes):
         _add_location(locations, sandbox, LocationMembership("project.sandbox", (state.project_id, str(index))))
-    categories = {
-        "project_directory": "project_directory.directory",
-        "session": "session.directory",
-        "workspace": "workspace.directory",
-    }
     for row in state.rows:
         if row.directory is not None:
-            _add_location(locations, row.directory, LocationMembership(categories[row.table], row.identity))
+            _add_location(
+                locations,
+                row.directory,
+                LocationMembership(_ROW_LOCATION_CATEGORIES[row.table], row.identity),
+            )
     if len(locations) > MAX_LOCATIONS:
         raise MoveError("move distinct location limit exceeded")
     mappings: list[MoveMapping] = []

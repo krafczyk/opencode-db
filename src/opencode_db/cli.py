@@ -477,7 +477,7 @@ def _execute_move(request: MoveCommandRequest) -> int:
                 response = sys.stdin.readline()
             except KeyboardInterrupt:
                 response = ""
-            if _remove_line_ending(response) != "y":
+            if response.removesuffix("\n").removesuffix("\r") != "y":
                 sys.stderr.write("opencode-db: move cancelled; no changes were applied\n")
                 return EXIT_PRECONDITION_REFUSED
         apply_sibling_move(reviewed, progress=callback)
@@ -545,15 +545,6 @@ def _is_terminal(stream: object) -> bool:
         return bool(isatty()) if callable(isatty) else False
     except OSError:
         return False
-
-
-def _remove_line_ending(value: str) -> str:
-    """Remove exactly one conventional input line ending without trimming input."""
-    if value.endswith("\n"):
-        value = value[:-1]
-    if value.endswith("\r"):
-        value = value[:-1]
-    return value
 
 
 class _MoveProgressReporter:
