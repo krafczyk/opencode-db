@@ -2,8 +2,55 @@
 
 This document specifies the version-1 local protocol used by `opencode-db`.
 It is intentionally a fail-closed retained-evidence protocol, not an OpenCode
-database schema specification. The command never discovers targets, starts
-OpenCode, inspects processes, or coordinates database users.
+database schema specification. The command never discovers targets through
+OpenCode, starts OpenCode, inspects processes, or coordinates database users.
+
+## Project and session inspection
+
+The human-only read-only inspection grammar is:
+
+```text
+opencode-db list-projects [--db ABSOLUTE_DB]
+opencode-db show-project [--db ABSOLUTE_DB] --project-id ID
+opencode-db show-session [--db ABSOLUTE_DB] --session-id ID
+```
+
+No inspection command accepts `--json`. An omitted `--db` selects
+`$XDG_DATA_HOME/opencode/opencode.db`; when `XDG_DATA_HOME` is absent or not an
+absolute path it falls back to `$HOME/.local/share/opencode/opencode.db`. If
+neither base is absolute, or the selected file is absent or not regular, the
+command refuses. Successful output starts with the selected canonical database
+path. The database is opened only through SQLite `mode=ro`; inspection never
+prompts, mutates, checkpoints, migrates, invokes OpenCode, or inspects
+processes. Failed SQLite integrity or foreign-key checks are safety refusals.
+
+`list-projects` emits one deterministic block per exact `project.id`. It prints
+available safe project metadata and all supported registered structure:
+worktree, decoded absolute sandboxes, `project_directory` directory/type/strategy
+records, workspace directory/count summaries, and session directory/count
+summaries. It never reads arbitrary message or event data.
+
+`show-project` requires exactly one matching project row. It prints the same
+project structure followed by deterministic session summaries. Every session
+summary starts with `session_id` and provides available safe metadata plus
+separate `v2_turns`, `legacy_turns`, and `pending_inputs` counts. Turn counts
+include only visible user/assistant rows. It never prints transcript text.
+
+`show-session` requires exactly one matching session row and its one project
+row. It prints session metadata, project metadata, then separate turn/input
+counts. Current V2 rows are rendered only in `session_message` `seq` order;
+legacy rows are rendered separately in `message` `time_created,id` order with
+their `part` children in OpenCode's deterministic `id` order. User, assistant,
+and system text is shown. Reasoning, tools, shell activity, compaction, and
+other non-text records are concise labels only: tool inputs/results, shell
+commands/output, and hidden context snapshots are never dumped.
+Unpromoted `session_input` prompts are a separate pending section; promoted
+inputs are never duplicated. `session_context_epoch.baseline` and snapshots are
+never read or printed. If both transcript systems exist they remain separate,
+not a synthesized chronology. Unsupported required columns or malformed JSON
+are bounded safety refusals rather than guessed or silently omitted output.
+Transcript output is intentionally private; operators must protect stdout and
+must not redirect it to shared logs.
 
 ## Session transfer
 
@@ -55,11 +102,13 @@ idempotent and does not alter unrelated project state.
 
 ## Target and identities
 
-Each command starts with one exact absolute `--database` path. Preview requires
-that path to be an existing regular file. Status, abort, resume, rollback, and
-`prune-backup` can resolve a recorded target while an incomplete installation
-has moved the active main file. Relative paths, `:memory:`, missing preview
-targets, paths used as IDs, prefixes, and globs are refused.
+Cleanup commands start with one exact absolute `--database` path. Preview
+requires that path to be an existing regular file. Status, abort, resume,
+rollback, and `prune-backup` can resolve a recorded target while an incomplete
+installation has moved the active main file. Inspection selection is instead
+defined above and always requires an existing regular file. Relative paths,
+`:memory:`, missing preview targets, paths used as IDs, prefixes, and globs are
+refused.
 
 The control store is `<database-parent>/.opencode-db/<target-id>/`. The
 `target-id` is derived from the canonical absolute target path and is used to
@@ -157,8 +206,8 @@ reported as `scratch_cleanup_required` and is not removed remotely.
 ## Result and exits
 
 Cleanup commands with `--json` emit exactly one UTF-8, ASCII-safe,
-newline-terminated object on stdout, capped at 64 KiB. Top-level transfer
-commands instead use their documented human-only output. The cleanup result has
+newline-terminated object on stdout, capped at 64 KiB. Top-level transfer and
+inspection commands instead use their documented human-only output. The cleanup result has
 no unknown version-1 fields:
 
 ```text

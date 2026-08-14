@@ -14,14 +14,47 @@ salvage tool.
 
 - Linux only; Python 3.11 or newer.
 - No runtime dependencies beyond the Python standard library.
-- Every command requires an exact absolute `--database` path. The tool never
-  discovers an OpenCode database and never accepts a relative or in-memory
-  target.
+- Cleanup and transfer commands require an exact absolute database path. The
+  read-only inspection commands accept an optional absolute `--db` and otherwise
+  use `$XDG_DATA_HOME/opencode/opencode.db`, falling back to
+  `$HOME/.local/share/opencode/opencode.db`. They never discover a target through
+  OpenCode and never accept a relative or in-memory target.
 - The operator owns shutdown, restart, and concurrent-use safety. Commands run
   immediately: they do not prompt for confirmation, inspect processes, or
   coordinate other users.
 - The tool never starts OpenCode. After a successful install, start OpenCode
   separately using its unchanged normal command and configuration.
+
+## Project and session inspection
+
+These human-only, read-only commands inspect an existing OpenCode database
+without prompting, mutating, checkpointing, migrating, starting OpenCode, or
+inspecting processes:
+
+```bash
+opencode-db list-projects [--db /absolute/path/opencode.db]
+opencode-db show-project [--db /absolute/path/opencode.db] --project-id ID
+opencode-db show-session [--db /absolute/path/opencode.db] --session-id ID
+```
+
+The selected canonical database path is printed first. Selection fails closed
+when the default base is absent or non-absolute, or when the selected path is
+not an existing regular file. Inspection opens SQLite only in `mode=ro` and
+refuses failed SQLite integrity or foreign-key checks.
+`list-projects` groups safe project metadata, worktrees, decoded sandboxes,
+registered project directories, workspace directory summaries, and session
+directory/count summaries. `show-project` adds deterministic session summaries
+and separate visible V2, legacy, and pending-input counts, but never prints any
+transcript text.
+
+`show-session` prints safe session and project metadata, those separate counts,
+then separate V2 and legacy transcript sections when present. It renders only
+user, assistant, and system text; reasoning, tools, shell activity, compaction,
+and other non-text records are concise labels without tool inputs/results,
+shell command/output, or hidden context snapshots. Unpromoted inbox prompts are
+shown separately and promoted prompts are not repeated. Transcript output is
+intentionally private: protect stdout and do not redirect it to shared logs.
+There is no `--json` inspection mode.
 
 ## Session transfer
 
@@ -221,9 +254,9 @@ space in an OpenCode database.
 ## Results, deadlines, and storage
 
 Cleanup commands accept `--json` for exactly one newline-terminated
-schema-version-1 JSON object on stdout. Top-level `export` and `import` do not
-accept `--json`; their separate human-only success output is written to stdout
-and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
+schema-version-1 JSON object on stdout. Top-level `export`, `import`, and the
+inspection commands do not accept `--json`; their separate human-only success
+output is written to stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
 syntax/input shape, `3` uncertain decision required, `4` safety-precondition
 refusal, `5` operational or validation failure, and `6` manual recovery
 required.

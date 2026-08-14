@@ -198,6 +198,9 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("prune-backup", text)
             self.assertIn("opencode-db export --db", text)
             self.assertIn("opencode-db import --target-project-dir", text)
+            self.assertIn("opencode-db list-projects", text)
+            self.assertIn("opencode-db show-project", text)
+            self.assertIn("opencode-db show-session", text)
             self.assertIn("`cleanup prune`", text)
             self.assertIn("absolute", text)
             self.assertIn("OpenCode", text)
@@ -331,16 +334,27 @@ class CliContractTests(unittest.TestCase):
                 "resume",
                 "rollback",
                 "prune-backup",
+                "list-projects",
+                "show-project",
+                "show-session",
             ]
 
             for action in actions:
                 with self.subTest(action=action):
                     stdout = io.StringIO()
                     with redirect_stdout(stdout):
-                        arguments = [action, "--help"] if action in {"export", "import"} else ["cleanup", action, "--help"]
+                        arguments = (
+                            [action, "--help"]
+                            if action in {"export", "import", "list-projects", "show-project", "show-session"}
+                            else ["cleanup", action, "--help"]
+                        )
                         self.assertEqual(cli.main(arguments), 0)
                     self.assertIn(action, stdout.getvalue())
-                    option = "--db ABSOLUTE_DB" if action in {"export", "import"} else "--database ABSOLUTE_PATH"
+                    option = (
+                        "--db ABSOLUTE_DB"
+                        if action in {"export", "import", "list-projects", "show-project", "show-session"}
+                        else "--database ABSOLUTE_PATH"
+                    )
                     self.assertIn(option, stdout.getvalue())
 
             self.assertEqual(database.read_bytes(), before)

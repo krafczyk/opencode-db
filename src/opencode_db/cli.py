@@ -30,6 +30,12 @@ from .install import (
     resume_install,
     rollback_install,
 )
+from .inspect import (
+    InspectionError,
+    InspectionOperationalError,
+    InspectionRequest,
+    inspect_database,
+)
 from .model import (
     EXIT_DECISION_REQUIRED,
     EXIT_MANUAL_RECOVERY_REQUIRED,
@@ -105,17 +111,22 @@ class CliUsageError(ValueError):
         self.command = command
 
 
-def parse_command(arguments: Sequence[str]) -> CommandRequest | TransferRequest:
+def parse_command(
+    arguments: Sequence[str],
+) -> CommandRequest | TransferRequest | InspectionRequest:
     """Parse one cleanup or top-level transfer command without accessing state.
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
-    Returns a :class:`CommandRequest` or :class:`TransferRequest` with only
+    Returns a :class:`CommandRequest`, :class:`TransferRequest`, or
+    :class:`InspectionRequest` with only
     validated explicit fields. Raises :class:`CliUsageError` or
     :class:`TransferUsageError` for unknown commands, missing options, invalid
     absolute paths, ambiguous IDs, duplicate options, and non-finite deadlines.
     The function never reads stdin, creates a database, or mutates a file.
     """
     values = list(arguments)
+    if values and values[0] in {"list-projects", "show-project", "show-session"}:
+        return _parse_inspection_command(values)
     if values and values[0] in {"export", "import"}:
         return parse_transfer_command(values)
     if len(values) < 2 or values[0] != "cleanup":
@@ -165,6 +176,51 @@ def parse_command(arguments: Sequence[str]) -> CommandRequest | TransferRequest:
         snapshot_id=snapshot_id,
         approve_uncertain_report=report,
     )
+
+
+def _parse_inspection_command(arguments: list[str]) -> InspectionRequest:
+    """Parse one human-only read-only inspection command without filesystem access.
+
+    Parameters: ``arguments`` begins with a public inspection command. Returns
+    an :class:`InspectionRequest` whose optional ``--db`` is syntactically
+    absolute. Raises :class:`CliUsageError` for missing, duplicate, unknown, or
+    ambiguous arguments. The function does not resolve defaults, open SQLite,
+    create files, or inspect processes.
+    """
+    command = arguments[0]
+    allowed = {
+        "list-projects": {"db"},
+        "show-project": {"db", "project-id"},
+        "show-session": {"db", "session-id"},
+    }[command]
+    required = {
+        "list-projects": set(),
+        "show-project": {"project-id"},
+        "show-session": {"session-id"},
+    }[command]
+    options: dict[str, str] = {}
+    position = 1
+    while position < len(arguments):
+        token = arguments[position]
+        if not token.startswith("--"):
+            raise CliUsageError(command, "Unexpected positional argument.")
+        name = token[2:]
+        if name not in allowed:
+            raise CliUsageError(command, "Unsupported command option.")
+        if name in options:
+            raise CliUsageError(command, "Command options may not be repeated.")
+        if position + 1 >= len(arguments) or arguments[position + 1].startswith("--"):
+            raise CliUsageError(command, "A command option is missing its value.")
+        options[name] = arguments[position + 1]
+        position += 2
+    if missing := required - set(options):
+        raise CliUsageError(command, f"Missing required option --{sorted(missing)[0]}.")
+    database = (
+        _absolute_path(options["db"], command, "db") if "db" in options else None
+    )
+    project_id = _optional_id(options, "project-id", command)
+    session_id = _optional_id(options, "session-id", command)
+    return InspectionRequest(command, database, project_id, session_id)
 
 
 def render_json(result: Result) -> str:
@@ -255,7 +311,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if _wants_help(values):
         sys.stdout.write(_help_text(values))
         return 0
-    json_mode = "--json" in values
+    json_mode = "--json" in values and (
+        not values or values[0] not in {"list-projects", "show-project", "show-session"}
+    )
     try:
         request = parse_command(values)
     except (CliUsageError, TransferUsageError) as error:
@@ -274,12 +332,41 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     if isinstance(request, TransferRequest):
         return _execute_transfer(request)
+    if isinstance(request, InspectionRequest):
+        return _execute_inspection(request)
     result = _execute(request)
     if request.json:
         sys.stdout.write(render_json(result))
     else:
         sys.stderr.write(render_human(result))
     return result.exit_code
+
+
+def _execute_inspection(request: InspectionRequest) -> int:
+    """Render one read-only inspection view to stdout without cleanup result encoding.
+
+    Parameters: ``request`` has validated grammar and a possibly implicit
+    database selection. Returns zero for a rendered view, the safety refusal
+    class for unavailable selections/schema/data, or the operational class for
+    bounded filesystem/SQLite read failures. It never opens the database writable
+    or prints transcript content except from ``show-session``.
+    """
+    try:
+        sys.stdout.write(
+            inspect_database(
+                request.database,
+                request.command,
+                project_id=request.project_id,
+                session_id=request.session_id,
+            )
+        )
+        return 0
+    except InspectionOperationalError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_OPERATIONAL_FAILURE
+    except InspectionError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_PRECONDITION_REFUSED
 
 
 def _execute_transfer(request: TransferRequest) -> int:
@@ -809,8 +896,11 @@ def _wants_help(values: Sequence[str]) -> bool:
 
 
 def _help_text(values: Sequence[str]) -> str:
-    command = " ".join(values[:2])
+    command = values[0] if values and values[0] in {"list-projects", "show-project", "show-session"} else " ".join(values[:2])
     synopses = {
+        "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB]",
+        "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID",
+        "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID",
         "export": "opencode-db export --db ABSOLUTE_DB --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
         "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR --db ABSOLUTE_DB --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview --database ABSOLUTE_PATH [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
@@ -821,13 +911,13 @@ def _help_text(values: Sequence[str]) -> str:
         "cleanup rollback": "opencode-db cleanup rollback --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]",
         "cleanup prune-backup": "opencode-db cleanup prune-backup --database ABSOLUTE_PATH --snapshot ID [--json]",
     }
-    if values and values[0] in {"export", "import"}:
+    if values and values[0] in {"export", "import", "list-projects", "show-project", "show-session"}:
         return synopses[values[0]] + "\n"
     if command in synopses:
         return synopses[command] + "\n"
     return (
         "\n".join(
-            ["usage: opencode-db (cleanup COMMAND | export | import) [OPTIONS]", *synopses.values()]
+            ["usage: opencode-db (cleanup COMMAND | export | import | list-projects | show-project | show-session) [OPTIONS]", *synopses.values()]
         )
         + "\n"
     )
