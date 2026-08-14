@@ -42,12 +42,17 @@ def move_fixture(root: Path, *, duplicate: bool = False) -> tuple[Path, Path, Pa
         subprocess.run(["git", "-C", str(checkout), "add", "marker"], check=True)
         subprocess.run(
             [
-                "git", "-C", str(checkout), "-c", "user.name=Test", "-c",
-                "user.email=test@example.invalid", "commit", "-qm", "initial",
+                "git", "-C", str(checkout), "-c", "maintenance.auto=false", "-c",
+                "gc.auto=0", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "initial",
             ],
             check=True,
         )
-        shutil.copytree(checkout, target_parent / name)
+        shutil.copytree(
+            checkout,
+            target_parent / name,
+            ignore=shutil.ignore_patterns("*.lock"),
+        )
     database = root / "opencode.db"
     connection = sqlite3.connect(database)
     try:
