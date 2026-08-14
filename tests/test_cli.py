@@ -275,6 +275,9 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("Linux only", readme)
         self.assertIn("`mv` is the sole interactive exception", normalized_readme)
         self.assertIn("never starts OpenCode", normalized_readme)
+        for text in (normalized_readme, normalized_protocol):
+            self.assertIn("source or target project checkout entries", text)
+            self.assertIn("SQLite-managed standard sidecars", text)
         for command in (
             "mv",
             "list-projects",

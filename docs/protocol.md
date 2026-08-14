@@ -118,10 +118,12 @@ bounded XDG/HOME default described in Target and identities.
 The operator owns filesystem placement: copy the complete flat sibling checkout
 family first, invoke `mv` to change metadata, verify the result, then separately
 remove old directories if desired. The command never copies, moves, creates,
-repairs, renames, or removes filesystem entries. It validates every supported
-structured project location, compares each source/target Git checkout locally,
-then writes a deterministic complete mapping preview to stdout. Paths are
-single-line ASCII-escaped and quoted; each mapping reports the affected
+repairs, renames, or removes source or target project checkout entries, nor does
+it change their contents. SQLite may perform normal writes to the selected
+database and its SQLite-managed standard sidecars. The command validates every
+supported structured project location, compares each source/target Git checkout
+locally, then writes a deterministic complete mapping preview to stdout. Paths
+are single-line ASCII-escaped and quoted; each mapping reports the affected
 structured category counts.
 
 Without `--yes`, both stdin and stdout must be terminals. The command refuses

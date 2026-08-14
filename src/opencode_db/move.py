@@ -278,7 +278,9 @@ def apply_sibling_move(
     bounded writer lock or perform the transaction. The function writes only the
     selected project's worktree, sandbox JSON, project-directory keys, session
     directories, and non-null workspace directories. It neither rewrites
-    historical/free-form data nor changes filesystem or Git content.
+    historical/free-form data nor changes source or target project checkout
+    entries or contents. SQLite may perform normal writes to the selected
+    database and its SQLite-managed standard sidecars.
     """
     if not isinstance(reviewed, ReviewedMovePlan):
         raise MoveError("move reviewed plan is malformed")

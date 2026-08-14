@@ -126,9 +126,11 @@ database as a fallback.
 
 `mv` updates only the selected project's current structured location metadata
 after the operator has copied a flat family of sibling Git checkouts. It never
-copies, moves, repairs, renames, or removes filesystem entries. The operator
-first copies the source family, then runs `mv`, verifies normal OpenCode use,
-and finally performs any old-directory cleanup separately.
+copies, moves, creates, repairs, renames, or removes source or target project
+checkout entries, nor does it change their contents. SQLite may perform normal
+writes to the selected database and its SQLite-managed standard sidecars. The
+operator first copies the source family, then runs `mv`, verifies normal OpenCode
+use, and finally performs any old-directory cleanup separately.
 
 ```bash
 opencode-db mv --project-id ID \
