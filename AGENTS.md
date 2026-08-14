@@ -22,9 +22,11 @@ tooling are trusted. Other agents sharing the worktree are cooperative but can
 change files concurrently. Other local users, remote services, package
 registries, external input, and data returned by OpenCode are untrusted.
 
-The cleanup tool receives an explicit database path from an operator. It must
-not discover a target through OpenCode, inspect processes, request a shutdown
-confirmation, or automatically run at OpenCode startup or shutdown.
+The tool accepts an explicit absolute database path or the documented bounded
+XDG/HOME default. It must not discover a target through OpenCode, inspect
+processes, request a shutdown confirmation, or automatically run at OpenCode
+startup or shutdown. Explicit values remain absolute and non-memory; default
+selection does not probe paths before command-specific validation.
 
 ## Filesystem And Concurrency Assumptions
 

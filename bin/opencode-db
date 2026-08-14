@@ -7,14 +7,14 @@ die() {
   exit 1
 }
 
-case ${HOME:-} in
-  /*) ;;
-  *) die "HOME must be an absolute path" ;;
-esac
-data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
-case $data_home in
-  /*) ;;
-  *) die "XDG_DATA_HOME must be an absolute path" ;;
+case ${XDG_DATA_HOME:-} in
+  /*) data_home=$XDG_DATA_HOME ;;
+  *)
+    case ${HOME:-} in
+      /*) data_home=$HOME/.local/share ;;
+      *) die "XDG_DATA_HOME or HOME must be an absolute path" ;;
+    esac
+    ;;
 esac
 checkout="$data_home/mkchad/components/opencode-db"
 source_dir="$checkout/src"

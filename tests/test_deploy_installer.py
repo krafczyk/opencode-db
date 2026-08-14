@@ -204,10 +204,15 @@ class DeployInstallerTests(unittest.TestCase):
             ],
         )
 
-    def test_launcher_refuses_a_relative_deployed_data_root(self) -> None:
+    def test_launcher_refuses_without_an_absolute_deployed_data_root(self) -> None:
         """Never resolve the managed checkout relative to the caller directory."""
         installed = self._run("--recovery-dir", str(self.recovery))
-        environment = {**self.environment, "XDG_DATA_HOME": "relative-data"}
+        environment = {
+            key: value
+            for key, value in self.environment.items()
+            if key != "HOME"
+        }
+        environment["XDG_DATA_HOME"] = "relative-data"
 
         launched = subprocess.run(
             [str(self.target), "--help"],
@@ -221,6 +226,43 @@ class DeployInstallerTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertNotEqual(launched.returncode, 0)
         self.assertIn("XDG_DATA_HOME", launched.stderr)
+
+    def test_launcher_uses_absolute_xdg_without_home(self) -> None:
+        """Allow an absolute XDG checkout base when HOME is unavailable."""
+        installed = self._run("--recovery-dir", str(self.recovery))
+        environment = {key: value for key, value in self.environment.items() if key != "HOME"}
+
+        launched = subprocess.run(
+            [str(self.target), "--help"],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+
+    def test_launcher_falls_back_to_home_when_xdg_is_relative(self) -> None:
+        """Derive the pinned checkout from HOME after rejecting a relative XDG base."""
+        installed = self._run("--recovery-dir", str(self.recovery))
+        fallback_checkout = self.home / ".local" / "share" / "mkchad" / "components" / "opencode-db"
+        fallback_checkout.parent.mkdir(parents=True)
+        shutil.copytree(self.checkout, fallback_checkout)
+        environment = {**self.environment, "XDG_DATA_HOME": "relative-data"}
+
+        launched = subprocess.run(
+            [str(self.target), "--help"],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(launched.returncode, 0, launched.stderr)
 
     def test_launcher_ignores_caller_imports_and_keeps_checkout_clean(self) -> None:
         """Use only pinned package bytes without creating bytecode in the checkout."""

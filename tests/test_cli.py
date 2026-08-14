@@ -104,6 +104,54 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(request.command, command)
                 self.assertEqual(request.database, database)
 
+    def test_cleanup_commands_select_the_omitted_database_from_xdg(self) -> None:
+        """Keep cleanup request targets concrete without checking the selected file."""
+        expected = "/missing/xdg/opencode/opencode.db"
+        cases = [
+            ["cleanup", "preview"],
+            ["cleanup", "install", "--candidate", "candidate-1"],
+            ["cleanup", "status"],
+            ["cleanup", "abort", "--operation", "operation-1"],
+            ["cleanup", "resume", "--operation", "operation-1"],
+            ["cleanup", "rollback", "--operation", "operation-1"],
+            [
+                "cleanup",
+                "prune-backup",
+                "--snapshot",
+                "snapshot-20260805T000000Z-000000000000000000000000",
+            ],
+        ]
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "/missing/xdg", "HOME": "relative"}, clear=True):
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    self.assertEqual(cli.parse_command(arguments).database, expected)
+
+    def test_cleanup_default_prunes_recorded_target_when_the_main_file_is_absent(self) -> None:
+        """Leave catalog-derived cleanup actions available after the default main file moves."""
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode-db-v1") as directory:
+            root = Path(directory)
+            xdg = root / "xdg"
+            database = xdg / "opencode" / "opencode.db"
+            database.parent.mkdir(parents=True)
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE entries (value TEXT)")
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg), "HOME": "relative"}, clear=True):
+                preview_exit, preview = self._run_json(["cleanup", "preview", "--json"])
+                database.unlink()
+                prune_exit, pruned = self._run_json(
+                    [
+                        "cleanup",
+                        "prune-backup",
+                        "--snapshot",
+                        str(preview["snapshot_id"]),
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(preview_exit, 0)
+        self.assertEqual(prune_exit, 0)
+        self.assertEqual(pruned["status"], Status.BACKUP_PRUNED.value)
+
     def test_transfer_commands_have_closed_top_level_grammar(self) -> None:
         """Accept the explicit transfer synopses and reject cleanup-only options."""
         cases = [
@@ -142,6 +190,25 @@ class CliContractTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, EXIT_USAGE)
         self.assertEqual(payload["status"], Status.SYNTAX_ERROR.value)
+
+    def test_transfer_commands_allow_an_omitted_database_option(self) -> None:
+        """Select the shared environment default while retaining transfer-only grammar."""
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "/xdg", "HOME": "relative"}, clear=True):
+            exported = cli.parse_command(
+                ["export", "--project-dir", "/tmp/project", "--export-dir", "/tmp/exports"]
+            )
+            imported = cli.parse_command(
+                [
+                    "import",
+                    "--target-project-dir",
+                    "/tmp/project",
+                    "--import",
+                    "/tmp/transfer.sqlite",
+                ]
+            )
+
+        self.assertEqual(exported.database, "/xdg/opencode/opencode.db")
+        self.assertEqual(imported.database, "/xdg/opencode/opencode.db")
 
     def test_transfer_failures_use_operational_or_safety_exit_classes(self) -> None:
         """Classify transfer operational failures separately from safety refusals."""
@@ -196,7 +263,6 @@ class CliContractTests(unittest.TestCase):
         )
         for text in (readme, protocol):
             self.assertIn("prune-backup", text)
-            self.assertIn("opencode-db export --db", text)
             self.assertIn("opencode-db import --target-project-dir", text)
             self.assertIn("opencode-db list-projects", text)
             self.assertIn("opencode-db show-project", text)
@@ -204,9 +270,26 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("`cleanup prune`", text)
             self.assertIn("absolute", text)
             self.assertIn("OpenCode", text)
+        self.assertIn("[--db", protocol)
+        self.assertIn("Add `--db /absolute/path", readme)
         self.assertIn("Linux only", readme)
         self.assertIn("do not prompt for confirmation", normalized_readme)
         self.assertIn("never starts OpenCode", normalized_readme)
+        for command in (
+            "list-projects",
+            "show-project",
+            "show-session",
+            "export",
+            "import",
+            "cleanup preview",
+            "cleanup install",
+            "cleanup status",
+            "cleanup resume",
+            "cleanup rollback",
+            "cleanup abort",
+            "cleanup prune-backup",
+        ):
+            self.assertNotIn(f"opencode-db {command} [--", readme)
         self.assertIn("complete", readme)
         self.assertIn("uncertain", readme)
         self.assertIn("invalid", readme)
@@ -351,9 +434,9 @@ class CliContractTests(unittest.TestCase):
                         self.assertEqual(cli.main(arguments), 0)
                     self.assertIn(action, stdout.getvalue())
                     option = (
-                        "--db ABSOLUTE_DB"
+                        "[--db ABSOLUTE_DB]"
                         if action in {"export", "import", "list-projects", "show-project", "show-session"}
-                        else "--database ABSOLUTE_PATH"
+                        else "[--database ABSOLUTE_PATH]"
                     )
                     self.assertIn(option, stdout.getvalue())
 

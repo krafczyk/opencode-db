@@ -55,15 +55,16 @@ must not redirect it to shared logs.
 ## Session transfer
 
 Top-level transfer commands have separate, human-only output from the closed
-cleanup result schema, accept no `--json` option, and accept no implicit target
-selection:
+cleanup result schema and accept no `--json` option:
 
 ```text
-opencode-db export --db ABSOLUTE_DB --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR
-opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR --db ABSOLUTE_DB --import ABSOLUTE_IMPORT_FILE
+opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR
+opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE
 ```
 
-Both `--db` values must name existing regular SQLite files and are opened with
+An explicit `--db` value must name an absolute non-memory path. An omitted
+`--db` uses the bounded XDG/HOME selection defined below. Both resulting
+transfer targets must be existing regular SQLite files and are opened with
 SQLite `mode=rw`; the tool never creates a replacement, empty, or in-memory
 database. Project directories must be existing absolute directories. Export
 resolves one project ID from canonical equality with
@@ -102,13 +103,19 @@ idempotent and does not alter unrelated project state.
 
 ## Target and identities
 
-Cleanup commands start with one exact absolute `--database` path. Preview
-requires that path to be an existing regular file. Status, abort, resume,
-rollback, and `prune-backup` can resolve a recorded target while an incomplete
-installation has moved the active main file. Inspection selection is instead
-defined above and always requires an existing regular file. Relative paths,
-`:memory:`, missing preview targets, paths used as IDs, prefixes, and globs are
-refused.
+Every database-accepting command accepts an explicit absolute database option or
+an omitted bounded default. The default is
+`$XDG_DATA_HOME/opencode/opencode.db` when `XDG_DATA_HOME` is absolute;
+otherwise it is `$HOME/.local/share/opencode/opencode.db` when `HOME` is
+absolute. An absolute XDG base wins regardless of selected-file existence; the
+tool does not search HOME based on the file. Neither usable base is a bounded
+refusal. Default selection only constructs a string and never stats, opens, or
+canonicalizes it. Explicit paths remain non-memory and absolute. Preview,
+install, export, import, and inspection require a present regular file through
+their existing validators. Status, abort, resume, rollback, and `prune-backup`
+can resolve a recorded target while an incomplete installation has moved the
+active main file. Relative paths, `:memory:`, missing preview targets, paths
+used as IDs, prefixes, and globs are refused.
 
 The control store is `<database-parent>/.opencode-db/<target-id>/`. The
 `target-id` is derived from the canonical absolute target path and is used to
@@ -245,7 +252,7 @@ Linux local filesystems; remote or unclassified scratch fails closed.
 
 ## Exact backup pruning
 
-`cleanup prune-backup --database ABSOLUTE_PATH --snapshot ID` resolves one
+`cleanup prune-backup [--database ABSOLUTE_PATH] --snapshot ID` resolves one
 complete snapshot ID through the target catalog. It refuses foreign/unknown IDs,
 path-shaped IDs, prefixes, globs, changed or unexpected group members, and a
 snapshot referenced by a nonterminal installation. Otherwise it removes only

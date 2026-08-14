@@ -16,6 +16,7 @@ import stat
 import tempfile
 
 from .artifacts import new_artifact_id
+from .target import TargetError, select_default_database
 
 ARCHIVE_METADATA_TABLE = "_opencode_db_transfer_metadata"
 """Reserved table name holding the closed session-transfer archive metadata."""
@@ -96,10 +97,11 @@ class TransferUsageError(ValueError):
 class TransferRequest:
     """Represent one grammar-validated export or import request.
 
-    Parameters identify only absolute explicit paths.  ``project_dir`` is the
-    export source project for ``export`` or target project for ``import``;
-    ``export_dir`` and ``import_file`` are present only for their matching
-    operation.  The value neither opens SQLite nor changes filesystem state.
+    Parameters identify absolute paths. ``database`` is either explicit or the
+    documented environment default; ``project_dir`` is the export source project
+    for ``export`` or target project for ``import``; ``export_dir`` and
+    ``import_file`` are present only for their matching operation. The value
+    neither opens SQLite nor changes filesystem state.
     """
 
     command: str
@@ -141,8 +143,8 @@ def parse_transfer_command(arguments: list[str]) -> TransferRequest:
     """Parse one closed top-level session transfer command without I/O.
 
     Parameters: ``arguments`` is argv excluding the program name and must begin
-    with ``export`` or ``import``.  Returns a :class:`TransferRequest` with
-    absolute paths only.  Raises :class:`TransferUsageError` for unknown,
+    with ``export`` or ``import``. Returns a :class:`TransferRequest` with
+    absolute paths only. Raises :class:`TransferUsageError` for unknown,
     duplicate, missing, or unsupported options.  Parsing does not inspect paths,
     open SQLite, or create artifacts.
     """
@@ -168,11 +170,16 @@ def parse_transfer_command(arguments: list[str]) -> TransferRequest:
             raise TransferUsageError(command, "A command option is missing its value.")
         options[name] = arguments[position + 1]
         position += 2
-    if missing := allowed - set(options):
+    required = allowed - {"db"}
+    if missing := required - set(options):
         raise TransferUsageError(
             command, f"Missing required option --{sorted(missing)[0]}."
         )
-    database = _absolute_option(options["db"], command, "db")
+    database = (
+        _absolute_option(options["db"], command, "db")
+        if "db" in options
+        else _default_database(command)
+    )
     if command == "export":
         return TransferRequest(
             command=command,
@@ -190,6 +197,20 @@ def parse_transfer_command(arguments: list[str]) -> TransferRequest:
         ),
         import_file=_absolute_option(options["import"], command, "import"),
     )
+
+
+def _default_database(command: str) -> str:
+    """Return the environment-selected transfer database without inspecting it.
+
+    Parameters: ``command`` identifies the grammar being parsed. Returns the
+    concrete absolute default path. Raises :class:`TransferUsageError` when no
+    absolute XDG or HOME base is available; downstream validators retain file
+    existence and regularity checks.
+    """
+    try:
+        return select_default_database()
+    except TargetError as error:
+        raise TransferUsageError(command, "Default database path is unavailable.") from error
 
 
 def export_sessions(

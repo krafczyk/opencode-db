@@ -16,6 +16,8 @@ from pathlib import Path
 import sqlite3
 import stat
 
+from .target import TargetError, select_default_database
+
 
 class InspectionError(RuntimeError):
     """Report a bounded safety refusal without exposing database row contents.
@@ -74,14 +76,10 @@ def resolve_database_path(explicit: str | None) -> Path:
     for an otherwise valid path that cannot be inspected. No file is created.
     """
     if explicit is None:
-        xdg_data = os.environ.get("XDG_DATA_HOME")
-        home = os.environ.get("HOME")
-        if isinstance(xdg_data, str) and os.path.isabs(xdg_data):
-            selected = Path(xdg_data) / "opencode" / "opencode.db"
-        elif isinstance(home, str) and os.path.isabs(home):
-            selected = Path(home) / ".local" / "share" / "opencode" / "opencode.db"
-        else:
-            raise InspectionError("default database path is unavailable")
+        try:
+            selected = Path(select_default_database())
+        except TargetError as error:
+            raise InspectionError("default database path is unavailable") from error
     else:
         selected = Path(explicit)
     if "\x00" in os.fspath(selected) or not selected.is_absolute():

@@ -14,11 +14,13 @@ salvage tool.
 
 - Linux only; Python 3.11 or newer.
 - No runtime dependencies beyond the Python standard library.
-- Cleanup and transfer commands require an exact absolute database path. The
-  read-only inspection commands accept an optional absolute `--db` and otherwise
-  use `$XDG_DATA_HOME/opencode/opencode.db`, falling back to
-  `$HOME/.local/share/opencode/opencode.db`. They never discover a target through
-  OpenCode and never accept a relative or in-memory target.
+- Every database-accepting command accepts an optional explicit absolute
+  database option. When omitted, it selects `$XDG_DATA_HOME/opencode/opencode.db`
+  if `XDG_DATA_HOME` is absolute, otherwise
+  `$HOME/.local/share/opencode/opencode.db` if `HOME` is absolute. An absolute
+  XDG base wins even when its selected file is absent; the tool never searches
+  OpenCode or falls back based on file existence. Explicit values never accept a
+  relative or in-memory target.
 - The operator owns shutdown, restart, and concurrent-use safety. Commands run
   immediately: they do not prompt for confirmation, inspect processes, or
   coordinate other users.
@@ -32,10 +34,13 @@ without prompting, mutating, checkpointing, migrating, starting OpenCode, or
 inspecting processes:
 
 ```bash
-opencode-db list-projects [--db /absolute/path/opencode.db]
-opencode-db show-project [--db /absolute/path/opencode.db] --project-id ID
-opencode-db show-session [--db /absolute/path/opencode.db] --session-id ID
+opencode-db list-projects
+opencode-db show-project --project-id ID
+opencode-db show-session --session-id ID
 ```
+
+Add `--db /absolute/path/opencode.db` to any inspection command to override the
+default database.
 
 The selected canonical database path is printed first. Selection fails closed
 when the default base is absent or non-absolute, or when the selected path is
@@ -58,18 +63,20 @@ There is no `--json` inspection mode.
 
 ## Session transfer
 
-Session transfer is an explicit, project-scoped workflow for moving complete
-current OpenCode session state between projects known to separate databases. It
+Session transfer is a project-scoped workflow for moving complete current
+OpenCode session state between projects known to separate databases. It uses the
+same bounded optional database selection as every other database command and
 does not discover a database, project, or directory. Arrange database shutdown
 and concurrent-use safety before starting.
 
-Export from an existing absolute database and existing source project directory:
+Export from the selected existing database and existing source project directory:
 
 ```bash
-opencode-db export --db /absolute/path/opencode.db \
-  --project-dir /absolute/source/project \
+opencode-db export --project-dir /absolute/source/project \
   --export-dir /absolute/private/exports
 ```
+
+Add `--db /absolute/path/opencode.db` to override the default source database.
 
 The command prints the canonical export directory, resolved source project ID,
 and one import-file path, never session content. It creates the export directory
@@ -80,13 +87,15 @@ The archive contains all rows and columns from `session`, `message`, `part`,
 sessions are included only when their recorded directory matches the selected
 project directory.
 
-Import that exact file into an existing target database and project directory:
+Import that exact file into the selected existing target database and project directory:
 
 ```bash
 opencode-db import --target-project-dir /absolute/target/project \
-  --db /absolute/path/target-opencode.db \
   --import /absolute/private/exports/opencode-session-YYYYMMDDTHHMMSSZ-HEX.sqlite
 ```
+
+Add `--db /absolute/path/target-opencode.db` to override the default target
+database.
 
 Import resolves exactly one target project, preserves session IDs and parent
 relationships, changes imported `session.project_id` to that target, stores the
@@ -141,7 +150,16 @@ exact launcher at `~/.local/bin/opencode-db` without building a wheel, contactin
 a package index, or adding runtime dependencies:
 
 ```bash
-COMPONENT="${XDG_DATA_HOME:-$HOME/.local/share}/mkchad/components/opencode-db"
+case ${XDG_DATA_HOME:-} in
+  /*) DATA_HOME=$XDG_DATA_HOME ;;
+  *)
+    case ${HOME:-} in
+      /*) DATA_HOME=$HOME/.local/share ;;
+      *) printf '%s\n' "XDG_DATA_HOME or HOME must be absolute" >&2; exit 1 ;;
+    esac
+    ;;
+esac
+COMPONENT="$DATA_HOME/mkchad/components/opencode-db"
 RECOVERY_DIR=/private/caller-created/recovery-directory
 "$COMPONENT/bin/install_opencode_db.sh" --check --recovery-dir "$RECOVERY_DIR"
 "$COMPONENT/bin/install_opencode_db.sh" --recovery-dir "$RECOVERY_DIR"
@@ -154,19 +172,24 @@ private recovery directory; if it replaces a noncompliant regular launcher, it
 retains that file as `opencode-db` in that directory. The final check compares
 the installed launcher byte-for-byte with the pinned launcher and runs only
 `opencode-db --help` under a short timeout. At runtime the launcher derives the
-pinned checkout from `XDG_DATA_HOME`, sets `PYTHONPATH` to only that checkout's
-`src`, and executes `python3 -m opencode_db` with unchanged arguments.
+pinned checkout from absolute `XDG_DATA_HOME`, or from absolute `HOME` when XDG
+is absent or relative, sets `PYTHONPATH` to only that checkout's `src`, and
+executes `python3 -m opencode_db` with unchanged arguments.
 
 ## Operator workflow
 
-First arrange OpenCode shutdown if it is needed. Then preview a known absolute
-database path. Preview immediately captures the main file and any present
+First arrange OpenCode shutdown if it is needed. Then preview the bounded
+default database or provide an explicit absolute path. Preview immediately
+captures the main file and any present
 `-wal`, `-shm`, and `-journal` sidecars, works only on a separate scratch copy,
 and retains the source snapshot privately beside the target.
 
 ```bash
-opencode-db cleanup preview --database /absolute/path/opencode.db --json
+opencode-db cleanup preview --json
 ```
+
+Add `--database /absolute/path/opencode.db` to override the default cleanup
+target.
 
 Preview has three classifications:
 
@@ -187,8 +210,7 @@ Installation is a separate explicit action. Use the exact candidate ID returned
 by preview. A complete candidate needs no extra confirmation:
 
 ```bash
-opencode-db cleanup install --database /absolute/path/opencode.db \
-  --candidate candidate-YYYYMMDDTHHMMSSZ-HEX
+opencode-db cleanup install --candidate candidate-YYYYMMDDTHHMMSSZ-HEX
 ```
 
 For an uncertain candidate, copy the exact `report_sha256` from that same
@@ -196,8 +218,7 @@ preview result. This is approval of that candidate/report pair, not a broad
 override:
 
 ```bash
-opencode-db cleanup install --database /absolute/path/opencode.db \
-  --candidate candidate-YYYYMMDDTHHMMSSZ-HEX \
+opencode-db cleanup install --candidate candidate-YYYYMMDDTHHMMSSZ-HEX \
   --approve-uncertain-report LOWERCASE_SHA256
 ```
 
@@ -211,12 +232,9 @@ filesystem paths. Inspect the exact recorded operation and choose one explicit
 recovery action:
 
 ```bash
-opencode-db cleanup status --database /absolute/path/opencode.db \
-  --operation install-YYYYMMDDTHHMMSSZ-HEX --json
-opencode-db cleanup resume --database /absolute/path/opencode.db \
-  --operation install-YYYYMMDDTHHMMSSZ-HEX
-opencode-db cleanup rollback --database /absolute/path/opencode.db \
-  --operation install-YYYYMMDDTHHMMSSZ-HEX
+opencode-db cleanup status --operation install-YYYYMMDDTHHMMSSZ-HEX --json
+opencode-db cleanup resume --operation install-YYYYMMDDTHHMMSSZ-HEX
+opencode-db cleanup rollback --operation install-YYYYMMDDTHHMMSSZ-HEX
 ```
 
 `status` is read-only. `resume` accepts only the durable recorded before/after
@@ -226,8 +244,7 @@ operation ID with `cleanup abort`; cross-host scratch is reported as requiring
 manual cleanup rather than removed remotely.
 
 ```bash
-opencode-db cleanup abort --database /absolute/path/opencode.db \
-  --operation operation-YYYYMMDDTHHMMSSZ-HEX
+opencode-db cleanup abort --operation operation-YYYYMMDDTHHMMSSZ-HEX
 ```
 
 ## Retained artifacts and pruning
@@ -243,7 +260,7 @@ and refuses snapshots required by an incomplete installation. A failed or
 interrupted prune may be retried with the same exact ID.
 
 ```bash
-opencode-db cleanup prune-backup --database /absolute/path/opencode.db \
+opencode-db cleanup prune-backup \
   --snapshot snapshot-YYYYMMDDTHHMMSSZ-HEX --json
 ```
 

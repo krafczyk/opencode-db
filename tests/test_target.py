@@ -15,12 +15,38 @@ from opencode_db.target import (
     TargetEnvironment,
     TargetError,
     admit_scratch,
+    select_default_database,
     resolve_target,
 )
 
 
 class TargetTests(unittest.TestCase):
     """Verify that target and scratch validation fail before database access."""
+
+    def test_default_database_selection_uses_xdg_then_home_without_inspecting_files(
+        self,
+    ) -> None:
+        """Choose only an absolute environment base without probing its database."""
+        self.assertEqual(
+            select_default_database(
+                {"XDG_DATA_HOME": "/missing/xdg", "HOME": "/home/operator"}
+            ),
+            "/missing/xdg/opencode/opencode.db",
+        )
+        self.assertEqual(
+            select_default_database(
+                {"XDG_DATA_HOME": "relative", "HOME": "/home/operator"}
+            ),
+            "/home/operator/.local/share/opencode/opencode.db",
+        )
+        with self.assertRaises(TargetError) as error:
+            select_default_database({"XDG_DATA_HOME": "relative", "HOME": "relative"})
+        self.assertEqual(error.exception.code, "default_database_unavailable")
+        with self.assertRaises(TargetError) as error:
+            select_default_database(
+                {"XDG_DATA_HOME": "/invalid\x00base", "HOME": "/home/operator"}
+            )
+        self.assertEqual(error.exception.code, "default_database_unavailable")
 
     def test_resolve_target_requires_an_existing_regular_absolute_file(self) -> None:
         """Reject invalid target forms without creating a replacement database."""

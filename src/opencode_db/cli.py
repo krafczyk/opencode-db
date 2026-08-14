@@ -56,6 +56,7 @@ from .transfer import (
     import_sessions,
     parse_transfer_command,
 )
+from .target import TargetError, select_default_database
 
 MAX_JSON_BYTES = 64 * 1024
 """Maximum UTF-8 byte length for a machine-mode result, including its newline."""
@@ -87,13 +88,13 @@ _COMMAND_OPTIONS = {
     "prune-backup": {"database", "snapshot", "json"},
 }
 _REQUIRED_OPTIONS = {
-    "preview": {"database"},
-    "install": {"database", "candidate"},
-    "status": {"database"},
-    "abort": {"database", "operation"},
-    "resume": {"database", "operation"},
-    "rollback": {"database", "operation"},
-    "prune-backup": {"database", "snapshot"},
+    "preview": set(),
+    "install": {"candidate"},
+    "status": set(),
+    "abort": {"operation"},
+    "resume": {"operation"},
+    "rollback": {"operation"},
+    "prune-backup": {"snapshot"},
 }
 
 
@@ -118,8 +119,9 @@ def parse_command(
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
     Returns a :class:`CommandRequest`, :class:`TransferRequest`, or
-    :class:`InspectionRequest` with only
-    validated explicit fields. Raises :class:`CliUsageError` or
+    :class:`InspectionRequest` with validated fields; cleanup requests use a
+    concrete environment-selected database string when their option is omitted.
+    Raises :class:`CliUsageError` or
     :class:`TransferUsageError` for unknown commands, missing options, invalid
     absolute paths, ambiguous IDs, duplicate options, and non-finite deadlines.
     The function never reads stdin, creates a database, or mutates a file.
@@ -158,7 +160,11 @@ def parse_command(
 
     if missing := _REQUIRED_OPTIONS[action] - set(options):
         raise CliUsageError(command, f"Missing required option --{sorted(missing)[0]}.")
-    database = _absolute_path(_option(options, "database"), command, "database")
+    database = (
+        _absolute_path(_option(options, "database"), command, "database")
+        if "database" in options
+        else _default_database(command)
+    )
     scratch_dir = _optional_path(options, "scratch-dir", command)
     deadline = _optional_deadline(options, command)
     candidate_id = _optional_id(options, "candidate", command)
@@ -372,7 +378,8 @@ def _execute_inspection(request: InspectionRequest) -> int:
 def _execute_transfer(request: TransferRequest) -> int:
     """Run one transfer command without using the closed cleanup result schema.
 
-    Parameters: ``request`` is a grammar-validated explicit transfer selection.
+    Parameters: ``request`` is a grammar-validated transfer selection with a
+    concrete explicit or environment-selected database path.
     Returns zero after successful export or import, the operational-failure exit
     class for filesystem, SQLite, integrity, or publication failures, and the
     precondition-refusal class for safety refusals. It reports only paths,
@@ -828,6 +835,20 @@ def _absolute_path(value: str, command: str, name: str) -> str:
     return value
 
 
+def _default_database(command: str) -> str:
+    """Return the environment-selected target or one bounded usage refusal.
+
+    Parameters: ``command`` identifies the parser context. Returns the concrete
+    absolute default path without inspecting it. Raises :class:`CliUsageError`
+    when neither documented environment base is absolute; later command layers
+    retain responsibility for file validation and database access.
+    """
+    try:
+        return select_default_database()
+    except TargetError as error:
+        raise CliUsageError(command, "Default database path is unavailable.") from error
+
+
 def _optional_path(
     options: dict[str, str | bool], name: str, command: str
 ) -> str | None:
@@ -901,15 +922,15 @@ def _help_text(values: Sequence[str]) -> str:
         "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB]",
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID",
-        "export": "opencode-db export --db ABSOLUTE_DB --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
-        "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR --db ABSOLUTE_DB --import ABSOLUTE_IMPORT_FILE",
-        "cleanup preview": "opencode-db cleanup preview --database ABSOLUTE_PATH [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
-        "cleanup install": "opencode-db cleanup install --database ABSOLUTE_PATH --candidate ID [--approve-uncertain-report SHA256] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
-        "cleanup status": "opencode-db cleanup status --database ABSOLUTE_PATH [--operation ID] [--json]",
-        "cleanup abort": "opencode-db cleanup abort --database ABSOLUTE_PATH --operation ID [--json]",
-        "cleanup resume": "opencode-db cleanup resume --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]",
-        "cleanup rollback": "opencode-db cleanup rollback --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]",
-        "cleanup prune-backup": "opencode-db cleanup prune-backup --database ABSOLUTE_PATH --snapshot ID [--json]",
+        "export": "opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
+        "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE",
+        "cleanup preview": "opencode-db cleanup preview [--database ABSOLUTE_PATH] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
+        "cleanup install": "opencode-db cleanup install [--database ABSOLUTE_PATH] --candidate ID [--approve-uncertain-report SHA256] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
+        "cleanup status": "opencode-db cleanup status [--database ABSOLUTE_PATH] [--operation ID] [--json]",
+        "cleanup abort": "opencode-db cleanup abort [--database ABSOLUTE_PATH] --operation ID [--json]",
+        "cleanup resume": "opencode-db cleanup resume [--database ABSOLUTE_PATH] --operation ID [--deadline-seconds N] [--json]",
+        "cleanup rollback": "opencode-db cleanup rollback [--database ABSOLUTE_PATH] --operation ID [--deadline-seconds N] [--json]",
+        "cleanup prune-backup": "opencode-db cleanup prune-backup [--database ABSOLUTE_PATH] --snapshot ID [--json]",
     }
     if values and values[0] in {"export", "import", "list-projects", "show-project", "show-session"}:
         return synopses[values[0]] + "\n"

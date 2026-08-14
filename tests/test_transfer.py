@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -70,6 +71,31 @@ def _temporary_directory():
 
 class SessionTransferTests(unittest.TestCase):
     """Prove transfer scope, schema gates, remapping, and replacement behavior."""
+
+    def test_export_cli_uses_the_omitted_xdg_database(self) -> None:
+        """Run a transfer through the default target rather than an explicit --db."""
+        with _temporary_directory() as root:
+            project_dir = root / "source-project"
+            project_dir.mkdir()
+            xdg = root / "xdg"
+            database = xdg / "opencode" / "opencode.db"
+            database.parent.mkdir(parents=True)
+            self._create_database(database, project_dir, root / "other-project")
+            output = io.StringIO()
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg), "HOME": "relative"}, clear=True):
+                with redirect_stdout(output):
+                    exit_code = cli.main(
+                        [
+                            "export",
+                            "--project-dir",
+                            str(project_dir),
+                            "--export-dir",
+                            str(root / "exports"),
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("opencode-db: exported", output.getvalue())
 
     def test_export_reports_private_canonical_artifact_and_complete_table_families(
         self,

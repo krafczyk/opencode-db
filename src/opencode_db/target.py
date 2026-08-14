@@ -1,15 +1,16 @@
-"""Validate explicit source paths and Linux-local scratch preconditions.
+"""Select database paths and validate source and scratch preconditions.
 
 This module never opens SQLite, starts OpenCode, or creates a replacement
-database. It only resolves operator input and checks storage evidence needed
-before the artifact layer writes private source snapshots.
+database. It selects documented environment defaults, resolves operator input,
+and checks storage evidence needed before the artifact layer writes private
+source snapshots.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,31 @@ class TargetError(RuntimeError):
         """Store the stable refusal ``code`` without retaining exception details."""
         super().__init__(code)
         self.code = code
+
+
+def select_default_database(environment: Mapping[str, str] | None = None) -> str:
+    """Select the documented OpenCode database path from environment bases only.
+
+    Parameters: ``environment`` optionally supplies XDG/HOME values for
+    deterministic callers; omitted uses :data:`os.environ`. Returns
+    ``$XDG_DATA_HOME/opencode/opencode.db`` when ``XDG_DATA_HOME`` is absolute,
+    otherwise ``$HOME/.local/share/opencode/opencode.db`` when ``HOME`` is
+    absolute. Raises :class:`TargetError` with ``default_database_unavailable``
+    when neither base is absolute. The function never stats, opens, resolves, or
+    creates the selected path.
+    """
+    values = os.environ if environment is None else environment
+    xdg_data_home = values.get("XDG_DATA_HOME")
+    if isinstance(xdg_data_home, str) and os.path.isabs(xdg_data_home):
+        if "\x00" in xdg_data_home:
+            raise TargetError("default_database_unavailable")
+        return os.path.join(xdg_data_home, "opencode", "opencode.db")
+    home = values.get("HOME")
+    if isinstance(home, str) and os.path.isabs(home):
+        if "\x00" in home:
+            raise TargetError("default_database_unavailable")
+        return os.path.join(home, ".local", "share", "opencode", "opencode.db")
+    raise TargetError("default_database_unavailable")
 
 
 @dataclass(frozen=True)
