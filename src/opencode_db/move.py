@@ -8,7 +8,7 @@ SQLite, creates files, changes filesystem content, or contacts Git remotes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -49,6 +49,12 @@ MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 2.0
 """Fixed wall-clock limit for one local Git probe."""
 
+SQLITE_BUSY_TIMEOUT_MS = 2_000
+"""Maximum connection-local wait for the move application's writer lock."""
+
+REVALIDATION_TIMEOUT_SECONDS = 10.0
+"""Maximum wall-clock time allowed for application-time freshness validation."""
+
 
 class MoveError(RuntimeError):
     """Report a bounded sibling-move safety refusal without mutable side effects.
@@ -59,7 +65,7 @@ class MoveError(RuntimeError):
     """
 
     def __init__(self, message: str) -> None:
-        """Store one bounded, content-free public planning diagnostic."""
+        """Store one bounded, content-free public move diagnostic."""
         super().__init__(message[:512])
 
 
@@ -76,8 +82,8 @@ class MoveOperationalError(MoveError):
 class MoveRequest:
     """Select one project and copied target main worktree for read-only planning.
 
-    ``database`` is an absolute existing SQLite path checked only by
-    :func:`plan_sibling_move`; ``project_id`` identifies exactly one project; and
+    ``database`` is an absolute existing SQLite path checked by planning and
+    application; ``project_id`` identifies exactly one project; and
     ``target_project_dir`` is the absolute lexical target main worktree path.
     Constructing this immutable value performs no filesystem, SQLite, or Git I/O.
     """
@@ -126,14 +132,17 @@ class MoveMapping:
 class CapturedRow:
     """Preserve one selected structured row for later freshness comparison.
 
-    ``table`` is one supported table, ``identity`` is its stable row key, and
-    ``directory`` is its original nullable or non-null location value.  This
-    immutable record is read-only evidence and has no side effects.
+    ``table`` is one supported table, ``identity`` is its stable row key,
+    ``directory`` is its original nullable or non-null location value, and
+    ``payload`` binds non-key project-directory values across preview and apply.
+    The payload is omitted from representations so reviewed state does not
+    render database content. This immutable record has no side effects.
     """
 
     table: str
     identity: tuple[str, ...]
     directory: str | None
+    payload: tuple[object, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -143,7 +152,8 @@ class CapturedState:
     ``schema_fingerprint`` preserves all non-system schema objects; ``project``
     stores the selected project's location-bearing scalars; and ``rows`` retains
     every selected project-directory, session, and workspace row, including null
-    workspace directories.  The value is immutable and is never applied by U1.
+    workspace directories. The value is immutable evidence used to reject a
+    changed preview before any location updates.
     """
 
     schema_fingerprint: tuple[tuple[str, str, str, str | None], ...]
@@ -175,8 +185,8 @@ class ReviewedMovePlan:
 
     ``request`` identifies the operator selection, ``captured_state`` binds the
     coherent SQLite snapshot, and ``mappings`` contains every validated distinct
-    structured source in deterministic order.  U1 only constructs this value;
-    it does not authorize or perform a database or filesystem mutation.
+    structured source in deterministic order. It authorizes no work itself;
+    callers pass it to :func:`apply_sibling_move` only after confirmation.
     """
 
     request: MoveRequest
@@ -207,7 +217,9 @@ def plan_sibling_move(request: MoveRequest) -> ReviewedMovePlan:
         fingerprint = _validate_schema(connection)
         project, rows = _capture_project(connection, project_id)
         state = CapturedState(fingerprint, project_id, project["worktree"], project["sandboxes"], rows)
-        mappings = _build_mappings(state, target_main)
+        mappings = _build_mappings(
+            state, target_main, deadline=time.monotonic() + REVALIDATION_TIMEOUT_SECONDS
+        )
         connection.rollback()
         return ReviewedMovePlan(request, state, mappings)
     except MoveError:
@@ -221,6 +233,244 @@ def plan_sibling_move(request: MoveRequest) -> ReviewedMovePlan:
     finally:
         if connection is not None:
             connection.close()
+
+
+def apply_sibling_move(reviewed: ReviewedMovePlan) -> None:
+    """Atomically apply one previously reviewed sibling move plan.
+
+    Parameters: ``reviewed`` is an immutable :class:`ReviewedMovePlan` returned
+    by :func:`plan_sibling_move` for an existing absolute SQLite database. Returns
+    ``None`` only after the exact structured-location transaction commits. Raises
+    :class:`MoveError` when the reviewed state, schema, directory, Git evidence,
+    target project-directory keys, integrity, or foreign keys have changed or are
+    invalid; raises :class:`MoveOperationalError` if SQLite cannot acquire its
+    bounded writer lock or perform the transaction. The function writes only the
+    selected project's worktree, sandbox JSON, project-directory keys, session
+    directories, and non-null workspace directories. It neither rewrites
+    historical/free-form data nor changes filesystem or Git content.
+    """
+    if not isinstance(reviewed, ReviewedMovePlan):
+        raise MoveError("move reviewed plan is malformed")
+    database = _existing_database(reviewed.request.database)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{database.as_uri()}?mode=rw", uri=True, isolation_level=None)
+        connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+            raise MoveOperationalError("move SQLite foreign keys could not be enabled")
+        connection.execute("BEGIN IMMEDIATE")
+        _validate_database_health(connection)
+        current, mappings = _revalidate_reviewed_plan(connection, reviewed)
+        _apply_project_locations(connection, current, mappings)
+        _after_move_update_group("project")
+        _apply_project_directory_locations(connection, current, mappings)
+        _after_move_update_group("project_directory")
+        _apply_row_locations(connection, current, mappings, "session")
+        _after_move_update_group("session")
+        _apply_row_locations(connection, current, mappings, "workspace")
+        _after_move_update_group("workspace")
+        _verify_applied_locations(connection, current, mappings)
+        _validate_database_health(connection)
+        _after_move_update_group("pre_commit")
+        connection.commit()
+    except MoveError:
+        _rollback(connection)
+        raise
+    except (sqlite3.Error, OSError, ValueError, TypeError) as error:
+        _rollback(connection)
+        raise MoveOperationalError("move application could not complete") from error
+    finally:
+        _rollback(connection)
+        if connection is not None:
+            connection.close()
+
+
+def _rollback(connection: sqlite3.Connection | None) -> None:
+    """Roll back an active move transaction without obscuring its original failure."""
+    if connection is not None and connection.in_transaction:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+
+
+def _validate_database_health(connection: sqlite3.Connection) -> None:
+    """Require intact SQLite pages and no foreign-key violations before commit."""
+    if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        raise MoveError("move database integrity check failed")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise MoveError("move database foreign key check failed")
+
+
+def _revalidate_reviewed_plan(
+    connection: sqlite3.Connection, reviewed: ReviewedMovePlan
+) -> tuple[CapturedState, tuple[MoveMapping, ...]]:
+    """Collect and compare complete current evidence under the writer lock."""
+    if reviewed.request.project_id != reviewed.captured_state.project_id:
+        raise MoveError("move reviewed plan is malformed")
+    deadline = time.monotonic() + REVALIDATION_TIMEOUT_SECONDS
+    fingerprint = _validate_schema(connection)
+    _check_revalidation_deadline(deadline)
+    project, rows = _capture_project(connection, reviewed.captured_state.project_id)
+    current = CapturedState(
+        fingerprint,
+        reviewed.captured_state.project_id,
+        project["worktree"],
+        project["sandboxes"],
+        rows,
+    )
+    if current != reviewed.captured_state:
+        raise MoveError("move preview is stale: selected database state changed")
+    _check_revalidation_deadline(deadline)
+    target_main = _absolute_value(reviewed.request.target_project_dir, "target project directory")
+    mappings = _build_mappings(current, target_main, deadline=deadline)
+    if mappings != reviewed.mappings:
+        raise MoveError("move preview is stale: directory or Git evidence changed")
+    _check_revalidation_deadline(deadline)
+    return current, mappings
+
+
+def _check_revalidation_deadline(deadline: float) -> None:
+    """Fail operationally when complete application-time validation exceeds its bound."""
+    if time.monotonic() > deadline:
+        raise MoveOperationalError("move revalidation timed out")
+
+
+def _mapping_targets(mappings: tuple[MoveMapping, ...]) -> dict[tuple[str, tuple[str, ...]], str]:
+    """Index every exact selected structured owner by immutable membership key."""
+    targets: dict[tuple[str, tuple[str, ...]], str] = {}
+    for mapping in mappings:
+        for membership in mapping.memberships:
+            key = (membership.category, membership.row_identity)
+            if key in targets:
+                raise MoveError("move reviewed memberships are malformed")
+            targets[key] = mapping.target
+    return targets
+
+
+def _apply_project_locations(
+    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+) -> None:
+    """Update the selected project's exact worktree and sandbox JSON together."""
+    targets = _mapping_targets(mappings)
+    worktree = targets.get(("project.worktree", (state.project_id,)))
+    if worktree is None:
+        raise MoveError("move reviewed worktree membership is missing")
+    sandboxes = json.loads(state.sandboxes)
+    rewritten: list[str] = []
+    for index, _sandbox in enumerate(sandboxes):
+        target = targets.get(("project.sandbox", (state.project_id, str(index))))
+        if target is None:
+            raise MoveError("move reviewed sandbox membership is missing")
+        rewritten.append(target)
+    result = connection.execute(
+        "UPDATE project SET worktree = ?, sandboxes = ? "
+        "WHERE id = ? AND worktree = ? AND sandboxes = ?",
+        (worktree, json.dumps(rewritten), state.project_id, state.worktree, state.sandboxes),
+    )
+    if result.rowcount != 1:
+        raise MoveError("move project update affected an unexpected row count")
+
+
+def _apply_project_directory_locations(
+    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+) -> None:
+    """Transition every original project-directory key only into a vacant target key."""
+    targets = _mapping_targets(mappings)
+    for row in (item for item in state.rows if item.table == "project_directory"):
+        target = targets.get(("project_directory.directory", row.identity))
+        if target is None or row.directory is None or len(row.identity) != 2:
+            raise MoveError("move reviewed project-directory membership is malformed")
+        if connection.execute(
+            "SELECT 1 FROM project_directory WHERE project_id = ? AND directory = ?",
+            (row.identity[0], target),
+        ).fetchone() is not None:
+            raise MoveError("move project-directory target key is occupied")
+        if len(row.payload) != 3:
+            raise MoveError("move reviewed project-directory payload is malformed")
+        result = connection.execute(
+            "UPDATE project_directory SET directory = ? "
+            "WHERE project_id = ? AND directory = ? AND type IS ? "
+            "AND strategy IS ? AND time_created IS ?",
+            (target, row.identity[0], row.directory, *row.payload),
+        )
+        if result.rowcount != 1:
+            raise MoveError("move project-directory update affected an unexpected row count")
+
+
+def _apply_row_locations(
+    connection: sqlite3.Connection,
+    state: CapturedState,
+    mappings: tuple[MoveMapping, ...],
+    table: str,
+) -> None:
+    """Update exact selected session or non-null workspace directory rows."""
+    categories = {"session": "session.directory", "workspace": "workspace.directory"}
+    if table not in categories:
+        raise MoveError("move location table is unsupported")
+    targets = _mapping_targets(mappings)
+    for row in (item for item in state.rows if item.table == table and item.directory is not None):
+        target = targets.get((categories[table], row.identity))
+        if target is None or len(row.identity) != 1:
+            raise MoveError("move reviewed row membership is malformed")
+        result = connection.execute(
+            f"UPDATE {_quote(table)} SET directory = ? WHERE id = ? AND project_id = ? AND directory = ?",
+            (target, row.identity[0], state.project_id, row.directory),
+        )
+        if result.rowcount != 1:
+            raise MoveError(f"move {table} update affected an unexpected row count")
+
+
+def _verify_applied_locations(
+    connection: sqlite3.Connection, state: CapturedState, mappings: tuple[MoveMapping, ...]
+) -> None:
+    """Confirm selected row membership, exact targets, and null workspaces after updates."""
+    targets = _mapping_targets(mappings)
+    project = connection.execute(
+        "SELECT worktree, sandboxes FROM project WHERE id = ?", (state.project_id,)
+    ).fetchall()
+    expected_sandboxes = [
+        targets[("project.sandbox", (state.project_id, str(index)))]
+        for index, _sandbox in enumerate(json.loads(state.sandboxes))
+    ]
+    expected_project = (targets[("project.worktree", (state.project_id,))], json.dumps(expected_sandboxes))
+    if project != [expected_project]:
+        raise MoveError("move project post-update validation failed")
+    for table, category in (
+        ("project_directory", "project_directory.directory"),
+        ("session", "session.directory"),
+        ("workspace", "workspace.directory"),
+    ):
+        expected = [row for row in state.rows if row.table == table]
+        count = connection.execute(
+            f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (state.project_id,)
+        ).fetchone()
+        if count != (len(expected),):
+            raise MoveError(f"move {table} row count changed")
+        for row in expected:
+            directory = targets[(category, row.identity)] if row.directory is not None else None
+            if table == "project_directory":
+                if len(row.payload) != 3:
+                    raise MoveError("move reviewed project-directory payload is malformed")
+                found = connection.execute(
+                    "SELECT COUNT(*) FROM project_directory "
+                    "WHERE project_id = ? AND directory = ? AND type IS ? "
+                    "AND strategy IS ? AND time_created IS ?",
+                    (state.project_id, directory, *row.payload),
+                ).fetchone()
+            else:
+                found = connection.execute(
+                    f"SELECT COUNT(*) FROM {_quote(table)} WHERE id = ? AND project_id = ? AND directory IS ?",
+                    (row.identity[0], state.project_id, directory),
+                ).fetchone()
+            if found != (1,):
+                raise MoveError(f"move {table} post-update validation failed")
+
+
+def _after_move_update_group(group: str) -> None:
+    """Provide a no-op deterministic test seam after a named mutation group."""
+    del group
 
 
 def _existing_database(value: str | Path) -> Path:
@@ -261,7 +511,13 @@ def _validate_schema(connection: sqlite3.Connection) -> tuple[tuple[str, str, st
     tables = {name for object_type, name, _table, _sql in fingerprint if object_type == "table"}
     required = {
         "project": (("id", "TEXT", True), ("worktree", "TEXT", True), ("sandboxes", "TEXT", True)),
-        "project_directory": (("project_id", "TEXT", True), ("directory", "TEXT", True)),
+        "project_directory": (
+            ("project_id", "TEXT", True),
+            ("directory", "TEXT", True),
+            ("type", "TEXT", False),
+            ("strategy", "TEXT", False),
+            ("time_created", "INTEGER", True),
+        ),
         "session": (("id", "TEXT", True), ("project_id", "TEXT", True), ("directory", "TEXT", True)),
         "workspace": (("id", "TEXT", True), ("project_id", "TEXT", True), ("directory", "TEXT", False)),
     }
@@ -336,12 +592,19 @@ def _refuse_location_indexes(connection: sqlite3.Connection, table: str) -> None
 def _require_location_foreign_keys(connection: sqlite3.Connection, table: str) -> None:
     """Require the current closed outbound project relationship for each location table."""
     rows = connection.execute(f"PRAGMA foreign_key_list({_quote(table)})").fetchall()
-    expected = () if table == "project" else (("project", "project_id", "id"),)
-    observed: list[tuple[str, str, str]] = []
+    expected = () if table == "project" else (
+        (0, 0, "project", "project_id", "id", "NO ACTION", "CASCADE", "NONE"),
+    )
+    observed: list[tuple[object, ...]] = []
     for row in rows:
-        if len(row) < 5 or not all(isinstance(row[index], str) for index in (2, 3, 4)):
+        if (
+            len(row) != 8
+            or type(row[0]) is not int
+            or type(row[1]) is not int
+            or not all(isinstance(row[index], str) for index in range(2, 8))
+        ):
             raise MoveError("move schema is malformed")
-        observed.append((row[2], row[3], row[4]))
+        observed.append(tuple(row))
     if tuple(observed) != expected:
         raise MoveError("move schema has unfamiliar foreign keys")
 
@@ -377,12 +640,14 @@ def _capture_project(
         "sandboxes": _sandbox_text(project_row[2]),
     }
     rows: list[CapturedRow] = []
-    for table, identity_columns, nullable in (
-        ("project_directory", ("project_id", "directory"), False),
-        ("session", ("id",), False),
-        ("workspace", ("id",), True),
+    for table, identity_columns, nullable, payload_columns in (
+        ("project_directory", ("project_id", "directory"), False, ("type", "strategy", "time_created")),
+        ("session", ("id",), False, ()),
+        ("workspace", ("id",), True, ()),
     ):
-        selected = ", ".join(_quote(column) for column in (*identity_columns, "directory"))
+        selected = ", ".join(
+            _quote(column) for column in (*identity_columns, "directory", *payload_columns)
+        )
         order = ", ".join(_quote(column) for column in identity_columns)
         records = connection.execute(
             f"SELECT {selected} FROM {_quote(table)} WHERE project_id = ? "
@@ -392,11 +657,20 @@ def _capture_project(
         if len(records) > MAX_SELECTED_ROWS:
             raise MoveError("move selected row limit exceeded")
         for record in records:
-            if len(record) != len(identity_columns) + 1:
+            if len(record) != len(identity_columns) + 1 + len(payload_columns):
                 raise MoveError("move location row is malformed")
-            identity = tuple(_identifier(value, f"{table} row identity") for value in record[:-1])
-            directory = None if record[-1] is None and nullable else _absolute_value(record[-1], f"{table} directory")
-            rows.append(CapturedRow(table, identity, directory))
+            identity = tuple(
+                _identifier(value, f"{table} row identity")
+                for value in record[: len(identity_columns)]
+            )
+            directory_value = record[len(identity_columns)]
+            directory = (
+                None
+                if directory_value is None and nullable
+                else _absolute_value(directory_value, f"{table} directory")
+            )
+            payload = tuple(record[len(identity_columns) + 1 :])
+            rows.append(CapturedRow(table, identity, directory, payload))
     if len(rows) + 1 > MAX_SELECTED_ROWS:
         raise MoveError("move selected row limit exceeded")
     _capture_size(project, rows)
@@ -427,12 +701,28 @@ def _capture_size(project: dict[str, str], rows: list[CapturedRow]) -> None:
         values.extend(row.identity)
         if row.directory is not None:
             values.append(row.directory)
-    total = sum(len(value.encode("utf-8", "surrogatepass")) for value in values)
+        values.extend(row.payload)
+    total = sum(_captured_scalar_size(value) for value in values)
     if total > MAX_CAPTURE_BYTES:
         raise MoveError("move captured scalar limit exceeded")
 
 
-def _build_mappings(state: CapturedState, target_main: str) -> tuple[MoveMapping, ...]:
+def _captured_scalar_size(value: object) -> int:
+    """Return a deterministic byte charge for one captured SQLite scalar."""
+    if isinstance(value, str):
+        return len(value.encode("utf-8", "surrogatepass"))
+    if isinstance(value, bytes):
+        return len(value)
+    if value is None:
+        return 0
+    if type(value) in (int, float):
+        return 8
+    raise MoveError("move captured scalar is malformed")
+
+
+def _build_mappings(
+    state: CapturedState, target_main: str, *, deadline: float
+) -> tuple[MoveMapping, ...]:
     """Derive, validate, and evidence every distinct lexical sibling mapping."""
     source_parent = os.path.dirname(state.worktree)
     if not source_parent or os.path.basename(state.worktree) == "":
@@ -460,6 +750,7 @@ def _build_mappings(state: CapturedState, target_main: str) -> tuple[MoveMapping
     mappings: list[MoveMapping] = []
     derived: dict[str, str] = {}
     for source in sorted(locations):
+        _check_revalidation_deadline(deadline)
         memberships = tuple(sorted(locations[source], key=lambda item: (item.category, item.row_identity)))
         if os.path.dirname(source) != source_parent or not os.path.basename(source):
             raise MoveError(
@@ -479,7 +770,9 @@ def _build_mappings(state: CapturedState, target_main: str) -> tuple[MoveMapping
         _require_directory(source, "source", memberships)
         _require_directory(target, "target", memberships)
         source_git = _git_evidence(source, "source")
+        _check_revalidation_deadline(deadline)
         target_git = _git_evidence(target, "target")
+        _check_revalidation_deadline(deadline)
         _compare_git(source, target, source_git, target_git)
         mappings.append(MoveMapping(source, target, memberships, source_git, target_git))
     return tuple(mappings)
