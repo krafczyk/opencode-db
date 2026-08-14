@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from opencode_db import move
+from opencode_db import move, move_git
 from opencode_db.move import (
     MoveError,
     MoveOperationalError,
@@ -192,6 +192,7 @@ class MovePlanningTests(unittest.TestCase):
             ("MAX_SANDBOX_ENTRIES", 0, "sandbox JSON"),
             ("MAX_SANDBOX_BYTES", 2, "sandbox JSON"),
             ("MAX_CAPTURE_BYTES", 1, "captured scalar"),
+            ("MAX_SCHEMA_FINGERPRINT_BYTES", 1, "schema fingerprint"),
         )
         for constant, limit, message in cases:
             with self.subTest(constant=constant), _temporary_directory() as root:
@@ -306,7 +307,7 @@ class MovePlanningTests(unittest.TestCase):
                             move._git_evidence("/unused", "source")
                         else:
                             move._git_output("/unused", "source", ("x",), "probe")
-            with mock.patch("opencode_db.move.subprocess.Popen", side_effect=FileNotFoundError):
+            with mock.patch("opencode_db.move_git.subprocess.Popen", side_effect=FileNotFoundError):
                 with self.assertRaisesRegex(MoveOperationalError, "unavailable"):
                     move._git_output("/unused", "source", ("x",), "probe")
 
@@ -332,7 +333,7 @@ class MovePlanningTests(unittest.TestCase):
                     self._selector.close()
 
             with mock.patch.dict(os.environ, {"PATH": str(script.parent), "MOVE_FAKE_GIT": "pid-sleep", "MOVE_FAKE_GIT_PID": str(pid_file)}, clear=False):
-                with mock.patch.object(move.selectors, "DefaultSelector", InterruptingSelector):
+                with mock.patch.object(move_git.selectors, "DefaultSelector", InterruptingSelector):
                     with self.assertRaisesRegex(MoveOperationalError, "interrupted"):
                         move._git_output("/unused", "source", ("x",), "probe")
             child_pid = int(pid_file.read_text(encoding="ascii"))
@@ -466,12 +467,17 @@ class MovePlanningTests(unittest.TestCase):
             before = self._structured_rows(database)
             original = move._apply_project_directory_locations
 
-            def occupy_then_apply(connection: sqlite3.Connection, state: move.CapturedState, mappings: tuple[move.MoveMapping, ...]) -> None:
+            def occupy_then_apply(
+                connection: sqlite3.Connection,
+                state: move.CapturedState,
+                mappings: tuple[move.MoveMapping, ...],
+                deadline: float,
+            ) -> None:
                 connection.execute(
                     "INSERT INTO project_directory VALUES (?, ?, ?, ?, ?)",
                     ("project", str(target_parent / "directory"), "conflict", "manual", 2),
                 )
-                original(connection, state, mappings)
+                original(connection, state, mappings, deadline)
 
             with mock.patch.object(move, "_apply_project_directory_locations", side_effect=occupy_then_apply):
                 with self.assertRaisesRegex(MoveError, "target key is occupied"):
@@ -546,6 +552,112 @@ class MovePlanningTests(unittest.TestCase):
                 writer.rollback()
                 writer.close()
             self.assertEqual(before, self._structured_rows(database))
+
+    def test_schema_refuses_project_sandbox_constraints_and_cascading_parent_reference(self) -> None:
+        """Reject every rewritten project parent key before any unknown-table mutation."""
+        for statement, message in (
+            ("CREATE UNIQUE INDEX project_sandboxes_unique ON project(sandboxes)", "unfamiliar unique"),
+            (
+                "CREATE TABLE project_parent_ref ("
+                "value TEXT REFERENCES project(worktree) ON UPDATE CASCADE)",
+                "inbound directory",
+            ),
+        ):
+            with self.subTest(statement=statement), _temporary_directory() as root:
+                _source_parent, target_parent, database = self._fixture(root)
+                before = self._structured_rows(database)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute(statement)
+                with self.assertRaisesRegex(MoveError, message):
+                    plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
+                self.assertEqual(before, self._structured_rows(database))
+
+    def test_copied_linked_worktree_admin_metadata_refuses_during_plan_and_apply(self) -> None:
+        """Reject copied linked-worktree metadata that remains in the source Git family."""
+        with _temporary_directory() as root:
+            source_parent, target_parent, database = self._fixture(root)
+            source_main = source_parent / "main"
+            target_main = target_parent / "main"
+            linked = root / "linked"
+            subprocess.run(["git", "-C", str(source_main), "checkout", "--detach"], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "-C", str(target_main), "checkout", "--detach"], check=True, stdout=subprocess.DEVNULL)
+            reviewed = plan_sibling_move(MoveRequest(database, "project", str(target_main)))
+            before = self._structured_rows(database)
+            subprocess.run(
+                ["git", "-C", str(source_main), "worktree", "add", "--detach", str(linked), "HEAD"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            shutil.rmtree(target_main)
+            shutil.copytree(linked, target_main)
+            with self.assertRaisesRegex(MoveError, "administrative metadata points"):
+                apply_sibling_move(reviewed)
+            self.assertEqual(before, self._structured_rows(database))
+
+        with _temporary_directory() as root:
+            source_parent, target_parent, database = self._fixture(root)
+            source_main = source_parent / "main"
+            linked = root / "linked"
+            subprocess.run(["git", "-C", str(source_main), "checkout", "--detach"], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "-C", str(source_main), "worktree", "add", "--detach", str(linked), "HEAD"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            shutil.rmtree(target_parent / "main")
+            shutil.copytree(linked, target_parent / "main")
+            with self.assertRaisesRegex(MoveError, "administrative metadata points"):
+                plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
+
+    def test_writer_deadline_rolls_back_late_update_and_progress_failure_remains_success(self) -> None:
+        """Bound the whole writer transaction and keep optional progress observational."""
+        with _temporary_directory() as root:
+            _source_parent, target_parent, database = self._fixture(root)
+            reviewed = plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
+            before = self._structured_rows(database)
+
+            def delay_after_project(group: str) -> None:
+                if group == "project":
+                    time.sleep(0.02)
+
+            with mock.patch.object(move, "WRITER_TRANSACTION_TIMEOUT_SECONDS", 0.01):
+                with mock.patch.object(move, "_after_move_update_group", side_effect=delay_after_project):
+                    with self.assertRaisesRegex(MoveOperationalError, "application timed out"):
+                        apply_sibling_move(reviewed)
+            self.assertEqual(before, self._structured_rows(database))
+
+        with _temporary_directory() as root:
+            _source_parent, target_parent, database = self._fixture(root)
+            reviewed = plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
+
+            def failing_progress(_phase: str, _completed: int | None, _total: int | None, _complete: bool) -> None:
+                raise RuntimeError("observer failed")
+
+            apply_sibling_move(reviewed, progress=failing_progress)
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT worktree FROM project WHERE id = 'project'").fetchone(),
+                    (str(target_parent / "main"),),
+                )
+
+    def test_cleanup_failures_are_bounded_and_preserve_the_original_error(self) -> None:
+        """Report unconfirmed rollback and Git reaping without leaking raw exceptions."""
+        connection = mock.Mock()
+        connection.in_transaction = True
+        connection.rollback.side_effect = sqlite3.OperationalError("rollback failure")
+        original = MoveError("selected failure")
+        with self.assertRaisesRegex(MoveOperationalError, "rollback could not be confirmed") as caught:
+            move._cleanup_connection(connection, "application", original)
+        self.assertIs(caught.exception.__cause__, original)
+        connection.close.assert_called_once_with()
+
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("git", 0.01)
+        with self.assertRaisesRegex(MoveOperationalError, "cleanup could not reap"):
+            move_git._reap_process(process, MoveOperationalError, 0.01)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=0.01)
 
     @staticmethod
     def _fake_git(root: Path) -> Path:

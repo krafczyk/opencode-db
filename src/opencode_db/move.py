@@ -9,18 +9,16 @@ SQLite, creates files, changes filesystem content, or contacts Git remotes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import selectors
 import sqlite3
 import stat
-import subprocess
+import sys
 import time
 from collections.abc import Callable
-from urllib.parse import urlsplit, urlunsplit
+
+from . import move_git, move_schema
 
 
 MAX_SCHEMA_OBJECTS = 1_024
@@ -44,17 +42,29 @@ MAX_SANDBOX_BYTES = 16 * 1024 * 1024
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
 """Maximum aggregate UTF-8 byte length of captured structured scalar values."""
 
+MAX_SCHEMA_FINGERPRINT_BYTES = 64 * 1024 * 1024
+"""Maximum aggregate scalar bytes retained in one schema fingerprint."""
+
 MAX_GIT_OUTPUT_BYTES = 64 * 1024
 """Maximum stdout bytes accepted from one local Git probe."""
 
 GIT_TIMEOUT_SECONDS = 2.0
 """Fixed wall-clock limit for one local Git probe."""
 
+GIT_CLEANUP_TIMEOUT_SECONDS = 2.0
+"""Fixed wall-clock limit for terminating and reaping one Git probe."""
+
 SQLITE_BUSY_TIMEOUT_MS = 2_000
 """Maximum connection-local wait for the move application's writer lock."""
 
 REVALIDATION_TIMEOUT_SECONDS = 10.0
 """Maximum wall-clock time allowed for application-time freshness validation."""
+
+WRITER_TRANSACTION_TIMEOUT_SECONDS = 10.0
+"""Maximum wall-clock time for all work after the writer transaction begins."""
+
+SQLITE_PROGRESS_OPCODES = 1_000
+"""SQLite virtual-machine instructions between transaction deadline checks."""
 
 _ROW_LOCATION_CATEGORIES = {
     "project_directory": "project_directory.directory",
@@ -119,8 +129,10 @@ class MoveMapping:
 
     ``source`` and ``target`` are exact absolute lexical paths, and
     ``memberships`` records every structured field that owns ``source``.  The
-    mapping is immutable, sorted by source path in a reviewed plan, and does not
-    itself read or alter SQLite or the filesystem.
+    ``source_git`` and ``target_git`` are :class:`GitEvidence` values that bind
+    the corresponding local checkout identity, state, commit, and Git-admin
+    paths. The mapping is immutable, sorted by source path in a reviewed plan,
+    and does not itself read or alter SQLite or the filesystem.
     """
 
     source: str
@@ -177,13 +189,18 @@ class GitEvidence:
     ``project_identity`` is a digest of a normalized non-file origin or a root
     commit fallback, ``checkout_state`` is ``attached`` or ``detached``,
     ``branch`` is present only when attached, and ``head`` is the exact checked
-    out commit.  Values are immutable, bounded, local-only evidence.
+    out commit. ``git_dir`` and ``git_common_dir`` are bounded absolute paths
+    emitted by Git for the checkout's administrative metadata; they detect
+    copied linked worktrees that still point into a source family. Values are
+    immutable, bounded, local-only evidence and do not mutate Git state.
     """
 
     project_identity: str
     checkout_state: str
     branch: str | None
     head: str
+    git_dir: str
+    git_common_dir: str
 
 
 @dataclass(frozen=True)
@@ -236,19 +253,11 @@ def plan_sibling_move(
             deadline=time.monotonic() + REVALIDATION_TIMEOUT_SECONDS,
             progress=progress,
         )
-        connection.rollback()
         return ReviewedMovePlan(request, state, mappings)
-    except MoveError:
-        if connection is not None:
-            connection.rollback()
-        raise
     except (sqlite3.Error, OSError, ValueError, TypeError) as error:
-        if connection is not None:
-            connection.rollback()
         raise MoveOperationalError("move planning could not read the database") from error
     finally:
-        if connection is not None:
-            connection.close()
+        _cleanup_connection(connection, "planning", sys.exception())
 
 
 def apply_sibling_move(
@@ -275,6 +284,7 @@ def apply_sibling_move(
         raise MoveError("move reviewed plan is malformed")
     database = _existing_database(reviewed.request.database)
     connection: sqlite3.Connection | None = None
+    deadline: float | None = None
     try:
         connection = sqlite3.connect(f"{database.as_uri()}?mode=rw", uri=True, isolation_level=None)
         connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
@@ -282,46 +292,80 @@ def apply_sibling_move(
         if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
             raise MoveOperationalError("move SQLite foreign keys could not be enabled")
         connection.execute("BEGIN IMMEDIATE")
-        _validate_database_health(connection)
+        deadline = time.monotonic() + WRITER_TRANSACTION_TIMEOUT_SECONDS
+        _install_transaction_deadline(connection, deadline)
+        _check_transaction_deadline(deadline)
+        _validate_database_health(connection, deadline)
         _report_progress(progress, "revalidation", 0, 1, False)
-        current, mappings = _revalidate_reviewed_plan(connection, reviewed)
+        current, mappings = _revalidate_reviewed_plan(connection, reviewed, deadline)
         _report_progress(progress, "revalidation", 1, 1, True)
-        targets = _mapping_targets(mappings)
+        targets = _mapping_targets(mappings, deadline)
         _report_progress(progress, "update groups", 0, 5, False)
-        _apply_project_locations(connection, current, targets)
+        _apply_project_locations(connection, current, targets, deadline)
         _after_move_update_group("project")
+        _check_transaction_deadline(deadline)
         _report_progress(progress, "update groups", 1, 5, False)
-        _apply_project_directory_locations(connection, current, targets)
+        _apply_project_directory_locations(connection, current, targets, deadline)
         _after_move_update_group("project_directory")
+        _check_transaction_deadline(deadline)
         _report_progress(progress, "update groups", 2, 5, False)
-        _apply_row_locations(connection, current, targets, "session")
+        _apply_row_locations(connection, current, targets, "session", deadline)
         _after_move_update_group("session")
+        _check_transaction_deadline(deadline)
         _report_progress(progress, "update groups", 3, 5, False)
-        _apply_row_locations(connection, current, targets, "workspace")
+        _apply_row_locations(connection, current, targets, "workspace", deadline)
         _after_move_update_group("workspace")
+        _check_transaction_deadline(deadline)
         _report_progress(progress, "update groups", 4, 5, False)
-        _verify_applied_locations(connection, current, targets)
-        _validate_database_health(connection)
+        _verify_applied_locations(connection, current, targets, deadline)
+        _validate_database_health(connection, deadline)
         _after_move_update_group("pre_commit")
+        _check_transaction_deadline(deadline)
         connection.commit()
         _report_progress(progress, "update groups", 5, 5, True)
     except MoveError:
         raise
-    except (sqlite3.Error, OSError, ValueError, TypeError) as error:
+    except sqlite3.Error as error:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise MoveOperationalError("move application timed out") from error
+        raise MoveOperationalError("move application could not complete") from error
+    except (OSError, ValueError, TypeError) as error:
         raise MoveOperationalError("move application could not complete") from error
     finally:
-        _rollback(connection)
-        if connection is not None:
-            connection.close()
+        _cleanup_connection(connection, "application", sys.exception())
 
 
-def _rollback(connection: sqlite3.Connection | None) -> None:
-    """Roll back an active move transaction without obscuring its original failure."""
-    if connection is not None and connection.in_transaction:
-        try:
+def _cleanup_connection(
+    connection: sqlite3.Connection | None, phase: str, original: BaseException | None
+) -> None:
+    """Confirm rollback and close without leaking raw SQLite cleanup failures."""
+    if connection is None:
+        return
+    failure: sqlite3.Error | None = None
+    rollback_failed = False
+    try:
+        connection.set_progress_handler(None, 0)
+        if connection.in_transaction:
             connection.rollback()
-        except sqlite3.Error:
-            pass
+    except sqlite3.Error as error:
+        failure = error
+        rollback_failed = True
+    try:
+        connection.close()
+    except sqlite3.Error as error:
+        if failure is None:
+            failure = error
+    if failure is None:
+        return
+    message = (
+        f"move {phase} rollback could not be confirmed"
+        if rollback_failed
+        else f"move {phase} cleanup could not be confirmed"
+    )
+    operational = MoveOperationalError(message)
+    if original is not None:
+        raise operational from original
+    raise operational from failure
 
 
 def _report_progress(
@@ -333,27 +377,44 @@ def _report_progress(
 ) -> None:
     """Send one aggregate progress observation when a caller opted in."""
     if progress is not None:
-        progress(phase, completed, total, complete)
+        try:
+            progress(phase, completed, total, complete)
+        except Exception:
+            pass
 
 
-def _validate_database_health(connection: sqlite3.Connection) -> None:
+def _install_transaction_deadline(connection: sqlite3.Connection, deadline: float) -> None:
+    """Interrupt SQLite virtual-machine work after the writer deadline expires."""
+    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), SQLITE_PROGRESS_OPCODES)
+
+
+def _check_transaction_deadline(deadline: float) -> None:
+    """Fail operationally when the bounded writer transaction deadline expires."""
+    if time.monotonic() >= deadline:
+        raise MoveOperationalError("move application timed out")
+
+
+def _validate_database_health(connection: sqlite3.Connection, deadline: float) -> None:
     """Require intact SQLite pages and no foreign-key violations before commit."""
-    if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+    integrity = connection.execute("PRAGMA integrity_check")
+    first_integrity = next(integrity, None)
+    _check_transaction_deadline(deadline)
+    if first_integrity != ("ok",) or next(integrity, None) is not None:
         raise MoveError("move database integrity check failed")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise MoveError("move database foreign key check failed")
+    _check_transaction_deadline(deadline)
 
 
 def _revalidate_reviewed_plan(
-    connection: sqlite3.Connection, reviewed: ReviewedMovePlan
+    connection: sqlite3.Connection, reviewed: ReviewedMovePlan, deadline: float
 ) -> tuple[CapturedState, tuple[MoveMapping, ...]]:
     """Collect and compare complete current evidence under the writer lock."""
     if reviewed.request.project_id != reviewed.captured_state.project_id:
         raise MoveError("move reviewed plan is malformed")
-    deadline = time.monotonic() + REVALIDATION_TIMEOUT_SECONDS
-    fingerprint = _validate_schema(connection)
-    _check_revalidation_deadline(deadline)
-    project, rows = _capture_project(connection, reviewed.captured_state.project_id)
+    fingerprint = _validate_schema(connection, deadline=deadline)
+    _check_transaction_deadline(deadline)
+    project, rows = _capture_project(connection, reviewed.captured_state.project_id, deadline=deadline)
     current = CapturedState(
         fingerprint,
         reviewed.captured_state.project_id,
@@ -363,12 +424,17 @@ def _revalidate_reviewed_plan(
     )
     if current != reviewed.captured_state:
         raise MoveError("move preview is stale: selected database state changed")
-    _check_revalidation_deadline(deadline)
+    _check_transaction_deadline(deadline)
     target_main = _absolute_value(reviewed.request.target_project_dir, "target project directory")
-    mappings = _build_mappings(current, target_main, deadline=deadline)
+    mappings = _build_mappings(
+        current,
+        target_main,
+        deadline=deadline,
+        deadline_check=_check_transaction_deadline,
+    )
     if mappings != reviewed.mappings:
         raise MoveError("move preview is stale: directory or Git evidence changed")
-    _check_revalidation_deadline(deadline)
+    _check_transaction_deadline(deadline)
     return current, mappings
 
 
@@ -378,11 +444,15 @@ def _check_revalidation_deadline(deadline: float) -> None:
         raise MoveOperationalError("move revalidation timed out")
 
 
-def _mapping_targets(mappings: tuple[MoveMapping, ...]) -> dict[tuple[str, tuple[str, ...]], str]:
+def _mapping_targets(
+    mappings: tuple[MoveMapping, ...], deadline: float
+) -> dict[tuple[str, tuple[str, ...]], str]:
     """Index every exact selected structured owner by immutable membership key."""
     targets: dict[tuple[str, tuple[str, ...]], str] = {}
     for mapping in mappings:
+        _check_transaction_deadline(deadline)
         for membership in mapping.memberships:
+            _check_transaction_deadline(deadline)
             key = (membership.category, membership.row_identity)
             if key in targets:
                 raise MoveError("move reviewed memberships are malformed")
@@ -394,6 +464,7 @@ def _apply_project_locations(
     connection: sqlite3.Connection,
     state: CapturedState,
     targets: dict[tuple[str, tuple[str, ...]], str],
+    deadline: float,
 ) -> None:
     """Update the selected project's exact worktree and sandbox JSON together."""
     worktree = targets.get(("project.worktree", (state.project_id,)))
@@ -402,6 +473,7 @@ def _apply_project_locations(
     sandboxes = json.loads(state.sandboxes)
     rewritten: list[str] = []
     for index, _sandbox in enumerate(sandboxes):
+        _check_transaction_deadline(deadline)
         target = targets.get(("project.sandbox", (state.project_id, str(index))))
         if target is None:
             raise MoveError("move reviewed sandbox membership is missing")
@@ -413,15 +485,20 @@ def _apply_project_locations(
     )
     if result.rowcount != 1:
         raise MoveError("move project update affected an unexpected row count")
+    _check_transaction_deadline(deadline)
 
 
 def _apply_project_directory_locations(
     connection: sqlite3.Connection,
     state: CapturedState,
     targets: dict[tuple[str, tuple[str, ...]], str],
+    deadline: float,
 ) -> None:
     """Transition every original project-directory key only into a vacant target key."""
-    for row in (item for item in state.rows if item.table == "project_directory"):
+    for row in state.rows:
+        _check_transaction_deadline(deadline)
+        if row.table != "project_directory":
+            continue
         target = targets.get(("project_directory.directory", row.identity))
         if target is None or row.directory is None or len(row.identity) != 2:
             raise MoveError("move reviewed project-directory membership is malformed")
@@ -447,11 +524,15 @@ def _apply_row_locations(
     state: CapturedState,
     targets: dict[tuple[str, tuple[str, ...]], str],
     table: str,
+    deadline: float,
 ) -> None:
     """Update exact selected session or non-null workspace directory rows."""
     if table not in {"session", "workspace"}:
         raise MoveError("move location table is unsupported")
-    for row in (item for item in state.rows if item.table == table and item.directory is not None):
+    for row in state.rows:
+        _check_transaction_deadline(deadline)
+        if row.table != table or row.directory is None:
+            continue
         target = targets.get((_ROW_LOCATION_CATEGORIES[table], row.identity))
         if target is None or len(row.identity) != 1:
             raise MoveError("move reviewed row membership is malformed")
@@ -467,21 +548,24 @@ def _verify_applied_locations(
     connection: sqlite3.Connection,
     state: CapturedState,
     targets: dict[tuple[str, tuple[str, ...]], str],
+    deadline: float,
 ) -> None:
     """Confirm selected row membership, exact targets, and null workspaces after updates."""
-    project = connection.execute(
-        "SELECT worktree, sandboxes FROM project WHERE id = ?", (state.project_id,)
-    ).fetchall()
-    expected_sandboxes = [
-        targets[("project.sandbox", (state.project_id, str(index)))]
-        for index, _sandbox in enumerate(json.loads(state.sandboxes))
-    ]
+    project = connection.execute("SELECT worktree, sandboxes FROM project WHERE id = ?", (state.project_id,))
+    expected_sandboxes: list[str] = []
+    for index, _sandbox in enumerate(json.loads(state.sandboxes)):
+        _check_transaction_deadline(deadline)
+        expected_sandboxes.append(targets[("project.sandbox", (state.project_id, str(index)))])
     expected_project = (targets[("project.worktree", (state.project_id,))], json.dumps(expected_sandboxes))
-    if project != [expected_project]:
+    if next(project, None) != expected_project or next(project, None) is not None:
         raise MoveError("move project post-update validation failed")
     for table in _ROW_LOCATION_CATEGORIES:
         category = _ROW_LOCATION_CATEGORIES[table]
-        expected = [row for row in state.rows if row.table == table]
+        expected: list[CapturedRow] = []
+        for row in state.rows:
+            _check_transaction_deadline(deadline)
+            if row.table == table:
+                expected.append(row)
         columns = (
             "project_id, directory, type, strategy, time_created"
             if table == "project_directory"
@@ -495,6 +579,7 @@ def _verify_applied_locations(
             )
         )
         for row in expected:
+            _check_transaction_deadline(deadline)
             directory = targets[(category, row.identity)] if row.directory is not None else None
             if table == "project_directory":
                 if len(row.payload) != 3:
@@ -506,6 +591,7 @@ def _verify_applied_locations(
                 raise MoveError(f"move {table} post-update validation failed")
         if next(observed, None) is not None:
             raise MoveError(f"move {table} row count changed")
+        _check_transaction_deadline(deadline)
 
 
 def _after_move_update_group(group: str) -> None:
@@ -529,135 +615,19 @@ def _existing_database(value: str | Path) -> Path:
     return path
 
 
-def _validate_schema(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str | None], ...]:
+def _validate_schema(
+    connection: sqlite3.Connection, *, deadline: float | None = None
+) -> tuple[tuple[str, str, str, str | None], ...]:
     """Require the bounded closed location schema and return its stable fingerprint."""
-    objects = connection.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-    ).fetchall()
-    if len(objects) > MAX_SCHEMA_OBJECTS:
-        raise MoveError("move schema object limit exceeded")
-    fingerprint: list[tuple[str, str, str, str | None]] = []
-    for row in objects:
-        if (
-            len(row) != 4
-            or not all(isinstance(value, str) for value in row[:3])
-            or row[3] is not None and not isinstance(row[3], str)
-        ):
-            raise MoveError("move schema is malformed")
-        for identifier in row[:3]:
-            _identifier(identifier, "schema identifier")
-        fingerprint.append((row[0], row[1], row[2], row[3]))
-    tables = {name for object_type, name, _table, _sql in fingerprint if object_type == "table"}
-    required = {
-        "project": (("id", "TEXT", True), ("worktree", "TEXT", True), ("sandboxes", "TEXT", True)),
-        "project_directory": (
-            ("project_id", "TEXT", True),
-            ("directory", "TEXT", True),
-            ("type", "TEXT", False),
-            ("strategy", "TEXT", False),
-            ("time_created", "INTEGER", True),
-        ),
-        "session": (("id", "TEXT", True), ("project_id", "TEXT", True), ("directory", "TEXT", True)),
-        "workspace": (("id", "TEXT", True), ("project_id", "TEXT", True), ("directory", "TEXT", False)),
-    }
-    if not set(required) <= tables:
-        raise MoveError("move schema is incomplete")
-    primary_keys = {
-        "project": ("id",),
-        "project_directory": ("project_id", "directory"),
-        "session": ("id",),
-        "workspace": ("id",),
-    }
-    for table, columns in required.items():
-        metadata = _table_columns(connection, table)
-        for name, declared_type, required_not_null in columns:
-            column = metadata.get(name)
-            if column is None or column[0] != declared_type or (required_not_null and not column[1] and not column[2]):
-                raise MoveError("move schema is incompatible")
-        if tuple(
-            name
-            for name, _metadata in sorted(metadata.items(), key=lambda item: item[1][2])
-            if _metadata[2]
-        ) != primary_keys[table]:
-            raise MoveError("move schema primary key is incompatible")
-        if any(hidden for _type, _not_null, _position, hidden in metadata.values()):
-            raise MoveError("move schema has generated columns")
-        _refuse_location_indexes(connection, table)
-        _require_location_foreign_keys(connection, table)
-    if any(object_type == "trigger" and table in required for object_type, _name, table, _sql in fingerprint):
-        raise MoveError("move schema has side-effecting triggers")
-    _refuse_inbound_directory_references(connection, tables)
-    for table in tables - set(required):
-        columns = _table_columns(connection, table)
-        if {"project_id", "directory"} <= set(columns):
-            raise MoveError("move schema has unknown project directory state")
-    return tuple(fingerprint)
-
-
-def _table_columns(
-    connection: sqlite3.Connection, table: str
-) -> dict[str, tuple[str, bool, int, int]]:
-    """Return closed column metadata while refusing malformed or generated fields."""
-    rows = connection.execute(f"PRAGMA table_xinfo({_quote(table)})").fetchall()
-    result: dict[str, tuple[str, bool, int, int]] = {}
-    for row in rows:
-        if len(row) < 7 or not isinstance(row[1], str) or not isinstance(row[2], str) or type(row[3]) is not int or type(row[5]) is not int or type(row[6]) is not int:
-            raise MoveError("move schema is malformed")
-        if row[1] in result:
-            raise MoveError("move schema is malformed")
-        result[row[1]] = (row[2].upper(), bool(row[3]), row[5], row[6])
-    if not result:
-        raise MoveError("move schema is malformed")
-    return result
-
-
-def _refuse_location_indexes(connection: sqlite3.Connection, table: str) -> None:
-    """Reject unfamiliar unique constraints involving a rewritten location field."""
-    for index in connection.execute(f"PRAGMA index_list({_quote(table)})").fetchall():
-        if len(index) < 4 or not isinstance(index[1], str) or type(index[2]) is not int or not isinstance(index[3], str):
-            raise MoveError("move schema is malformed")
-        if not index[2]:
-            continue
-        columns = connection.execute(f"PRAGMA index_info({_quote(index[1])})").fetchall()
-        names = tuple(row[2] for row in columns if len(row) > 2 and isinstance(row[2], str))
-        if len(names) != len(columns):
-            raise MoveError("move schema is malformed")
-        expected_primary = table == "project_directory" and index[3] == "pk" and names == ("project_id", "directory")
-        rewritten_column = "worktree" if table == "project" else "directory"
-        if rewritten_column in names and not expected_primary:
-            raise MoveError("move schema has unfamiliar unique location index")
-
-
-def _require_location_foreign_keys(connection: sqlite3.Connection, table: str) -> None:
-    """Require the current closed outbound project relationship for each location table."""
-    rows = connection.execute(f"PRAGMA foreign_key_list({_quote(table)})").fetchall()
-    expected = () if table == "project" else (
-        (0, 0, "project", "project_id", "id", "NO ACTION", "CASCADE", "NONE"),
+    return move_schema.validate_schema(
+        connection,
+        move_error=MoveError,
+        quote=_quote,
+        max_schema_objects=MAX_SCHEMA_OBJECTS,
+        max_fingerprint_bytes=MAX_SCHEMA_FINGERPRINT_BYTES,
+        max_scalar_bytes=MAX_VALUE_BYTES,
+        check_deadline=lambda: _check_optional_deadline(deadline),
     )
-    observed: list[tuple[object, ...]] = []
-    for row in rows:
-        if (
-            len(row) != 8
-            or type(row[0]) is not int
-            or type(row[1]) is not int
-            or not all(isinstance(row[index], str) for index in range(2, 8))
-        ):
-            raise MoveError("move schema is malformed")
-        observed.append(tuple(row))
-    if tuple(observed) != expected:
-        raise MoveError("move schema has unfamiliar foreign keys")
-
-
-def _refuse_inbound_directory_references(connection: sqlite3.Connection, tables: set[str]) -> None:
-    """Refuse any foreign key that would make a rewritten directory a parent key."""
-    affected = {"project", "project_directory", "session", "workspace"}
-    for table in tables:
-        for row in connection.execute(f"PRAGMA foreign_key_list({_quote(table)})").fetchall():
-            if len(row) < 5 or not isinstance(row[2], str) or not isinstance(row[4], str):
-                raise MoveError("move schema is malformed")
-            if row[2] in affected and row[4] == "directory":
-                raise MoveError("move schema has inbound directory references")
 
 
 def _capture_project(
@@ -665,6 +635,7 @@ def _capture_project(
     project_id: str,
     *,
     progress: Callable[[str, int | None, int | None, bool], None] | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict[str, str], tuple[CapturedRow, ...]]:
     """Capture exactly one selected project and every supported location-bearing row.
 
@@ -674,33 +645,36 @@ def _capture_project(
     row_tables = ("project_directory", "session", "workspace")
     total: int | None = None
     if progress is not None:
-        counts = [
-            connection.execute(
+        total = 1
+        for table in row_tables:
+            _check_optional_deadline(deadline)
+            count = connection.execute(
                 f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (project_id,)
             ).fetchone()
-            for table in row_tables
-        ]
-        if any(count is None or len(count) != 1 or type(count[0]) is not int for count in counts):
-            raise MoveError("move selected row count is malformed")
-        total = 1 + sum(count[0] for count in counts)
-        if total > MAX_SELECTED_ROWS:
-            raise MoveError("move selected row limit exceeded")
+            if count is None or len(count) != 1 or type(count[0]) is not int:
+                raise MoveError("move selected row count is malformed")
+            total += count[0]
+            if total > MAX_SELECTED_ROWS:
+                raise MoveError("move selected row limit exceeded")
         _report_progress(progress, "collection", 0, total, False)
     projects = connection.execute(
-        "SELECT id, worktree, sandboxes FROM project WHERE id = ?", (project_id,)
-    ).fetchall()
-    if not projects:
+        "SELECT id, worktree, sandboxes FROM project WHERE id = ? LIMIT 2", (project_id,)
+    )
+    project_row = next(projects, None)
+    if project_row is None:
         raise MoveError("project ID was not found")
-    if len(projects) != 1:
+    if next(projects, None) is not None:
         raise MoveError("project ID is ambiguous")
-    project_row = projects[0]
     if len(project_row) != 3:
         raise MoveError("move project row is malformed")
     project = {
         "id": _identifier(project_row[0], "project ID"),
         "worktree": _absolute_value(project_row[1], "project worktree"),
-        "sandboxes": _sandbox_text(project_row[2]),
+        "sandboxes": _sandbox_text(project_row[2], deadline=deadline),
     }
+    captured_bytes = sum(_captured_scalar_size(value) for value in project.values())
+    if captured_bytes > MAX_CAPTURE_BYTES:
+        raise MoveError("move captured scalar limit exceeded")
     rows: list[CapturedRow] = []
     completed = 1
     for table, identity_columns, nullable, payload_columns in (
@@ -716,34 +690,41 @@ def _capture_project(
             f"SELECT {selected} FROM {_quote(table)} WHERE project_id = ? "
             f"ORDER BY {order} LIMIT {MAX_SELECTED_ROWS + 1}",
             (project_id,),
-        ).fetchall()
-        if len(records) > MAX_SELECTED_ROWS:
-            raise MoveError("move selected row limit exceeded")
-        for record in records:
-            if len(record) != len(identity_columns) + 1 + len(payload_columns):
-                raise MoveError("move location row is malformed")
-            identity = tuple(
-                _identifier(value, f"{table} row identity")
-                for value in record[: len(identity_columns)]
-            )
-            directory_value = record[len(identity_columns)]
-            directory = (
-                None
-                if directory_value is None and nullable
-                else _absolute_value(directory_value, f"{table} directory")
-            )
-            payload = tuple(record[len(identity_columns) + 1 :])
-            rows.append(CapturedRow(table, identity, directory, payload))
-            completed += 1
-            _report_progress(progress, "collection", completed, total, False)
-    if len(rows) + 1 > MAX_SELECTED_ROWS:
-        raise MoveError("move selected row limit exceeded")
-    _capture_size(project, rows)
+        )
+        while batch := records.fetchmany(256):
+            _check_optional_deadline(deadline)
+            for record in batch:
+                if completed >= MAX_SELECTED_ROWS:
+                    raise MoveError("move selected row limit exceeded")
+                if len(record) != len(identity_columns) + 1 + len(payload_columns):
+                    raise MoveError("move location row is malformed")
+                identity = tuple(
+                    _identifier(value, f"{table} row identity")
+                    for value in record[: len(identity_columns)]
+                )
+                directory_value = record[len(identity_columns)]
+                directory = (
+                    None
+                    if directory_value is None and nullable
+                    else _absolute_value(directory_value, f"{table} directory")
+                )
+                payload = tuple(record[len(identity_columns) + 1 :])
+                candidate_bytes = sum(_captured_scalar_size(value) for value in identity)
+                if directory is not None:
+                    candidate_bytes += _captured_scalar_size(directory)
+                candidate_bytes += sum(_captured_scalar_size(value) for value in payload)
+                if captured_bytes + candidate_bytes > MAX_CAPTURE_BYTES:
+                    raise MoveError("move captured scalar limit exceeded")
+                captured_bytes += candidate_bytes
+                rows.append(CapturedRow(table, identity, directory, payload))
+                completed += 1
+                _report_progress(progress, "collection", completed, total, False)
+                _check_optional_deadline(deadline)
     _report_progress(progress, "collection", completed, total, True)
     return project, tuple(rows)
 
 
-def _sandbox_text(value: object) -> str:
+def _sandbox_text(value: object, *, deadline: float | None = None) -> str:
     """Validate bounded sandbox JSON without preserving mutable decoded objects."""
     if not isinstance(value, str):
         raise MoveError("move sandbox JSON is malformed")
@@ -756,20 +737,9 @@ def _sandbox_text(value: object) -> str:
     if not isinstance(decoded, list) or len(decoded) > MAX_SANDBOX_ENTRIES:
         raise MoveError("move sandbox JSON is malformed")
     for sandbox in decoded:
+        _check_optional_deadline(deadline)
         _absolute_value(sandbox, "project sandbox")
     return value
-
-
-def _capture_size(project: dict[str, str], rows: list[CapturedRow]) -> None:
-    """Enforce aggregate scalar bounds before immutable plan construction."""
-    total = sum(_captured_scalar_size(value) for value in project.values())
-    for row in rows:
-        total += sum(_captured_scalar_size(value) for value in row.identity)
-        if row.directory is not None:
-            total += _captured_scalar_size(row.directory)
-        total += sum(_captured_scalar_size(value) for value in row.payload)
-    if total > MAX_CAPTURE_BYTES:
-        raise MoveError("move captured scalar limit exceeded")
 
 
 def _captured_scalar_size(value: object) -> int:
@@ -785,12 +755,19 @@ def _captured_scalar_size(value: object) -> int:
     raise MoveError("move captured scalar is malformed")
 
 
+def _check_optional_deadline(deadline: float | None) -> None:
+    """Check the writer deadline when a helper runs inside application."""
+    if deadline is not None:
+        _check_transaction_deadline(deadline)
+
+
 def _build_mappings(
     state: CapturedState,
     target_main: str,
     *,
     deadline: float,
     progress: Callable[[str, int | None, int | None, bool], None] | None = None,
+    deadline_check: Callable[[float], None] = _check_revalidation_deadline,
 ) -> tuple[MoveMapping, ...]:
     """Derive, validate, and evidence every distinct lexical sibling mapping."""
     source_parent = os.path.dirname(state.worktree)
@@ -805,6 +782,7 @@ def _build_mappings(
     _add_location(locations, state.worktree, LocationMembership("project.worktree", (state.project_id,)))
     sandboxes = json.loads(state.sandboxes)
     for index, sandbox in enumerate(sandboxes):
+        deadline_check(deadline)
         _add_location(locations, sandbox, LocationMembership("project.sandbox", (state.project_id, str(index))))
     for row in state.rows:
         if row.directory is not None:
@@ -820,7 +798,7 @@ def _build_mappings(
     total = len(locations)
     _report_progress(progress, "Git pair validation", 0, total, False)
     for source in sorted(locations):
-        _check_revalidation_deadline(deadline)
+        deadline_check(deadline)
         memberships = tuple(sorted(locations[source], key=lambda item: (item.category, item.row_identity)))
         if os.path.dirname(source) != source_parent or not os.path.basename(source):
             raise MoveError(
@@ -840,12 +818,22 @@ def _build_mappings(
         _require_directory(source, "source", memberships)
         _require_directory(target, "target", memberships)
         source_git = _git_evidence(source, "source")
-        _check_revalidation_deadline(deadline)
+        deadline_check(deadline)
         target_git = _git_evidence(target, "target")
-        _check_revalidation_deadline(deadline)
+        deadline_check(deadline)
         _compare_git(source, target, source_git, target_git)
         mappings.append(MoveMapping(source, target, memberships, source_git, target_git))
         _report_progress(progress, "Git pair validation", len(mappings), total, len(mappings) == total)
+    source_admin_paths = tuple(
+        admin_path
+        for mapping in mappings
+        for admin_path in (mapping.source_git.git_dir, mapping.source_git.git_common_dir)
+    )
+    for mapping in mappings:
+        deadline_check(deadline)
+        for target_admin_path in (mapping.target_git.git_dir, mapping.target_git.git_common_dir):
+            if any(_points_into(target_admin_path, source_admin_path) for source_admin_path in source_admin_paths):
+                raise MoveError("git target administrative metadata points into the source family")
     return tuple(mappings)
 
 
@@ -870,140 +858,42 @@ def _require_directory(path: str, side: str, memberships: tuple[LocationMembersh
 
 
 def _git_evidence(path: str, side: str) -> GitEvidence:
-    """Collect bounded local-only identity and checkout state evidence for one root."""
-    root = _git_output(path, side, ("rev-parse", "--show-toplevel"), "repository root")
-    if _single_line(root, "repository root") != os.path.normpath(path):
-        raise MoveError(f"git {side} path is not a worktree root: path={_display(path)}")
-    origin_result = _git_output(path, side, ("config", "--get", "remote.origin.url"), "origin", allow_missing=True)
-    branch_result = _git_output(path, side, ("symbolic-ref", "--quiet", "--short", "HEAD"), "checkout state", allow_missing=True)
-    head = _commit(_single_line(_git_output(path, side, ("rev-parse", "HEAD"), "HEAD"), "HEAD"), "HEAD")
-    if origin_result is None:
-        identity = f"root:{_root_commit(path, side)}"
-    else:
-        normalized = _normalize_origin(_single_line(origin_result, "origin"))
-        identity = f"root:{_root_commit(path, side)}" if normalized is None else "origin:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    if branch_result is None:
-        return GitEvidence(identity, "detached", None, head)
-    branch = _single_line(branch_result, "branch")
-    if not branch or any(character.isspace() or ord(character) < 32 for character in branch):
-        raise MoveError(f"git {side} branch output is malformed: path={_display(path)}")
-    return GitEvidence(identity, "attached", branch, head)
-
-
-def _root_commit(path: str, side: str) -> str:
-    """Return exactly one root commit for local-origin fallback identity evidence."""
-    output = _git_output(path, side, ("rev-list", "--max-parents=0", "HEAD"), "root commit")
-    lines = [line for line in output.splitlines() if line]
-    if len(lines) != 1:
-        raise MoveError(f"git {side} root commit is ambiguous: path={_display(path)}")
-    return _commit(lines[0], "root commit")
+    """Collect bounded local Git evidence through the dedicated subprocess boundary."""
+    return move_git.collect_evidence(
+        path,
+        side,
+        evidence_factory=GitEvidence,
+        move_error=MoveError,
+        operational_error=MoveOperationalError,
+        display=_display,
+        maximum_output_bytes=MAX_GIT_OUTPUT_BYTES,
+        timeout_seconds=GIT_TIMEOUT_SECONDS,
+        cleanup_timeout_seconds=GIT_CLEANUP_TIMEOUT_SECONDS,
+    )
 
 
 def _git_output(
     path: str, side: str, arguments: tuple[str, ...], label: str, *, allow_missing: bool = False
 ) -> str | None:
-    """Run one local no-shell Git probe with live stdout cap and forced reaping."""
-    process: subprocess.Popen[bytes] | None = None
-    selector: selectors.BaseSelector | None = None
-    output = bytearray()
-    try:
-        process = subprocess.Popen(
-            ["git", "-C", path, *arguments],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        if process.stdout is None:
-            raise MoveOperationalError("git probe could not capture stdout")
-        os.set_blocking(process.stdout.fileno(), False)
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise MoveOperationalError("git probe timed out")
-            events = selector.select(remaining)
-            if not events:
-                if process.poll() is not None:
-                    break
-                continue
-            for key, _event in events:
-                chunk = os.read(key.fd, min(4096, MAX_GIT_OUTPUT_BYTES + 1 - len(output)))
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                output.extend(chunk)
-                if len(output) > MAX_GIT_OUTPUT_BYTES:
-                    raise MoveOperationalError("git probe stdout limit exceeded")
-        status = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        if status != 0:
-            if allow_missing and status == 1:
-                return None
-            raise MoveError(f"git {side} {label} probe failed: path={_display(path)}")
-        try:
-            return output.decode("utf-8", "strict")
-        except UnicodeDecodeError as error:
-            raise MoveError(f"git {side} {label} output is malformed: path={_display(path)}") from error
-    except KeyboardInterrupt as error:
-        raise MoveOperationalError("git probe was interrupted") from error
-    except FileNotFoundError as error:
-        raise MoveOperationalError("git is unavailable") from error
-    except subprocess.TimeoutExpired as error:
-        raise MoveOperationalError("git probe timed out") from error
-    except OSError as error:
-        raise MoveOperationalError("git probe could not run") from error
-    finally:
-        if selector is not None:
-            selector.close()
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
-        if process is not None and process.stdout is not None:
-            process.stdout.close()
+    """Run one bounded local Git probe through the internal Git module."""
+    return move_git.git_output(
+        path,
+        side,
+        arguments,
+        label,
+        allow_missing=allow_missing,
+        move_error=MoveError,
+        operational_error=MoveOperationalError,
+        display=_display,
+        maximum_output_bytes=MAX_GIT_OUTPUT_BYTES,
+        timeout_seconds=GIT_TIMEOUT_SECONDS,
+        cleanup_timeout_seconds=GIT_CLEANUP_TIMEOUT_SECONDS,
+    )
 
 
-def _single_line(value: str, label: str) -> str:
-    """Return one bounded single-line Git value while rejecting malformed output."""
-    if not value.endswith("\n") or value.count("\n") != 1 or "\r" in value:
-        raise MoveError(f"git {label} output is malformed")
-    result = value[:-1]
-    if not result or len(result.encode("utf-8", "surrogatepass")) > MAX_VALUE_BYTES:
-        raise MoveError(f"git {label} output is malformed")
-    return result
-
-
-def _commit(value: str, label: str) -> str:
-    """Require a bounded SHA-1 or SHA-256 hexadecimal Git commit identifier."""
-    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", value) is None:
-        raise MoveError(f"git {label} output is malformed")
-    return value
-
-
-def _normalize_origin(value: str) -> str | None:
-    """Normalize a non-file Git origin without retaining credentials for diagnostics."""
-    if len(value.encode("utf-8", "surrogatepass")) > MAX_VALUE_BYTES or any(ord(character) < 32 for character in value):
-        raise MoveError("git origin output is malformed")
-    try:
-        parsed = urlsplit(value)
-    except ValueError as error:
-        raise MoveError("git origin output is malformed") from error
-    if parsed.scheme:
-        if parsed.scheme.lower() == "file" or not parsed.hostname:
-            return None
-        try:
-            port = parsed.port
-        except ValueError as error:
-            raise MoveError("git origin output is malformed") from error
-        host = parsed.hostname.lower()
-        netloc = host if port is None else f"{host}:{port}"
-        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path.rstrip("/"), "", ""))
-    if ":" in value and not any(character.isspace() for character in value):
-        host_path = value.rsplit("@", 1)[-1]
-        if host_path.startswith("/") or host_path.startswith("."):
-            return None
-        return host_path.rstrip("/")
-    return None
+def _points_into(path: str, parent: str) -> bool:
+    """Return whether one normalized absolute Git-admin path is inside another."""
+    return path == parent or path.startswith(parent + os.sep)
 
 
 def _compare_git(source: str, target: str, source_git: GitEvidence, target_git: GitEvidence) -> None:

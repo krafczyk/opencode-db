@@ -1121,7 +1121,7 @@ def _reviewed_move() -> object:
 
     request = MoveRequest("/tmp/opencode.db", "project", "/target/main")
     state = CapturedState((), "project", "/source/main", "[]", ())
-    evidence = GitEvidence("root:abc", "attached", "main", "a" * 40)
+    evidence = GitEvidence("root:abc", "attached", "main", "a" * 40, "/source/.git", "/source/.git")
     mapping = MoveMapping(
         "/source/main", "/target/main", (LocationMembership("project.worktree", ("project",)),), evidence, evidence
     )
