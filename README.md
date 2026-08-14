@@ -21,9 +21,10 @@ salvage tool.
   XDG base wins even when its selected file is absent; the tool never searches
   OpenCode or falls back based on file existence. Explicit values never accept a
   relative or in-memory target.
-- The operator owns shutdown, restart, and concurrent-use safety. Commands run
-  immediately: they do not prompt for confirmation, inspect processes, or
-  coordinate other users.
+- The operator owns shutdown, restart, and concurrent-use safety. Commands do
+  not inspect processes or coordinate other users. `mv` is the sole interactive
+  exception: it previews its complete metadata mapping and asks for confirmation
+  unless `--yes` is explicit.
 - The tool never starts OpenCode. After a successful install, start OpenCode
   separately using its unchanged normal command and configuration.
 
@@ -120,6 +121,42 @@ Rollback-journal evidence, malformed inputs, changed source files, unsupported
 scratch storage, unknown retained schemas, and candidates that cannot validate
 are refused. The tool never creates an empty, in-memory, or replacement
 database as a fallback.
+
+## Sibling project move
+
+`mv` updates only the selected project's current structured location metadata
+after the operator has copied a flat family of sibling Git checkouts. It never
+copies, moves, repairs, renames, or removes filesystem entries. The operator
+first copies the source family, then runs `mv`, verifies normal OpenCode use,
+and finally performs any old-directory cleanup separately.
+
+```bash
+opencode-db mv --project-id ID \
+  --target-project-dir /absolute/new-parent/project \
+  [--db /absolute/path/opencode.db] [--method sibling] [--yes] [--progress]
+```
+
+`--project-id` and `--target-project-dir` are required. `--method` defaults to
+and currently accepts only `sibling`. `--db` follows the same bounded default
+selection as the other database commands. The target main checkout must retain
+the source main checkout basename, and every known structured project location
+must be an immediate sibling in both source and copied target families.
+
+Before any mutation, `mv` writes a deterministic complete source-to-target
+mapping to stdout with affected structured categories and counts. Without
+`--yes`, both stdin and stdout must be terminals; only an exact lowercase `y`
+after the input line ending is removed authorizes the transaction. Any other
+input, end-of-input, or interruption cancels without applying metadata changes.
+`--yes` bypasses only that prompt, never the preview, filesystem checks, Git
+correspondence checks, schema checks, or freshness-bound transaction.
+
+`--progress` is opt-in and writes only fixed phase labels and aggregate counts
+to stderr. Terminal stderr may redraw an ASCII bar; redirected stderr receives
+bounded newline-delimited records. Progress never changes stdout mappings,
+authorization, validation, or transaction behavior. The rewrite changes only
+the supported project worktree, sandbox, project-directory, session-directory,
+and non-null workspace-directory fields. Historical messages, prompts, tools,
+output, and other free-form content remain unchanged.
 
 ## Standalone install
 
@@ -272,11 +309,12 @@ space in an OpenCode database.
 
 Cleanup commands accept `--json` for exactly one newline-terminated
 schema-version-1 JSON object on stdout. Top-level `export`, `import`, and the
-inspection commands do not accept `--json`; their separate human-only success
-output is written to stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
+inspection commands do not accept `--json`; `mv` also has human-only output and
+does not accept `--json`. Their separate human-only success output is written to
+stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
 syntax/input shape, `3` uncertain decision required, `4` safety-precondition
-refusal, `5` operational or validation failure, and `6` manual recovery
-required.
+refusal (including `mv` validation, detached-stream refusal, and cancellation),
+`5` bounded operational SQLite or Git failure, and `6` manual recovery required.
 
 The default deadline is 30 minutes. `--deadline-seconds` accepts finite whole
 seconds from 1 through 86400. SQLite busy waits are finite. The tool requires

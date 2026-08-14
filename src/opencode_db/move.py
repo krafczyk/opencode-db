@@ -19,6 +19,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -194,14 +195,20 @@ class ReviewedMovePlan:
     mappings: tuple[MoveMapping, ...]
 
 
-def plan_sibling_move(request: MoveRequest) -> ReviewedMovePlan:
+def plan_sibling_move(
+    request: MoveRequest,
+    *,
+    progress: Callable[[str, int | None, int | None, bool], None] | None = None,
+) -> ReviewedMovePlan:
     """Build one read-only, fail-closed sibling move plan from a SQLite snapshot.
 
     Parameters: ``request`` supplies an absolute existing database path, one
     nonempty project ID, and an absolute target main worktree path.  Returns an
     immutable :class:`ReviewedMovePlan` only when the current closed schema,
     exact selected rows, flat lexical family, existing source/target directories,
-    and local Git correspondence all validate.  Raises :class:`MoveError` for
+    and local Git correspondence all validate. ``progress``, when supplied,
+    receives fixed phase names and aggregate completed/total observations; it
+    cannot alter planning. Raises :class:`MoveError` for
     malformed data or ineligible layouts and :class:`MoveOperationalError` for
     SQLite, filesystem, Git availability, cap, timeout, or interruption failures.
     It opens SQLite read-only in exactly one explicit read transaction and never
@@ -215,10 +222,13 @@ def plan_sibling_move(request: MoveRequest) -> ReviewedMovePlan:
         connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, isolation_level=None)
         connection.execute("BEGIN")
         fingerprint = _validate_schema(connection)
-        project, rows = _capture_project(connection, project_id)
+        project, rows = _capture_project(connection, project_id, progress=progress)
         state = CapturedState(fingerprint, project_id, project["worktree"], project["sandboxes"], rows)
         mappings = _build_mappings(
-            state, target_main, deadline=time.monotonic() + REVALIDATION_TIMEOUT_SECONDS
+            state,
+            target_main,
+            deadline=time.monotonic() + REVALIDATION_TIMEOUT_SECONDS,
+            progress=progress,
         )
         connection.rollback()
         return ReviewedMovePlan(request, state, mappings)
@@ -235,7 +245,11 @@ def plan_sibling_move(request: MoveRequest) -> ReviewedMovePlan:
             connection.close()
 
 
-def apply_sibling_move(reviewed: ReviewedMovePlan) -> None:
+def apply_sibling_move(
+    reviewed: ReviewedMovePlan,
+    *,
+    progress: Callable[[str, int | None, int | None, bool], None] | None = None,
+) -> None:
     """Atomically apply one previously reviewed sibling move plan.
 
     Parameters: ``reviewed`` is an immutable :class:`ReviewedMovePlan` returned
@@ -243,7 +257,9 @@ def apply_sibling_move(reviewed: ReviewedMovePlan) -> None:
     ``None`` only after the exact structured-location transaction commits. Raises
     :class:`MoveError` when the reviewed state, schema, directory, Git evidence,
     target project-directory keys, integrity, or foreign keys have changed or are
-    invalid; raises :class:`MoveOperationalError` if SQLite cannot acquire its
+    invalid; ``progress``, when supplied, receives fixed revalidation and update
+    group aggregate observations without affecting the transaction. Raises
+    :class:`MoveOperationalError` if SQLite cannot acquire its
     bounded writer lock or perform the transaction. The function writes only the
     selected project's worktree, sandbox JSON, project-directory keys, session
     directories, and non-null workspace directories. It neither rewrites
@@ -261,19 +277,27 @@ def apply_sibling_move(reviewed: ReviewedMovePlan) -> None:
             raise MoveOperationalError("move SQLite foreign keys could not be enabled")
         connection.execute("BEGIN IMMEDIATE")
         _validate_database_health(connection)
+        _report_progress(progress, "revalidation", 0, 1, False)
         current, mappings = _revalidate_reviewed_plan(connection, reviewed)
+        _report_progress(progress, "revalidation", 1, 1, True)
+        _report_progress(progress, "update groups", 0, 5, False)
         _apply_project_locations(connection, current, mappings)
         _after_move_update_group("project")
+        _report_progress(progress, "update groups", 1, 5, False)
         _apply_project_directory_locations(connection, current, mappings)
         _after_move_update_group("project_directory")
+        _report_progress(progress, "update groups", 2, 5, False)
         _apply_row_locations(connection, current, mappings, "session")
         _after_move_update_group("session")
+        _report_progress(progress, "update groups", 3, 5, False)
         _apply_row_locations(connection, current, mappings, "workspace")
         _after_move_update_group("workspace")
+        _report_progress(progress, "update groups", 4, 5, False)
         _verify_applied_locations(connection, current, mappings)
         _validate_database_health(connection)
         _after_move_update_group("pre_commit")
         connection.commit()
+        _report_progress(progress, "update groups", 5, 5, True)
     except MoveError:
         _rollback(connection)
         raise
@@ -293,6 +317,18 @@ def _rollback(connection: sqlite3.Connection | None) -> None:
             connection.rollback()
         except sqlite3.Error:
             pass
+
+
+def _report_progress(
+    progress: Callable[[str, int | None, int | None, bool], None] | None,
+    phase: str,
+    completed: int | None,
+    total: int | None,
+    complete: bool,
+) -> None:
+    """Send one aggregate progress observation when a caller opted in."""
+    if progress is not None:
+        progress(phase, completed, total, complete)
 
 
 def _validate_database_health(connection: sqlite3.Connection) -> None:
@@ -621,9 +657,29 @@ def _refuse_inbound_directory_references(connection: sqlite3.Connection, tables:
 
 
 def _capture_project(
-    connection: sqlite3.Connection, project_id: str
+    connection: sqlite3.Connection,
+    project_id: str,
+    *,
+    progress: Callable[[str, int | None, int | None, bool], None] | None = None,
 ) -> tuple[dict[str, str], tuple[CapturedRow, ...]]:
-    """Capture exactly one selected project and every supported location-bearing row."""
+    """Capture exactly one selected project and every supported location-bearing row.
+
+    ``progress`` receives only aggregate collection counts after their bounded
+    totals are known. It does not change the snapshot queries or captured state.
+    """
+    row_tables = ("project_directory", "session", "workspace")
+    counts = [
+        connection.execute(
+            f"SELECT COUNT(*) FROM {_quote(table)} WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        for table in row_tables
+    ]
+    if any(count is None or len(count) != 1 or type(count[0]) is not int for count in counts):
+        raise MoveError("move selected row count is malformed")
+    total = 1 + sum(count[0] for count in counts)
+    if total > MAX_SELECTED_ROWS:
+        raise MoveError("move selected row limit exceeded")
+    _report_progress(progress, "collection", 0, total, False)
     projects = connection.execute(
         "SELECT id, worktree, sandboxes FROM project WHERE id = ?", (project_id,)
     ).fetchall()
@@ -640,6 +696,7 @@ def _capture_project(
         "sandboxes": _sandbox_text(project_row[2]),
     }
     rows: list[CapturedRow] = []
+    completed = 1
     for table, identity_columns, nullable, payload_columns in (
         ("project_directory", ("project_id", "directory"), False, ("type", "strategy", "time_created")),
         ("session", ("id",), False, ()),
@@ -671,9 +728,12 @@ def _capture_project(
             )
             payload = tuple(record[len(identity_columns) + 1 :])
             rows.append(CapturedRow(table, identity, directory, payload))
+            completed += 1
+            _report_progress(progress, "collection", completed, total, False)
     if len(rows) + 1 > MAX_SELECTED_ROWS:
         raise MoveError("move selected row limit exceeded")
     _capture_size(project, rows)
+    _report_progress(progress, "collection", completed, total, True)
     return project, tuple(rows)
 
 
@@ -721,7 +781,11 @@ def _captured_scalar_size(value: object) -> int:
 
 
 def _build_mappings(
-    state: CapturedState, target_main: str, *, deadline: float
+    state: CapturedState,
+    target_main: str,
+    *,
+    deadline: float,
+    progress: Callable[[str, int | None, int | None, bool], None] | None = None,
 ) -> tuple[MoveMapping, ...]:
     """Derive, validate, and evidence every distinct lexical sibling mapping."""
     source_parent = os.path.dirname(state.worktree)
@@ -749,6 +813,8 @@ def _build_mappings(
         raise MoveError("move distinct location limit exceeded")
     mappings: list[MoveMapping] = []
     derived: dict[str, str] = {}
+    total = len(locations)
+    _report_progress(progress, "Git pair validation", 0, total, False)
     for source in sorted(locations):
         _check_revalidation_deadline(deadline)
         memberships = tuple(sorted(locations[source], key=lambda item: (item.category, item.row_identity)))
@@ -775,6 +841,7 @@ def _build_mappings(
         _check_revalidation_deadline(deadline)
         _compare_git(source, target, source_git, target_git)
         mappings.append(MoveMapping(source, target, memberships, source_git, target_git))
+        _report_progress(progress, "Git pair validation", len(mappings), total, len(mappings) == total)
     return tuple(mappings)
 
 

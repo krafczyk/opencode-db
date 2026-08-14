@@ -101,6 +101,46 @@ Session IDs and parent relationships are retained. A failed insert, check, or
 commit rolls back the entire import; repeating a successful archive import is
 idempotent and does not alter unrelated project state.
 
+## Sibling project move
+
+The human-only metadata move grammar is:
+
+```text
+opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--yes] [--progress]
+```
+
+`--project-id` and `--target-project-dir` are required. `--method` defaults to
+and accepts only `sibling`; `--json`, relative paths, duplicate options, unknown
+options, and unsupported methods are usage errors before SQLite or Git access.
+An explicit `--db` is absolute and non-memory. An omitted `--db` uses the same
+bounded XDG/HOME default described in Target and identities.
+
+The operator owns filesystem placement: copy the complete flat sibling checkout
+family first, invoke `mv` to change metadata, verify the result, then separately
+remove old directories if desired. The command never copies, moves, creates,
+repairs, renames, or removes filesystem entries. It validates every supported
+structured project location, compares each source/target Git checkout locally,
+then writes a deterministic complete mapping preview to stdout. Paths are
+single-line ASCII-escaped and quoted; each mapping reports the affected
+structured category counts.
+
+Without `--yes`, both stdin and stdout must be terminals. The command refuses
+without reading stdin when either is detached. With both terminals, only exact
+lowercase `y` after line-ending removal authorizes application; `n`, any other
+input, EOF, and interruption cancel. `--yes` bypasses only the prompt, never
+the preview, eligibility, Git, schema, or freshness checks. After authorization,
+the command revalidates and atomically updates only supported structured
+worktree, sandbox, project-directory, session-directory, and non-null
+workspace-directory fields. Historical messages, prompts, tools, output, and
+other free-form content are not rewritten.
+
+`--progress` is opt-in. It writes only fixed phase labels and aggregate counts to
+stderr: bounded collection, Git-pair validation, revalidation, and update
+groups. Terminal stderr may redraw one ASCII bar and finishes with a newline;
+redirected stderr receives capped newline-delimited records without carriage
+returns. Progress contains no IDs, paths, remotes, or database content and does
+not alter stdout, prompting, validation, or transaction behavior.
+
 ## Target and identities
 
 Every database-accepting command accepts an explicit absolute database option or
@@ -214,7 +254,8 @@ reported as `scratch_cleanup_required` and is not removed remotely.
 
 Cleanup commands with `--json` emit exactly one UTF-8, ASCII-safe,
 newline-terminated object on stdout, capped at 64 KiB. Top-level transfer and
-inspection commands instead use their documented human-only output. The cleanup result has
+inspection commands instead use their documented human-only output. `mv` is also
+human-only and has no JSON result. The cleanup result has
 no unknown version-1 fields:
 
 ```text
@@ -235,8 +276,8 @@ mutate active files.
 | 0 | terminal success | complete preview, installed, rolled back, status, backup pruned |
 | 2 | syntax/input shape | malformed command, relative path, incomplete ID |
 | 3 | decision required | validated uncertain preview or missing exact uncertain approval |
-| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence, malformed transfer archive, ambiguous project, incompatible schema |
-| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure, transfer filesystem/SQLite/integrity/publication failure |
+| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence, malformed transfer archive, ambiguous project, incompatible schema, `mv` validation refusal, cancellation, or detached-stream refusal |
+| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure, transfer filesystem/SQLite/integrity/publication failure, bounded `mv` SQLite or Git execution failure |
 | 6 | manual recovery required | unreconcilable active installation or cross-host scratch cleanup |
 
 Stable status values are `complete`, `uncertain`, `source_changed`, `invalid`,
