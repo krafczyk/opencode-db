@@ -20,6 +20,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db import cli
+from opencode_db import move_cli
 from opencode_db.transfer import TransferError, TransferOperationalError
 from opencode_db.model import (
     EXIT_OPERATIONAL_FAILURE,
@@ -897,7 +898,7 @@ class CliContractTests(unittest.TestCase):
         ):
             with self.subTest(arguments=rejected):
                 stderr = io.StringIO()
-                with patch.object(cli, "plan_sibling_move") as planner, redirect_stderr(stderr):
+                with patch.object(move_cli, "plan_sibling_move") as planner, redirect_stderr(stderr):
                     self.assertEqual(cli.main(rejected), EXIT_USAGE)
                 planner.assert_not_called()
                 self.assertIn("opencode-db:", stderr.getvalue())
@@ -949,7 +950,7 @@ class CliContractTests(unittest.TestCase):
 
     def test_mv_refuses_detached_or_nonexact_confirmation_without_application(self) -> None:
         """Require both terminals and an exact lowercase confirmation before mutation."""
-        with patch.object(cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(cli, "apply_sibling_move") as apply:
+        with patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -962,7 +963,7 @@ class CliContractTests(unittest.TestCase):
             apply.assert_not_called()
 
         for reply in ("n\n", "Y\n", " y\n", "y \n", "", "\n"):
-            with self.subTest(reply=reply), patch.object(cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(cli, "apply_sibling_move") as apply:
+            with self.subTest(reply=reply), patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
                 stdin = _TtyStream(reply)
                 stdout = _TtyStream()
                 stderr = _TtyStream()
@@ -977,7 +978,7 @@ class CliContractTests(unittest.TestCase):
         stdin = _InterruptingTty()
         stdout = _TtyStream()
         stderr = _TtyStream()
-        with patch.object(cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(cli, "apply_sibling_move") as apply:
+        with patch.object(move_cli, "plan_sibling_move", return_value=_reviewed_move()), patch.object(move_cli, "apply_sibling_move") as apply:
             with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
                 exit_code = cli.main(
                     ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db"]
@@ -1005,11 +1006,11 @@ class CliContractTests(unittest.TestCase):
         ) -> None:
             assert callable(progress)
             progress("revalidation", 0, 1, False)
-            raise cli.MoveOperationalError("git is unavailable")
+            raise move_cli.MoveOperationalError("git is unavailable")
 
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.object(cli, "plan_sibling_move", side_effect=plan_with_progress), patch.object(cli, "apply_sibling_move", side_effect=fail_during_revalidation):
+        with patch.object(move_cli, "plan_sibling_move", side_effect=plan_with_progress), patch.object(move_cli, "apply_sibling_move", side_effect=fail_during_revalidation):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = cli.main(
                     ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--db", "/tmp/opencode.db", "--yes", "--progress"]
@@ -1023,7 +1024,7 @@ class CliContractTests(unittest.TestCase):
         self.assertNotIn("/source/main", stderr.getvalue())
 
         capped = io.StringIO()
-        reporter = cli._MoveProgressReporter(capped)
+        reporter = move_cli._MoveProgressReporter(capped)
         for completed in range(150):
             reporter.update("collection", completed, 150, False)
         reporter.update("collection", 150, 150, True)
@@ -1031,7 +1032,7 @@ class CliContractTests(unittest.TestCase):
         self.assertLessEqual(len(lines), 100)
         self.assertTrue(lines[-1].endswith("complete"))
 
-        with patch.object(cli, "plan_sibling_move", side_effect=cli.MoveError("move schema is incomplete")), patch.object(cli, "apply_sibling_move") as apply:
+        with patch.object(move_cli, "plan_sibling_move", side_effect=move_cli.MoveError("move schema is incomplete")), patch.object(move_cli, "apply_sibling_move") as apply:
             stderr = io.StringIO()
             with redirect_stderr(stderr):
                 exit_code = cli.main(
