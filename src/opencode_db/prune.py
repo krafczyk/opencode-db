@@ -8,10 +8,11 @@ selected existing database in one immediate transaction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 
 from .transfer import (
@@ -33,6 +34,11 @@ _MAX_VALUE = (1 << 63) - 1
 _MAX_NUMERIC_DIGITS = len(str(_MAX_VALUE))
 _BUSY_TIMEOUT_MS = 10_000
 _SELECTION_TABLE = "_opencode_db_prune_selection"
+_PRUNE_TIMEOUT_SECONDS = 10.0
+_PRUNE_PROGRESS_OPCODES = 1_000
+_MAX_PRUNE_CANDIDATES = 250_000
+_MAX_PRUNE_SESSION_ID_BYTES = 16 * 1024
+_MAX_PRUNE_EVIDENCE_BYTES = 64 * 1024 * 1024
 _TIME_PATTERN = re.compile(r"([1-9][0-9]*)([dmy])\Z")
 _SIZE_PATTERN = re.compile(r"([1-9][0-9]*)(B|KiB|MiB|GiB|TiB)\Z")
 _SIZE_MULTIPLIERS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
@@ -85,7 +91,7 @@ class PruneRequest:
     """
 
     database: str
-    project_id: str | None = None
+    project_id: str | None = field(default=None, repr=False)
     oldest: str | None = None
     keep_newest: str | None = None
     target_size: str | None = None
@@ -93,6 +99,75 @@ class PruneRequest:
     vacuum: bool = False
     yes: bool = False
     command: str = "prune"
+
+
+@dataclass(frozen=True)
+class PruneSelector:
+    """Represent the normalized retention policy used for one reviewed prune.
+
+    ``name`` identifies the supplied selector, while ``kind`` and ``value`` are
+    its grammar-validated form.  The value is immutable planning input and has
+    no SQLite or filesystem side effects.  It is used by planning and writer-side
+    revalidation to preserve the existing selector semantics exactly.
+    """
+
+    name: str
+    kind: str
+    value: int
+
+
+@dataclass(frozen=True)
+class PrunePreview:
+    """Describe aggregate impact that an operator can authorize without row data.
+
+    ``sessions_to_prune`` and ``sessions_to_keep`` are scoped counts;
+    ``oldest_surviving_session_updated`` is the retained scoped minimum or
+    ``None``.  Projected logical fields are populated only when size estimates
+    were requested.  Constructing the value performs no I/O or mutation.
+    """
+
+    sessions_to_prune: int
+    sessions_to_keep: int
+    oldest_surviving_session_updated: int | None
+    projected_logical_bytes_deleted: int | None
+    projected_logical_database_bytes_after_prune: int | None
+
+
+@dataclass(frozen=True)
+class PruneEvidence:
+    """Capture immutable private selection and displayed evidence from one snapshot.
+
+    ``selected_session_ids`` is retained only for exact writer-side freshness
+    comparison and is intentionally omitted from representations.  ``now_ms``
+    is the sole clock captured by planning, preventing elapsed authorization
+    time from changing time-based retention.  The value neither authorizes nor
+    performs a mutation.
+    """
+
+    now_ms: int
+    selected_session_ids: tuple[str, ...] = field(repr=False)
+    preview: PrunePreview
+
+
+@dataclass(frozen=True)
+class ReviewedPrunePlan:
+    """Bind a normalized request and immutable snapshot evidence for review.
+
+    ``request`` identifies the existing selected database, ``selector`` keeps
+    the normalized retention policy, and ``evidence`` records private selected
+    IDs plus displayed aggregate evidence.  Callers must pass this value to
+    :func:`apply_prune_plan` after authorization; constructing it makes no
+    database mutation.
+    """
+
+    request: PruneRequest
+    selector: PruneSelector
+    evidence: PruneEvidence
+
+    @property
+    def preview(self) -> PrunePreview:
+        """Return the aggregate impact preview without exposing selected IDs."""
+        return self.evidence.preview
 
 
 @dataclass(frozen=True)
@@ -172,15 +247,18 @@ def session_logical_sizes(
     *,
     project_id: str | None = None,
     session_id: str | None = None,
+    deadline: float | None = None,
 ) -> dict[str, int]:
     """Estimate known owned-row payload bytes for matching sessions in batches.
 
     Parameters: ``connection`` has passed :func:`validate_session_schema`, and
-    optional exact project/session IDs restrict the selected session rows.
-    Returns every matching session ID mapped to its complete known logical byte
-    estimate. Each owned table is aggregated once, so listing many estimates
-    does not issue one query per session. Raises :class:`PruneError` for
-    malformed ownership data and does not mutate or render persisted values.
+    optional exact project/session IDs restrict the selected session rows, and
+    ``deadline`` optionally bounds internal aggregate loops. Returns every
+    matching session ID mapped to its complete known logical byte estimate. Each
+    owned table is aggregated once, so listing many estimates does not issue one
+    query per session. Raises :class:`PruneError` for malformed ownership data
+    or :class:`PruneOperationalError` when the supplied deadline expires; it
+    does not mutate or render persisted values.
     """
     filters: list[str] = []
     parameters: list[object] = []
@@ -212,6 +290,7 @@ def session_logical_sizes(
         raise PruneError("database session data is malformed")
     sizes = {row[0]: row[1] for row in session_rows}
     for table in CHILD_SESSION_TABLES:
+        _check_prune_deadline(deadline)
         columns = _table_columns(connection, table)
         expression = _payload_expression(columns, "owned")
         selector = SESSION_SELECTOR_COLUMNS[table]
@@ -223,6 +302,7 @@ def session_logical_sizes(
             tuple(parameters),
         ).fetchall()
         for owned_session_id, logical_bytes in records:
+            _check_prune_deadline(deadline)
             if (
                 owned_session_id not in sizes
                 or type(logical_bytes) is not int
@@ -320,106 +400,165 @@ def prune_sessions(
 ) -> PruneOutcome:
     """Atomically prune selected sessions from one existing SQLite database.
 
-    Parameters: ``database`` is an existing absolute regular file opened through
-    SQLite ``mode=rw``; ``project_id`` optionally scopes candidates to one exact
-    existing project; exactly one selector is supplied; ``estimate_size`` enables
-    human reporting; and ``vacuum`` requests post-commit physical compaction.
-    Returns committed counts and requested logical estimates. Raises
+    Parameters: ``database`` is an existing absolute regular file; ``project_id``
+    optionally scopes candidates to one exact existing project; exactly one
+    selector is supplied; ``estimate_size`` enables human reporting; ``vacuum``
+    requests post-commit physical compaction; and ``now_ms`` optionally fixes
+    the time selector clock. Returns committed counts and requested logical
+    estimates. Raises
     :class:`PruneError` for selector, path, schema, project, or ownership
     refusals, :class:`PruneOperationalError` for bounded SQLite/filesystem
     failures, and :class:`PruneCommittedError` with the committed outcome when a
-    requested post-commit vacuum fails. The function enables foreign keys,
-    validates integrity before and after deletion, deletes known child rows and
-    session rows in one immediate transaction, and rolls back all uncommitted
-    changes on failure. Vacuum, when requested, runs only after that commit.
+    requested post-commit vacuum fails. The function first plans through SQLite
+    ``mode=ro`` and then revalidates under one immediate writer transaction;
+    an empty non-vacuum request returns from read evidence without opening rw.
+    It enables foreign keys, validates integrity before and after deletion,
+    deletes known child rows and session rows atomically, and rolls back all
+    uncommitted changes. Vacuum, when requested, runs only after that commit.
     """
-    selector_name, raw_selector = _one_selector(oldest, keep_newest, target_size)
-    if selector_name == "target_size":
-        selector_kind = "size"
-        selector_value = parse_target_size(raw_selector)
-    else:
-        selector_kind, selector_value = parse_selector(raw_selector)
+    reviewed = plan_prune(
+        PruneRequest(
+            str(database),
+            project_id=project_id,
+            oldest=oldest,
+            keep_newest=keep_newest,
+            target_size=target_size,
+            estimate_size=estimate_size,
+            vacuum=vacuum,
+        ),
+        now_ms=now_ms,
+    )
+    if not reviewed.evidence.selected_session_ids and not vacuum:
+        return _outcome_from_evidence(reviewed.evidence)
+    return apply_prune_plan(reviewed)
+
+
+def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedPrunePlan:
+    """Capture one bounded read-only prune decision from a SQLite snapshot.
+
+    Parameters: ``request`` identifies an existing selected database, optional
+    project scope, exactly one retention selector, and size/vacuum options;
+    ``now_ms`` optionally supplies the single clock value used by time selectors.
+    Returns immutable :class:`ReviewedPrunePlan` evidence that authorizes no
+    mutation.  Raises :class:`PruneError` for malformed request, path, schema,
+    selector, ownership, or capped evidence; raises :class:`PruneOperationalError`
+    for read-only SQLite, deadline, or cleanup failures.  The function opens the
+    existing database in SQLite ``mode=ro`` for one explicit snapshot and does
+    not change rows, main/WAL content, or journal policy.
+    """
+    if not isinstance(request, PruneRequest):
+        raise PruneError("prune request is malformed")
+    selector = _normalize_selector(request)
+    captured_now_ms = _captured_now_ms(now_ms)
+    path = _prune_database_path(request.database)
+    connection: sqlite3.Connection | None = None
+    deadline: float | None = None
     try:
-        path = _existing_regular_path(database, "database")
+        connection = _open_prune_read_connection(path)
+        deadline = time.monotonic() + _PRUNE_TIMEOUT_SECONDS
+        _install_prune_deadline(connection, deadline)
+        connection.execute("BEGIN")
+        evidence = _evaluate_prune(
+            connection, request, selector, captured_now_ms, deadline
+        )
+        return ReviewedPrunePlan(request, selector, evidence)
+    except PruneError:
+        raise
     except TransferOperationalError as error:
         raise PruneOperationalError(str(error)) from error
     except TransferError as error:
         raise PruneError(str(error)) from error
-    except OSError as error:
-        raise PruneOperationalError("database could not be inspected") from error
-    connection = _open_prune_connection(path)
+    except (sqlite3.Error, OSError, ValueError, OverflowError) as error:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise PruneOperationalError("prune planning timed out") from error
+        raise PruneOperationalError("prune planning could not read the database") from error
+    finally:
+        _cleanup_prune_connection(connection, "planning", sys.exception())
+
+
+def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
+    """Revalidate and atomically apply one previously reviewed prune plan.
+
+    Parameters: ``reviewed`` is an immutable :class:`ReviewedPrunePlan` returned
+    by :func:`plan_prune`.  Returns the committed :class:`PruneOutcome`, including
+    requested logical estimates and successful vacuum geometry.  Raises
+    :class:`PruneError` when current selection or displayed evidence differs and
+    instructs the caller to rerun before any deletion; raises
+    :class:`PruneOperationalError` for bounded writer, SQLite, deadline, or
+    cleanup failures; and raises :class:`PruneCommittedError` if post-commit
+    vacuum fails.  It opens SQLite ``mode=rw``, acquires a writer transaction
+    only after review, deletes known selected state on an exact revalidation,
+    and rolls back every uncommitted change.
+    """
+    if not isinstance(reviewed, ReviewedPrunePlan):
+        raise PruneError("prune reviewed plan is malformed")
+    if not isinstance(reviewed.request, PruneRequest) or not isinstance(reviewed.selector, PruneSelector):
+        raise PruneError("prune reviewed plan is malformed")
+    if not isinstance(reviewed.evidence, PruneEvidence) or type(reviewed.evidence.now_ms) is not int:
+        raise PruneError("prune reviewed plan is malformed")
+    if _normalize_selector(reviewed.request) != reviewed.selector:
+        raise PruneError("prune reviewed plan is malformed")
+    path = _prune_database_path(reviewed.request.database)
+    connection: sqlite3.Connection | None = None
+    deadline: float | None = None
     committed = False
     try:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("PRAGMA defer_foreign_keys = ON")
-            _validate_for_prune(connection)
-            _validate_global_session_ids(connection)
-            if project_id is not None:
-                _require_project(connection, project_id)
-            candidates = _candidate_sessions(connection, project_id)
-            logical_sizes = (
-                session_logical_sizes(connection, project_id=project_id)
-                if selector_name == "target_size" or estimate_size
-                else None
-            )
-            deleted_ids = _select_deleted_ids(
-                candidates,
-                selector_name,
-                selector_kind,
-                selector_value,
-                logical_sizes,
-                now_ms=now_ms,
-            )
-            deleted_bytes = (
-                sum(logical_sizes[session_id] for session_id in deleted_ids)
-                if estimate_size and logical_sizes is not None
-                else None
-            )
-            if deleted_ids:
-                _prepare_selection(connection, deleted_ids)
-                _refuse_retained_session_children(connection)
-                _refuse_cross_boundary_session_foreign_keys(connection)
-                for table in CHILD_SESSION_TABLES:
-                    selector = SESSION_SELECTOR_COLUMNS[table]
-                    connection.execute(
-                        f"DELETE FROM {_quote(table)} WHERE {_quote(selector)} "
-                        f"IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
-                    )
-                deleted_sessions = connection.execute(
-                    f"DELETE FROM session WHERE id IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
-                ).rowcount
-                if deleted_sessions != len(deleted_ids):
-                    raise PruneError("session deletion did not match selected sessions")
-                _validate_for_prune(connection)
-                logical_database_bytes = (
-                    database_logical_bytes(connection) if estimate_size else None
-                )
-                connection.commit()
-                committed = True
-            else:
-                logical_database_bytes = (
-                    database_logical_bytes(connection) if estimate_size else None
-                )
-                # A no-match request is an observable no-op unless explicit VACUUM follows.
-                connection.rollback()
-        except PruneError:
-            connection.rollback()
-            raise
-        except TransferOperationalError as error:
-            connection.rollback()
-            raise PruneOperationalError(str(error)) from error
-        except TransferError as error:
-            connection.rollback()
-            raise PruneError(str(error)) from error
-        except (sqlite3.Error, OSError, ValueError, OverflowError) as error:
-            connection.rollback()
-            raise PruneOperationalError("session prune failed") from error
-
-        outcome = PruneOutcome(
-            len(deleted_ids), deleted_bytes, logical_database_bytes, None
+        connection = _open_prune_connection(path)
+        connection.execute("BEGIN IMMEDIATE")
+        deadline = time.monotonic() + _PRUNE_TIMEOUT_SECONDS
+        _install_prune_deadline(connection, deadline)
+        connection.execute("PRAGMA defer_foreign_keys = ON")
+        current = _evaluate_prune(
+            connection,
+            reviewed.request,
+            reviewed.selector,
+            reviewed.evidence.now_ms,
+            deadline,
         )
-        if vacuum:
+        if not _same_reviewed_evidence(reviewed.evidence, current):
+            raise PruneError("prune preview is stale: rerun the command")
+        deleted_ids = current.selected_session_ids
+        if deleted_ids:
+            _prepare_selection(connection, deleted_ids, deadline)
+            _refuse_retained_session_children(connection)
+            _check_prune_deadline(deadline)
+            _refuse_cross_boundary_session_foreign_keys(connection)
+            _check_prune_deadline(deadline)
+            for table in CHILD_SESSION_TABLES:
+                _check_prune_deadline(deadline)
+                selector = SESSION_SELECTOR_COLUMNS[table]
+                connection.execute(
+                    f"DELETE FROM {_quote(table)} WHERE {_quote(selector)} "
+                    f"IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
+                )
+            _check_prune_deadline(deadline)
+            deleted_sessions = connection.execute(
+                f"DELETE FROM session WHERE id IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
+            ).rowcount
+            if deleted_sessions != len(deleted_ids):
+                raise PruneError("session deletion did not match selected sessions")
+            _check_prune_deadline(deadline)
+            _validate_for_prune(connection)
+            _check_prune_deadline(deadline)
+            logical_database_bytes = (
+                database_logical_bytes(connection, deadline=deadline)
+                if reviewed.request.estimate_size
+                else None
+            )
+            _check_prune_deadline(deadline)
+            connection.commit()
+            committed = True
+        else:
+            logical_database_bytes = current.preview.projected_logical_database_bytes_after_prune
+            connection.rollback()
+        outcome = PruneOutcome(
+            len(deleted_ids),
+            current.preview.projected_logical_bytes_deleted,
+            logical_database_bytes,
+            None,
+        )
+        connection.set_progress_handler(None, 0)
+        if reviewed.request.vacuum:
             try:
                 physical_database_bytes = _vacuum(connection)
             except PruneOperationalError as error:
@@ -429,28 +568,40 @@ def prune_sessions(
                         outcome,
                     ) from error
                 raise PruneOperationalError("database vacuum failed") from error
-            outcome = replace(
-                outcome,
-                physical_database_bytes=physical_database_bytes,
-            )
+            outcome = replace(outcome, physical_database_bytes=physical_database_bytes)
         return outcome
+    except PruneError:
+        raise
+    except TransferOperationalError as error:
+        raise PruneOperationalError(str(error)) from error
+    except TransferError as error:
+        raise PruneError(str(error)) from error
+    except (sqlite3.Error, OSError, ValueError, OverflowError) as error:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise PruneOperationalError("prune application timed out") from error
+        raise PruneOperationalError("session prune failed") from error
     finally:
-        connection.close()
+        _cleanup_prune_connection(connection, "application", sys.exception())
 
 
-def database_logical_bytes(connection: sqlite3.Connection) -> int:
+def database_logical_bytes(
+    connection: sqlite3.Connection, *, deadline: float | None = None
+) -> int:
     """Estimate all non-system table payload bytes in the current database view.
 
-    Parameters: ``connection`` is an open validated SQLite connection. Returns
-    the sum of byte lengths of every non-NULL table value, excluding SQLite page,
-    schema, index, freelist, and WAL overhead. Raises :class:`PruneError` for
-    malformed table metadata. It never renders row content or changes the DB.
+    Parameters: ``connection`` is an open validated SQLite connection and
+    ``deadline`` optionally bounds the table loop. Returns the sum of byte
+    lengths of every non-NULL table value, excluding SQLite page, schema, index,
+    freelist, and WAL overhead. Raises :class:`PruneError` for malformed table
+    metadata or :class:`PruneOperationalError` on an expired supplied deadline.
+    It never renders row content or changes the DB.
     """
     rows = connection.execute(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
     ).fetchall()
     total = 0
     for (table,) in rows:
+        _check_prune_deadline(deadline)
         if not isinstance(table, str):
             raise PruneError("database schema is invalid")
         total += _table_payload_bytes(connection, table)
@@ -469,6 +620,197 @@ def _one_selector(
     return name, value
 
 
+def _normalize_selector(request: PruneRequest) -> PruneSelector:
+    """Return the parsed selector retained in reviewed immutable evidence."""
+    name, raw_selector = _one_selector(
+        request.oldest, request.keep_newest, request.target_size
+    )
+    if name == "target_size":
+        return PruneSelector(name, "size", parse_target_size(raw_selector))
+    kind, value = parse_selector(raw_selector)
+    return PruneSelector(name, kind, value)
+
+
+def _captured_now_ms(now_ms: int | None) -> int:
+    """Resolve and validate the one wall-clock value reused across both phases."""
+    captured = int(time.time() * 1000) if now_ms is None else now_ms
+    if type(captured) is not int:
+        raise PruneError("prune clock is malformed")
+    return captured
+
+
+def _prune_database_path(database: str | Path) -> Path:
+    """Return the selected existing database using the pruning error vocabulary."""
+    try:
+        return _existing_regular_path(database, "database")
+    except TransferOperationalError as error:
+        raise PruneOperationalError(str(error)) from error
+    except TransferError as error:
+        raise PruneError(str(error)) from error
+    except OSError as error:
+        raise PruneOperationalError("database could not be inspected") from error
+
+
+def _evaluate_prune(
+    connection: sqlite3.Connection,
+    request: PruneRequest,
+    selector: PruneSelector,
+    now_ms: int,
+    deadline: float,
+) -> PruneEvidence:
+    """Collect exactly the selection and preview evidence under one connection view."""
+    _check_prune_deadline(deadline)
+    _validate_for_prune(connection)
+    _check_prune_deadline(deadline)
+    _validate_global_session_ids(connection)
+    if request.project_id is not None:
+        _require_project(connection, request.project_id)
+    _check_prune_deadline(deadline)
+    candidates, evidence_bytes = _candidate_sessions(
+        connection, request.project_id, deadline
+    )
+    logical_sizes = (
+        session_logical_sizes(
+            connection, project_id=request.project_id, deadline=deadline
+        )
+        if selector.name == "target_size" or request.estimate_size
+        else None
+    )
+    if logical_sizes is not None:
+        _validate_logical_size_evidence(
+            candidates, logical_sizes, evidence_bytes, deadline
+        )
+    deleted_ids = tuple(
+        _select_deleted_ids(
+            candidates,
+            selector.name,
+            selector.kind,
+            selector.value,
+            logical_sizes,
+            now_ms=now_ms,
+            deadline=deadline,
+        )
+    )
+    selected = set(deleted_ids)
+    oldest_survivor: int | None = None
+    for session_id, updated in candidates:
+        _check_prune_deadline(deadline)
+        if session_id not in selected and (
+            oldest_survivor is None or updated < oldest_survivor
+        ):
+            oldest_survivor = updated
+    deleted_bytes: int | None = None
+    database_after: int | None = None
+    if request.estimate_size:
+        assert logical_sizes is not None
+        deleted_bytes = sum(logical_sizes[session_id] for session_id in deleted_ids)
+        _check_prune_deadline(deadline)
+        database_total = database_logical_bytes(connection, deadline=deadline)
+        if database_total < deleted_bytes:
+            raise PruneError("database logical size estimate is invalid")
+        database_after = database_total - deleted_bytes
+    return PruneEvidence(
+        now_ms,
+        deleted_ids,
+        PrunePreview(
+            len(deleted_ids),
+            len(candidates) - len(deleted_ids),
+            oldest_survivor,
+            deleted_bytes,
+            database_after,
+        ),
+    )
+
+
+def _validate_logical_size_evidence(
+    candidates: list[tuple[str, int]],
+    logical_sizes: dict[str, int],
+    evidence_bytes: int,
+    deadline: float,
+) -> None:
+    """Require complete bounded size evidence for the already bounded candidate set."""
+    candidate_ids: set[str] = set()
+    for session_id, _updated in candidates:
+        _check_prune_deadline(deadline)
+        candidate_ids.add(session_id)
+        evidence_bytes += 8
+        if evidence_bytes > _MAX_PRUNE_EVIDENCE_BYTES:
+            raise PruneOperationalError("prune candidate evidence exceeds supported bounds")
+    if set(logical_sizes) != candidate_ids:
+        raise PruneError("database logical size estimate is invalid")
+
+
+def _same_reviewed_evidence(expected: PruneEvidence, current: PruneEvidence) -> bool:
+    """Compare only selection and preview fields that were authorized for mutation."""
+    return (
+        expected.selected_session_ids == current.selected_session_ids
+        and expected.preview.sessions_to_prune == current.preview.sessions_to_prune
+        and expected.preview.sessions_to_keep == current.preview.sessions_to_keep
+        and expected.preview.oldest_surviving_session_updated
+        == current.preview.oldest_surviving_session_updated
+        and expected.preview.projected_logical_bytes_deleted
+        == current.preview.projected_logical_bytes_deleted
+        and expected.preview.projected_logical_database_bytes_after_prune
+        == current.preview.projected_logical_database_bytes_after_prune
+    )
+
+
+def _outcome_from_evidence(evidence: PruneEvidence) -> PruneOutcome:
+    """Build the compatible zero-result outcome without opening a writer connection."""
+    return PruneOutcome(
+        0,
+        evidence.preview.projected_logical_bytes_deleted,
+        evidence.preview.projected_logical_database_bytes_after_prune,
+        None,
+    )
+
+
+def _install_prune_deadline(connection: sqlite3.Connection, deadline: float) -> None:
+    """Interrupt SQLite work after the fixed planning or transaction deadline."""
+    connection.set_progress_handler(
+        lambda: int(time.monotonic() >= deadline), _PRUNE_PROGRESS_OPCODES
+    )
+
+
+def _check_prune_deadline(deadline: float | None) -> None:
+    """Raise a bounded operational error when an explicit prune deadline expires."""
+    if deadline is not None and time.monotonic() >= deadline:
+        raise PruneOperationalError("prune operation timed out")
+
+
+def _cleanup_prune_connection(
+    connection: sqlite3.Connection | None, phase: str, original: BaseException | None
+) -> None:
+    """Clear deadlines, confirm rollback, and close without leaking SQLite details."""
+    if connection is None:
+        return
+    failure: sqlite3.Error | None = None
+    rollback_failed = False
+    try:
+        connection.set_progress_handler(None, 0)
+        if connection.in_transaction:
+            connection.rollback()
+    except sqlite3.Error as error:
+        failure = error
+        rollback_failed = True
+    try:
+        connection.close()
+    except sqlite3.Error as error:
+        if failure is None:
+            failure = error
+    if failure is None:
+        return
+    message = (
+        f"prune {phase} rollback could not be confirmed"
+        if rollback_failed
+        else f"prune {phase} cleanup could not be confirmed"
+    )
+    operational = PruneOperationalError(message)
+    if original is not None:
+        raise operational from original
+    raise operational from failure
+
+
 def _open_prune_connection(path: Path) -> sqlite3.Connection:
     connection: sqlite3.Connection | None = None
     try:
@@ -479,6 +821,21 @@ def _open_prune_connection(path: Path) -> sqlite3.Connection:
         if connection is not None:
             connection.close()
         raise PruneOperationalError("database could not be opened in SQLite rw mode") from error
+
+
+def _open_prune_read_connection(path: Path) -> sqlite3.Connection:
+    """Open the existing selected database in SQLite read-only mode for planning."""
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None
+        )
+        connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        return connection
+    except sqlite3.Error as error:
+        if connection is not None:
+            connection.close()
+        raise PruneOperationalError("database could not be opened in SQLite ro mode") from error
 
 
 def _validate_for_prune(connection: sqlite3.Connection) -> None:
@@ -509,20 +866,32 @@ def _require_project(connection: sqlite3.Connection, project_id: str) -> None:
         raise PruneError("project ID is ambiguous")
 
 
-def _candidate_sessions(connection: sqlite3.Connection, project_id: str | None) -> list[tuple[str, int]]:
+def _candidate_sessions(
+    connection: sqlite3.Connection, project_id: str | None, deadline: float | None = None
+) -> tuple[list[tuple[str, int]], int]:
     where = "WHERE project_id = ?" if project_id is not None else ""
     parameters: tuple[object, ...] = (project_id,) if project_id is not None else ()
     rows = connection.execute(
         f"SELECT id, time_updated FROM session {where} ORDER BY time_updated DESC, id ASC", parameters
-    ).fetchall()
+    )
     candidates: list[tuple[str, int]] = []
+    evidence_bytes = 0
     for session_id, updated in rows:
+        _check_prune_deadline(deadline)
         if not isinstance(session_id, str) or not session_id or type(updated) is not int:
             raise PruneError("database session data is malformed")
+        if len(candidates) >= _MAX_PRUNE_CANDIDATES:
+            raise PruneOperationalError("prune candidate evidence exceeds supported bounds")
+        identifier_bytes = len(session_id.encode("utf-8", "surrogatepass"))
+        if identifier_bytes > _MAX_PRUNE_SESSION_ID_BYTES:
+            raise PruneOperationalError("prune candidate evidence exceeds supported bounds")
+        evidence_bytes += identifier_bytes + 8
+        if evidence_bytes > _MAX_PRUNE_EVIDENCE_BYTES:
+            raise PruneOperationalError("prune candidate evidence exceeds supported bounds")
         candidates.append((session_id, updated))
     if len(candidates) != len({session_id for session_id, _updated in candidates}):
         raise PruneError("database session data is malformed")
-    return candidates
+    return candidates, evidence_bytes
 
 
 def _validate_global_session_ids(connection: sqlite3.Connection) -> None:
@@ -547,6 +916,7 @@ def _select_deleted_ids(
     logical_sizes: dict[str, int] | None,
     *,
     now_ms: int | None,
+    deadline: float | None = None,
 ) -> list[str]:
     if selector_name == "oldest":
         return _oldest_selection(candidates, selector_kind, selector_value)
@@ -557,9 +927,14 @@ def _select_deleted_ids(
             raise AssertionError("target-size selection requires logical estimates")
         retained = 0
         for index, (session_id, _updated) in enumerate(candidates):
+            _check_prune_deadline(deadline)
             estimate = logical_sizes[session_id]
             if retained + estimate > selector_value:
-                return [candidate_id for candidate_id, _time in candidates[index:]]
+                selected: list[str] = []
+                for candidate_id, _time in candidates[index:]:
+                    _check_prune_deadline(deadline)
+                    selected.append(candidate_id)
+                return selected
             retained += estimate
         return []
     raise AssertionError("unknown selector")
@@ -587,11 +962,15 @@ def _keep_newest_selection(
     return [session_id for session_id, updated in candidates if updated < cutoff]
 
 
-def _prepare_selection(connection: sqlite3.Connection, session_ids: list[str]) -> None:
+def _prepare_selection(
+    connection: sqlite3.Connection, session_ids: tuple[str, ...], deadline: float | None = None
+) -> None:
     connection.execute(f"CREATE TEMP TABLE {_quote(_SELECTION_TABLE)} (id TEXT PRIMARY KEY)")
-    connection.executemany(
-        f"INSERT INTO temp.{_quote(_SELECTION_TABLE)} VALUES (?)", ((session_id,) for session_id in session_ids)
-    )
+    for session_id in session_ids:
+        _check_prune_deadline(deadline)
+        connection.execute(
+            f"INSERT INTO temp.{_quote(_SELECTION_TABLE)} VALUES (?)", (session_id,)
+        )
 
 
 def _refuse_retained_session_children(connection: sqlite3.Connection) -> None:

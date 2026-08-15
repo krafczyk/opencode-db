@@ -18,8 +18,11 @@ from opencode_db import cli
 import opencode_db.prune as prune_module
 from opencode_db.model import EXIT_OPERATIONAL_FAILURE, EXIT_PRECONDITION_REFUSED
 from opencode_db.prune import (
+    PruneRequest,
     PruneError,
     PruneOperationalError,
+    apply_prune_plan,
+    plan_prune,
     prune_sessions,
     session_logical_sizes,
 )
@@ -199,6 +202,180 @@ class SessionPruneTests(unittest.TestCase):
             )
             self.assertEqual(outcome.deleted_sessions, 1)
             self.assertEqual(self._session_ids(database), ["a-4", "b-1"])
+
+    def test_reviewed_plan_is_read_only_and_applies_the_exact_previewed_selection(self) -> None:
+        """Plan from a read snapshot, hide IDs in its repr, and apply that exact evidence."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            before = database.read_bytes()
+            with _connection(database) as connection:
+                journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+
+            reviewed = plan_prune(
+                PruneRequest(str(database), project_id="a", oldest="1"), now_ms=4 * 86_400_000
+            )
+
+            self.assertEqual(reviewed.preview.sessions_to_prune, 1)
+            self.assertEqual(reviewed.preview.sessions_to_keep, 2)
+            self.assertEqual(reviewed.preview.oldest_surviving_session_updated, 2 * 86_400_000)
+            self.assertEqual(database.read_bytes(), before)
+            with _connection(database) as connection:
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone(), journal_mode)
+            self.assertNotIn("a-1", repr(reviewed))
+
+            outcome = apply_prune_plan(reviewed)
+
+            self.assertEqual(outcome.deleted_sessions, 1)
+            self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+
+    def test_stale_reviewed_plan_refuses_before_any_deletion(self) -> None:
+        """Refuse a changed selection under the writer lock and retain all rows."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            reviewed = plan_prune(PruneRequest(str(database), project_id="a", oldest="1"))
+            self._insert_session(database, "a-0", "a", 0, b"new-after-preview")
+
+            with self.assertRaisesRegex(PruneError, "preview is stale.*rerun"):
+                apply_prune_plan(reviewed)
+
+            self.assertEqual(self._session_ids(database), ["a-0", "a-1", "a-2", "a-3", "b-1"])
+
+    def test_direct_zero_selection_without_vacuum_does_not_open_writable_sqlite(self) -> None:
+        """Return a no-op from reviewed read evidence without entering the writer phase."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            with patch("opencode_db.prune._open_prune_connection") as open_writable:
+                outcome = prune_sessions(database, oldest="1", project_id="a")
+
+            self.assertEqual(outcome.deleted_sessions, 0)
+            open_writable.assert_not_called()
+
+    def test_read_only_plan_observes_committed_wal_rows_without_changing_main_or_wal(self) -> None:
+        """Read the committed WAL snapshot without checkpointing or opening SQLite rw."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            writer = sqlite3.connect(database)
+            try:
+                self.assertEqual(writer.execute("PRAGMA journal_mode = WAL").fetchone(), ("wal",))
+                writer.execute(
+                    "INSERT INTO session VALUES ('wal-only', 'a', '/work/wal', 9, ?)",
+                    (b"wal-only-payload",),
+                )
+                writer.commit()
+                wal = Path(f"{database}-wal")
+                main_before = database.read_bytes()
+                wal_before = wal.read_bytes()
+
+                reviewed = plan_prune(PruneRequest(str(database), oldest="1"))
+
+                self.assertEqual(reviewed.preview.sessions_to_prune, 1)
+                self.assertEqual(reviewed.preview.sessions_to_keep, 0)
+                self.assertEqual(database.read_bytes(), main_before)
+                self.assertEqual(wal.read_bytes(), wal_before)
+            finally:
+                writer.close()
+
+    def test_project_scope_ignores_unrelated_drift_without_estimates_but_binds_displayed_total(self) -> None:
+        """Avoid false scoped drift unless a requested database-wide projection changed."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            reviewed = plan_prune(PruneRequest(str(database), project_id="a", oldest="1"))
+            with _connection(database) as connection:
+                connection.execute("UPDATE session SET payload = ? WHERE id = 'b-1'", (b"changed",))
+
+            outcome = apply_prune_plan(reviewed)
+
+            self.assertEqual(outcome.deleted_sessions, 1)
+            self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+
+            reviewed = plan_prune(
+                PruneRequest(str(database), project_id="a", oldest="1", estimate_size=True)
+            )
+            with _connection(database) as connection:
+                connection.execute("UPDATE session SET payload = ? WHERE id = 'b-1'", (b"changed-again",))
+
+            with self.assertRaisesRegex(PruneError, "preview is stale.*rerun"):
+                apply_prune_plan(reviewed)
+
+    def test_target_size_binds_selection_without_false_drift_from_undisplayed_sizes(self) -> None:
+        """Keep target-size selection authoritative without displaying or comparing its size map."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            with _connection(database) as connection:
+                newest_size = session_logical_sizes(connection, session_id="a-3")["a-3"]
+            reviewed = plan_prune(
+                PruneRequest(str(database), project_id="a", target_size=f"{newest_size}B")
+            )
+            with _connection(database) as connection:
+                connection.execute("UPDATE session SET payload = ? WHERE id = 'a-3'", (b"x",))
+
+            outcome = apply_prune_plan(reviewed)
+
+            self.assertEqual(outcome.deleted_sessions, 2)
+            self.assertEqual(self._session_ids(database), ["a-3", "b-1"])
+
+    def test_planning_caps_and_deadline_refuse_without_persisted_values(self) -> None:
+        """Enforce candidate and identifier bounds plus deadline before any writable phase."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "one", "a", 1, b"one")
+            self._insert_session(database, "two", "a", 2, b"two")
+            request = PruneRequest(str(database), oldest="1")
+
+            with patch.object(prune_module, "_MAX_PRUNE_CANDIDATES", 1):
+                with self.assertRaisesRegex(PruneOperationalError, "candidate evidence") as error:
+                    plan_prune(request)
+            self.assertNotIn("one", str(error.exception))
+
+            with patch.object(prune_module, "_MAX_PRUNE_CANDIDATES", 2):
+                self.assertEqual(plan_prune(request).preview.sessions_to_prune, 1)
+
+            with patch.object(prune_module, "_MAX_PRUNE_SESSION_ID_BYTES", 2):
+                with self.assertRaisesRegex(PruneOperationalError, "candidate evidence") as error:
+                    plan_prune(request)
+            self.assertNotIn("one", str(error.exception))
+            with patch.object(prune_module, "_MAX_PRUNE_SESSION_ID_BYTES", 3):
+                self.assertEqual(plan_prune(request).preview.sessions_to_prune, 1)
+
+            with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 21):
+                with self.assertRaisesRegex(PruneOperationalError, "candidate evidence"):
+                    plan_prune(request)
+            with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 22):
+                self.assertEqual(plan_prune(request).preview.sessions_to_prune, 1)
+
+            with patch.object(prune_module.time, "monotonic", side_effect=(0.0, 11.0)):
+                with self.assertRaisesRegex(PruneOperationalError, "timed out"):
+                    plan_prune(request)
+
+    def test_writer_revalidation_reuses_caps_and_deadline_then_rolls_back(self) -> None:
+        """Bound application work after locking and retain rows after a revalidation refusal."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "one", "a", 1, b"one")
+            self._insert_session(database, "two", "a", 2, b"two")
+            reviewed = plan_prune(PruneRequest(str(database), oldest="1"))
+
+            with patch.object(prune_module, "_MAX_PRUNE_CANDIDATES", 1):
+                with self.assertRaisesRegex(PruneOperationalError, "candidate evidence"):
+                    apply_prune_plan(reviewed)
+            self.assertEqual(self._session_ids(database), ["one", "two"])
+
+            with patch.object(prune_module.time, "monotonic", side_effect=(0.0, 11.0)):
+                with self.assertRaisesRegex(PruneOperationalError, "timed out"):
+                    apply_prune_plan(reviewed)
+            self.assertEqual(self._session_ids(database), ["one", "two"])
 
     def test_keep_newest_count_uses_newest_first_id_tie_break(self) -> None:
         """Retain exactly the requested newest count and deterministically break ties."""
