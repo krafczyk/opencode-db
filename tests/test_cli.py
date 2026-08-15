@@ -337,6 +337,7 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("--estimate-size", text)
             self.assertIn("--timeout-seconds", text)
             self.assertIn("--vacuum", text)
+            self.assertIn("--vacuum-only", text)
             self.assertIn("--yes", text)
             self.assertIn("rerun", text)
             self.assertIn("mode=ro", text)

@@ -88,6 +88,19 @@ class SessionPruneTests(unittest.TestCase):
             ]
         )
         self.assertEqual(overridden.timeout_seconds, 200.0)
+        vacuum_only = cli.parse_command(
+            [
+                "prune",
+                "--db",
+                "/tmp/opencode.db",
+                "--vacuum-only",
+                "--timeout-seconds",
+                "600",
+            ]
+        )
+        self.assertTrue(vacuum_only.vacuum_only)
+        self.assertFalse(vacuum_only.vacuum)
+        self.assertEqual(vacuum_only.timeout_seconds, 600.0)
         for invalid_timeout in (True, 0, -1, float("inf"), float("nan"), 86_401, "bad"):
             with self.subTest(invalid_timeout=invalid_timeout), self.assertRaisesRegex(
                 PruneError, "timeout seconds"
@@ -112,6 +125,10 @@ class SessionPruneTests(unittest.TestCase):
             ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "0"],
             ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "nan"],
             ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "86401"],
+            ["prune", "--db", "/tmp/opencode.db", "--vacuum-only", "--oldest", "1"],
+            ["prune", "--db", "/tmp/opencode.db", "--vacuum-only", "--project-id", "a"],
+            ["prune", "--db", "/tmp/opencode.db", "--vacuum-only", "--estimate-size"],
+            ["prune", "--db", "/tmp/opencode.db", "--vacuum-only", "--vacuum"],
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(cli.CliUsageError):
@@ -372,6 +389,45 @@ class SessionPruneTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("Vacuum database? [y/N] ", stdout.getvalue())
         apply.assert_called_once()
+
+    def test_cli_vacuum_only_preserves_sessions_and_uses_its_own_timeout(self) -> None:
+        """Compact without a selector or deletion and start a fresh vacuum deadline."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            before = self._session_ids(database)
+
+            with patch.object(
+                prune_module.time, "monotonic", return_value=10.0
+            ), patch.object(
+                prune_module,
+                "_install_prune_deadline",
+                wraps=prune_module._install_prune_deadline,
+            ) as install_deadline:
+                code, stdout, stderr = self._run(
+                    [
+                        "prune",
+                        "--db",
+                        str(database),
+                        "--vacuum-only",
+                        "--timeout-seconds",
+                        "200",
+                        "--yes",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("opencode-db: vacuum preview", stdout)
+            self.assertIn("session_rows_changed: 0", stdout)
+            self.assertIn("opencode-db: vacuumed", stdout)
+            self.assertNotIn("opencode-db: pruned", stdout)
+            self.assertEqual(self._session_ids(database), before)
+            self.assertEqual(
+                [call.args[1] for call in install_deadline.call_args_list],
+                [210.0, 210.0, 210.0],
+            )
 
     def test_cli_preview_estimates_local_time_and_no_leaks(self) -> None:
         """Render exact aggregate estimates with a local offset and no private evidence."""
@@ -1116,7 +1172,7 @@ class SessionPruneTests(unittest.TestCase):
             self.assertEqual(outcome.physical_database_bytes, database.stat().st_size)
 
     def test_post_commit_vacuum_failure_reports_the_committed_prune(self) -> None:
-        """Expose committed deletion and warn against repeating a failed vacuum request."""
+        """Expose committed deletion and direct recovery to vacuum-only mode."""
         with self._temporary_directory() as root:
             database = root / "opencode.db"
             self._create_database(database)
@@ -1142,7 +1198,39 @@ class SessionPruneTests(unittest.TestCase):
             self.assertEqual(code, EXIT_OPERATIONAL_FAILURE)
             self.assertIn("pruned_sessions: 1", stdout)
             self.assertIn("do not repeat the prune request", stderr)
+            self.assertIn("rerun with --vacuum-only", stderr)
             self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+
+    def test_vacuum_only_timeout_is_bounded_and_preserves_sessions(self) -> None:
+        """Report a vacuum deadline without deleting or misclassifying application work."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            before = self._session_ids(database)
+            reviewed = plan_prune(
+                PruneRequest(
+                    str(database), vacuum_only=True, timeout_seconds=1.0
+                )
+            )
+
+            with patch.object(
+                prune_module, "_install_prune_deadline"
+            ), patch.object(
+                prune_module,
+                "_vacuum",
+                side_effect=PruneOperationalError("database vacuum failed"),
+            ), patch.object(
+                prune_module.time,
+                "monotonic",
+                side_effect=(0.0, 0.0, 0.0, 0.0, 2.0),
+            ):
+                with self.assertRaisesRegex(
+                    PruneOperationalError, "database vacuum timed out"
+                ):
+                    apply_prune_plan(reviewed)
+
+            self.assertEqual(self._session_ids(database), before)
 
     def test_post_commit_cleanup_failures_report_the_committed_prune(self) -> None:
         """Keep the committed count and retry warning when post-commit cleanup fails."""

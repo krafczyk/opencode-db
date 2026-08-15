@@ -283,13 +283,14 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
 
     Parameters: ``arguments`` begins with ``prune``. Returns one
     :class:`PruneRequest` with an explicit or bounded-default database target and
-    exactly one validated retention selector. Raises :class:`CliUsageError` for
-    malformed paths, duplicate/unknown options, invalid IDs, or selectors. This
-    function neither reads stdin nor changes a database.
+    exactly one validated retention selector or vacuum-only mode. Raises
+    :class:`CliUsageError` for malformed paths, duplicate/unknown options,
+    invalid IDs, or selectors. This function neither reads stdin nor changes a
+    database.
     """
     command = "prune"
-    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "timeout-seconds", "vacuum", "yes"}
-    boolean_options = {"estimate-size", "vacuum", "yes"}
+    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "timeout-seconds", "vacuum", "vacuum-only", "yes"}
+    boolean_options = {"estimate-size", "vacuum", "vacuum-only", "yes"}
     options: dict[str, str | bool] = {}
     position = 1
     while position < len(arguments):
@@ -310,16 +311,28 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
         options[name] = arguments[position + 1]
         position += 2
     selectors = [name for name in ("oldest", "keep-newest", "target-size") if name in options]
-    if len(selectors) != 1:
+    vacuum_only = bool(options.get("vacuum-only", False))
+    if vacuum_only and (
+        selectors
+        or "project-id" in options
+        or "estimate-size" in options
+        or "vacuum" in options
+    ):
+        raise CliUsageError(
+            command,
+            "--vacuum-only cannot be combined with prune selectors, --project-id, --estimate-size, or --vacuum.",
+        )
+    if not vacuum_only and len(selectors) != 1:
         raise CliUsageError(command, "Exactly one prune selector is required.")
-    selector = selectors[0]
-    try:
-        if selector == "target-size":
-            parse_target_size(_option(options, selector))
-        else:
-            parse_selector(_option(options, selector))
-    except PruneError as error:
-        raise CliUsageError(command, str(error)) from error
+    if selectors:
+        selector = selectors[0]
+        try:
+            if selector == "target-size":
+                parse_target_size(_option(options, selector))
+            else:
+                parse_selector(_option(options, selector))
+        except PruneError as error:
+            raise CliUsageError(command, str(error)) from error
     timeout_seconds = PRUNE_TIMEOUT_SECONDS
     if "timeout-seconds" in options:
         try:
@@ -337,6 +350,7 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
         vacuum=bool(options.get("vacuum", False)),
         yes=bool(options.get("yes", False)),
         timeout_seconds=timeout_seconds,
+        vacuum_only=vacuum_only,
     )
 
 
@@ -509,7 +523,9 @@ def _execute_prune(request: PruneRequest) -> int:
     try:
         reviewed = plan_prune(request)
         _render_prune_preview(reviewed, sys.stdout)
-        if reviewed.preview.sessions_to_prune == 0 and not request.vacuum:
+        if reviewed.preview.sessions_to_prune == 0 and not (
+            request.vacuum or request.vacuum_only
+        ):
             outcome = apply_prune_plan(reviewed)
             sys.stdout.write(_render_prune_outcome(request, outcome))
             return 0
@@ -545,33 +561,36 @@ def _execute_prune(request: PruneRequest) -> int:
 def _render_prune_preview(reviewed: ReviewedPrunePlan, stdout: object) -> None:
     """Write and flush one canonical aggregate prune preview.
 
-    Parameters: ``reviewed`` is an immutable read-only prune plan and ``stdout``
-    is the selected human-output stream. Returns ``None`` after writing the
-    complete preview in its fixed field order and flushing it before any writable
+    Parameters: ``reviewed`` is an immutable read-only prune or vacuum plan and
+    ``stdout`` is the selected human-output stream. Returns ``None`` after writing the
+    complete operation-specific preview and flushing it before any writable
     application. Raises :class:`PruneOperationalError` when output cannot be
     delivered and :class:`PruneError` for an unrenderable persisted timestamp;
     neither failure exposes session identifiers or content.
     """
     preview = reviewed.preview
     try:
-        timestamp = _render_prune_preview_timestamp(
-            preview.oldest_surviving_session_updated
-        )
-        lines = [
-            "opencode-db: prune preview",
-            f"sessions_to_prune: {preview.sessions_to_prune}",
-            f"sessions_to_keep: {preview.sessions_to_keep}",
-            f"oldest_surviving_session_updated: {timestamp}",
-        ]
-        if reviewed.request.estimate_size:
-            lines.extend(
-                (
-                    "projected_logical_bytes_deleted: "
-                    f"{preview.projected_logical_bytes_deleted}",
-                    "projected_logical_database_bytes_after_prune: "
-                    f"{preview.projected_logical_database_bytes_after_prune}",
-                )
+        if reviewed.request.vacuum_only:
+            lines = ["opencode-db: vacuum preview", "session_rows_changed: 0"]
+        else:
+            timestamp = _render_prune_preview_timestamp(
+                preview.oldest_surviving_session_updated
             )
+            lines = [
+                "opencode-db: prune preview",
+                f"sessions_to_prune: {preview.sessions_to_prune}",
+                f"sessions_to_keep: {preview.sessions_to_keep}",
+                f"oldest_surviving_session_updated: {timestamp}",
+            ]
+            if reviewed.request.estimate_size:
+                lines.extend(
+                    (
+                        "projected_logical_bytes_deleted: "
+                        f"{preview.projected_logical_bytes_deleted}",
+                        "projected_logical_database_bytes_after_prune: "
+                        f"{preview.projected_logical_database_bytes_after_prune}",
+                    )
+                )
         rendered = "\n".join(lines) + "\n"
         if stdout.write(rendered) != len(rendered):
             raise PruneOperationalError("could not write prune preview")
@@ -645,6 +664,11 @@ def _write_prune_confirmation_prompt(
 
 def _render_prune_outcome(request: PruneRequest, outcome: PruneOutcome) -> str:
     """Render safe aggregate prune results, including a committed partial result."""
+    if request.vacuum_only:
+        return (
+            "opencode-db: vacuumed\n"
+            f"physical_database_bytes_after_vacuum: {outcome.physical_database_bytes}\n"
+        )
     lines = [
         "opencode-db: pruned",
         f"pruned_sessions: {outcome.deleted_sessions}",
@@ -1221,7 +1245,7 @@ def _help_text(values: Sequence[str]) -> str:
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]",
         "list-sessions": "opencode-db list-sessions [--db ABSOLUTE_DB] [--estimate-session-size] [--project-id ID]",
-        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]",
+        "prune": "opencode-db prune [--db ABSOLUTE_DB] ([--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--vacuum] | --vacuum-only) [--timeout-seconds SECONDS] [--yes]",
         "export": "opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
         "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview [--database ABSOLUTE_PATH] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
@@ -1237,7 +1261,8 @@ def _help_text(values: Sequence[str]) -> str:
             "Preview fields: sessions_to_prune, sessions_to_keep, "
             "oldest_surviving_session_updated, and optional projected logical bytes.\n"
             "--yes bypasses only the prompt; zero matches skip confirmation unless "
-            "--vacuum remains, and stale previews refuse with instructions to rerun."
+            "--vacuum remains. --vacuum-only compacts without deleting sessions, and "
+            "stale previews refuse with instructions to rerun."
         )
     }
     if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}:

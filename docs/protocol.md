@@ -69,10 +69,10 @@ session-linked tables and triggers instead of silently omitting persisted state.
 The human-only active pruning grammar is:
 
 ```text
-opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]
+opencode-db prune [--db ABSOLUTE_DB] ([--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--vacuum] | --vacuum-only) [--timeout-seconds SECONDS] [--yes]
 ```
 
-Exactly one selector is required. `N` is a positive base-10 session count.
+Exactly one selector is required unless `--vacuum-only` is used. `N` is a positive base-10 session count.
 `TIME` is a positive integer followed by `d`, `m`, or `y`, representing 24-hour
 days, 30-day months, or 365-day years in OpenCode epoch milliseconds. Count
 selection ranks `time_updated` descending with ID ascending tie-breaks.
@@ -107,9 +107,10 @@ Read-only planning and writer-side revalidation each cap the scoped candidate
 set at 250,000 sessions, each persisted session ID at 16 KiB, and captured
 candidate evidence at 64 MiB. Each phase has its own 300-second execution
 deadline by default. `--timeout-seconds` accepts finite positive seconds through
-86,400 and gives planning and application separate full windows; preview review
-and confirmation time consumes neither window. Exceeding a count, byte, or time
-bound refuses with a phase-specific diagnostic before authorization or deletion.
+86,400 and gives planning, application, and requested vacuum separate full
+windows; preview review and confirmation time consumes none of those windows.
+Exceeding a count, byte, or time bound refuses with a phase-specific diagnostic
+before authorization or deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after preview. Only
 exact lowercase `y` authorizes a remaining mutation; other input, EOF,
@@ -140,8 +141,11 @@ only after a successful revalidated deletion transaction or revalidated
 zero-selection request, compacts the physical database and prints its resulting
 file bytes. Its selection remains based on logical estimates. If deletion commits
 but post-commit vacuum fails, the command reports the committed aggregate outcome,
-returns an operational failure, and warns that the destructive selector must not
-be repeated.
+returns an operational failure, warns that the destructive selector must not be
+repeated, and directs recovery through `prune --vacuum-only`. Vacuum-only mode
+accepts no selector, project scope, estimate, or `--vacuum`; it emits a dedicated
+preview, requires the normal authorization, revalidates without selecting or
+deleting sessions, and bounds compaction with its own timeout window.
 
 ## Session transfer
 

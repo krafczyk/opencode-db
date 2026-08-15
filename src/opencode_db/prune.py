@@ -94,8 +94,9 @@ class PruneRequest:
 
     ``database`` is an absolute selected path, only one selector is populated,
     and optional flags control reporting, physical compaction, or explicit
-    confirmation bypass. ``timeout_seconds`` independently bounds planning and
-    application. The value has no SQLite or filesystem side effects.
+    confirmation bypass. ``vacuum_only`` selects compaction without a retention
+    selector or deletion. ``timeout_seconds`` independently bounds planning,
+    application, and vacuum. The value has no SQLite or filesystem side effects.
     """
 
     database: str
@@ -108,16 +109,17 @@ class PruneRequest:
     yes: bool = False
     command: str = "prune"
     timeout_seconds: float = PRUNE_TIMEOUT_SECONDS
+    vacuum_only: bool = False
 
 
 @dataclass(frozen=True)
 class PruneSelector:
-    """Represent the normalized retention policy used for one reviewed prune.
+    """Represent the normalized selection policy used for one reviewed operation.
 
     ``name`` identifies the supplied selector, while ``kind`` and ``value`` are
-    its grammar-validated form.  The value is immutable planning input and has
-    no SQLite or filesystem side effects.  It is used by planning and writer-side
-    revalidation to preserve the existing selector semantics exactly.
+    its grammar-validated form. Vacuum-only mode uses a selector-free sentinel.
+    The value is immutable planning input with no SQLite or filesystem side
+    effects and preserves semantics across planning and writer-side revalidation.
     """
 
     name: str
@@ -162,7 +164,7 @@ class ReviewedPrunePlan:
     """Bind a normalized request and immutable snapshot evidence for review.
 
     ``request`` identifies the existing selected database, ``selector`` keeps
-    the normalized retention policy, and ``evidence`` records private selected
+    the normalized operation policy, and ``evidence`` records private selected
     IDs plus displayed aggregate evidence.  Callers must pass this value to
     :func:`apply_prune_plan` after authorization; constructing it makes no
     database mutation.
@@ -430,15 +432,19 @@ def prune_sessions(
     vacuum: bool = False,
     now_ms: int | None = None,
     timeout_seconds: float = PRUNE_TIMEOUT_SECONDS,
+    vacuum_only: bool = False,
 ) -> PruneOutcome:
     """Atomically prune selected sessions from one existing SQLite database.
 
     Parameters: ``database`` is an existing absolute regular file; ``project_id``
     optionally scopes candidates to one exact existing project; exactly one
-    selector is supplied; ``estimate_size`` enables human reporting; ``vacuum``
-    requests post-commit physical compaction; ``now_ms`` optionally fixes the
-    time selector clock; and ``timeout_seconds`` independently bounds planning
-    and application. Returns committed counts and requested logical estimates. Raises
+    selector is supplied unless ``vacuum_only`` is set; ``estimate_size``
+    enables human reporting; ``vacuum`` requests post-commit physical
+    compaction; ``vacuum_only`` requests physical
+    compaction without a selector or deletion; ``now_ms`` optionally fixes the
+    time selector clock; and ``timeout_seconds`` independently bounds planning,
+    application, and vacuum. Returns committed counts and requested logical
+    estimates. Raises
     :class:`PruneError` for selector, path, schema, project, or ownership
     refusals, :class:`PruneOperationalError` for bounded SQLite/filesystem
     failures, and :class:`PruneCommittedError` with the committed outcome when a
@@ -459,6 +465,7 @@ def prune_sessions(
             estimate_size=estimate_size,
             vacuum=vacuum,
             timeout_seconds=timeout_seconds,
+            vacuum_only=vacuum_only,
         ),
         now_ms=now_ms,
     )
@@ -469,7 +476,8 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
     """Capture one bounded read-only prune decision from a SQLite snapshot.
 
     Parameters: ``request`` identifies an existing selected database, optional
-    project scope, exactly one retention selector, and size/vacuum options;
+    project scope, one retention selector or vacuum-only mode, and size/vacuum
+    options;
     ``now_ms`` optionally supplies the single clock value used by time-based
     ``keep_newest`` selection and is ignored by selectors that do not use time.
     Returns immutable :class:`ReviewedPrunePlan` evidence that authorizes no
@@ -526,9 +534,10 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     instructs the caller to rerun before any deletion; raises
     :class:`PruneOperationalError` for bounded writer, SQLite, deadline, or
     cleanup failures; and raises :class:`PruneCommittedError` if post-commit
-    work fails. It opens SQLite ``mode=rw``, acquires a writer transaction
-    only after review, deletes known selected state on an exact revalidation,
-    and rolls back every uncommitted change.
+    work fails. It opens SQLite ``mode=rw`` and acquires a writer transaction
+    only after review. A normal request deletes known selected state after exact
+    revalidation; vacuum-only mode revalidates without selecting or deleting rows.
+    Every uncommitted change is rolled back.
     """
     if not isinstance(reviewed, ReviewedPrunePlan):
         raise PruneError("prune reviewed plan is malformed")
@@ -542,12 +551,15 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     clock_required = reviewed.selector.name == "keep_newest" and reviewed.selector.kind == "time"
     if clock_required != (type(reviewed.evidence.now_ms) is int):
         raise PruneError("prune reviewed plan is malformed")
-    if not reviewed.evidence.selected_session_ids and not reviewed.request.vacuum:
+    if not reviewed.evidence.selected_session_ids and not _vacuum_requested(
+        reviewed.request
+    ):
         return _outcome_from_evidence(reviewed.evidence)
     path = _prune_database_path(reviewed.request.database)
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
     committed = False
+    application_finished = False
     outcome: PruneOutcome | None = None
     try:
         connection = _open_prune_connection(path)
@@ -617,16 +629,27 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
             )
         assert outcome is not None
         connection.set_progress_handler(None, 0)
-        if reviewed.request.vacuum:
+        application_finished = True
+        if _vacuum_requested(reviewed.request):
+            vacuum_deadline = time.monotonic() + timeout_seconds
             try:
+                _install_prune_deadline(connection, vacuum_deadline)
                 physical_database_bytes = _vacuum(connection)
-            except PruneOperationalError as error:
+                _check_prune_deadline(vacuum_deadline)
+            except (PruneError, sqlite3.Error) as error:
+                timed_out = time.monotonic() >= vacuum_deadline
                 if committed:
+                    failure = "vacuum timed out" if timed_out else "vacuum failed"
                     raise PruneCommittedError(
-                        "sessions were pruned but vacuum failed; do not repeat the prune request",
+                        f"sessions were pruned but {failure}; do not repeat the prune request; rerun with --vacuum-only",
                         outcome,
                     ) from error
-                raise PruneOperationalError("database vacuum failed") from error
+                message = (
+                    "database vacuum timed out"
+                    if timed_out
+                    else "database vacuum failed"
+                )
+                raise PruneOperationalError(message) from error
             outcome = replace(outcome, physical_database_bytes=physical_database_bytes)
         return outcome
     except PruneCommittedError:
@@ -640,6 +663,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
             ) from error
         if (
             isinstance(error, PruneOperationalError)
+            and not application_finished
             and deadline is not None
             and time.monotonic() >= deadline
         ):
@@ -703,6 +727,18 @@ def _one_selector(
 
 def _normalize_selector(request: PruneRequest) -> PruneSelector:
     """Return the parsed selector retained in reviewed immutable evidence."""
+    if request.vacuum_only:
+        if (
+            request.vacuum
+            or request.project_id is not None
+            or request.estimate_size
+            or any(
+                value is not None
+                for value in (request.oldest, request.keep_newest, request.target_size)
+            )
+        ):
+            raise PruneError("vacuum-only request is malformed")
+        return PruneSelector("vacuum_only", "none", 0)
     name, raw_selector = _one_selector(
         request.oldest, request.keep_newest, request.target_size
     )
@@ -745,6 +781,8 @@ def _evaluate_prune(
     _check_prune_deadline(deadline)
     _validate_for_prune(connection)
     _check_prune_deadline(deadline)
+    if selector.name == "vacuum_only":
+        return PruneEvidence(None, (), PrunePreview(0, 0, None, None, None))
     _validate_global_session_ids(connection)
     if request.project_id is not None:
         _require_project(connection, request.project_id)
@@ -832,6 +870,11 @@ def _outcome_from_evidence(evidence: PruneEvidence) -> PruneOutcome:
         evidence.preview.projected_logical_database_bytes_after_prune,
         None,
     )
+
+
+def _vacuum_requested(request: PruneRequest) -> bool:
+    """Return whether a reviewed request includes physical compaction."""
+    return request.vacuum or request.vacuum_only
 
 
 def _install_prune_deadline(connection: sqlite3.Connection, deadline: float) -> None:

@@ -349,10 +349,10 @@ Read-only planning and writer-side revalidation each accept at most 250,000
 scoped candidate sessions, 16 KiB per persisted session ID, and 64 MiB of
 captured candidate evidence. Each phase has its own 300-second execution
 deadline by default. `--timeout-seconds` accepts finite positive seconds up to
-86,400 and gives planning and application separate full windows; time spent
-reviewing or confirming the preview consumes neither window. Slow or oversized
-evidence fails with a bounded phase-specific diagnostic before authorization or
-deletion.
+86,400 and gives planning, application, and requested vacuum separate full
+windows; time spent reviewing or confirming the preview consumes none of those
+windows. Slow or oversized evidence fails with a bounded phase-specific
+diagnostic before authorization or deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after that preview and
 only an exact lowercase `y` authorizes any remaining mutation; other input, EOF,
@@ -374,12 +374,15 @@ instead of guessing ownership. It also refuses non-unique session IDs and
 known-table foreign keys that cross the selected and retained ownership boundary.
 
 ```bash
-opencode-db prune [--db /absolute/path/opencode.db] [--project-id ID] \
-  (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
-  [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]
+opencode-db prune [--db /absolute/path/opencode.db] \
+  ([--project-id ID] \
+    (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
+    [--estimate-size] [--vacuum] | --vacuum-only) \
+  [--timeout-seconds SECONDS] [--yes]
 ```
 
-Exactly one selector is required. Positive `N` means sessions; the canonical
+Exactly one selector is required unless `--vacuum-only` is used. Positive `N`
+means sessions; the canonical
 count ordering is `time_updated` descending with ID ascending tie-breaks, and
 `--oldest N` deletes from that ranking's tail. `TIME` is a positive integer plus
 `d`, `m`, or `y`, where a day is 24 hours, a month is 30 days, and a year is 365 days.
@@ -399,7 +402,12 @@ revalidated zero-selection request), physically compacts the database, and
 reports resulting file bytes. Selector decisions always use logical estimates,
 never physical file size. If deletion commits but the later vacuum fails, the
 command reports the committed session count and exits with an operational failure
-that explicitly warns not to repeat the destructive prune request.
+that explicitly warns not to repeat the destructive prune request and directs the
+operator to retry compaction with `prune --vacuum-only`. Vacuum-only mode accepts
+no selector, project scope, estimate, or `--vacuum`; it validates and confirms the
+selected database, changes no session rows, and uses its own `--timeout-seconds`
+window. SQLite vacuum can still fail for reasons such as insufficient temporary
+storage even when its timeout is long enough.
 
 ## Results, deadlines, and storage
 
