@@ -52,6 +52,16 @@ from .move_cli import (
     execute_move,
     parse_move_command,
 )
+from .prune import (
+    PruneCommittedError,
+    PruneError,
+    PruneOperationalError,
+    PruneOutcome,
+    PruneRequest,
+    parse_selector,
+    parse_target_size,
+    prune_sessions,
+)
 from .transfer import (
     TransferError,
     TransferOperationalError,
@@ -119,12 +129,13 @@ class CliUsageError(ValueError):
 
 def parse_command(
     arguments: Sequence[str],
-) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest:
+) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest | PruneRequest:
     """Parse one cleanup, transfer, inspection, or sibling move command without state access.
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
     Returns a :class:`CommandRequest`, :class:`TransferRequest`,
-    :class:`InspectionRequest`, or :class:`MoveCommandRequest` with validated
+    :class:`InspectionRequest`, :class:`MoveCommandRequest`, or
+    :class:`PruneRequest` with validated
     fields; cleanup requests use a concrete environment-selected database string
     when their option is omitted.
     Raises :class:`CliUsageError` or
@@ -133,8 +144,10 @@ def parse_command(
     The function never reads stdin, creates a database, or mutates a file.
     """
     values = list(arguments)
-    if values and values[0] in {"list-projects", "show-project", "show-session"}:
+    if values and values[0] in {"list-projects", "show-project", "show-session", "list-sessions"}:
         return _parse_inspection_command(values)
+    if values and values[0] == "prune":
+        return _parse_prune_command(values)
     if values and values[0] in {"export", "import"}:
         return parse_transfer_command(values)
     if values and values[0] == "mv":
@@ -210,16 +223,19 @@ def _parse_inspection_command(arguments: list[str]) -> InspectionRequest:
     """
     command = arguments[0]
     allowed = {
-        "list-projects": {"db"},
-        "show-project": {"db", "project-id"},
-        "show-session": {"db", "session-id"},
+        "list-projects": {"db", "estimate-project-size"},
+        "show-project": {"db", "project-id", "estimate-project-size"},
+        "show-session": {"db", "session-id", "estimate-session-size"},
+        "list-sessions": {"db", "project-id", "estimate-session-size"},
     }[command]
     required = {
         "list-projects": set(),
         "show-project": {"project-id"},
         "show-session": {"session-id"},
+        "list-sessions": set(),
     }[command]
-    options: dict[str, str] = {}
+    boolean_options = {"estimate-project-size", "estimate-session-size"}
+    options: dict[str, str | bool] = {}
     position = 1
     while position < len(arguments):
         token = arguments[position]
@@ -230,6 +246,10 @@ def _parse_inspection_command(arguments: list[str]) -> InspectionRequest:
             raise CliUsageError(command, "Unsupported command option.")
         if name in options:
             raise CliUsageError(command, "Command options may not be repeated.")
+        if name in boolean_options:
+            options[name] = True
+            position += 1
+            continue
         if position + 1 >= len(arguments) or arguments[position + 1].startswith("--"):
             raise CliUsageError(command, "A command option is missing its value.")
         options[name] = arguments[position + 1]
@@ -237,11 +257,74 @@ def _parse_inspection_command(arguments: list[str]) -> InspectionRequest:
     if missing := required - set(options):
         raise CliUsageError(command, f"Missing required option --{sorted(missing)[0]}.")
     database = (
-        _absolute_path(options["db"], command, "db") if "db" in options else None
+        _absolute_path(_option(options, "db"), command, "db")
+        if "db" in options
+        else None
     )
     project_id = _optional_id(options, "project-id", command)
     session_id = _optional_id(options, "session-id", command)
-    return InspectionRequest(command, database, project_id, session_id)
+    return InspectionRequest(
+        command,
+        database,
+        project_id,
+        session_id,
+        bool(options.get("estimate-project-size", False)),
+        bool(options.get("estimate-session-size", False)),
+    )
+
+
+def _parse_prune_command(arguments: list[str]) -> PruneRequest:
+    """Parse one active session prune command without opening SQLite.
+
+    Parameters: ``arguments`` begins with ``prune``. Returns one
+    :class:`PruneRequest` with an explicit or bounded-default database target and
+    exactly one validated retention selector. Raises :class:`CliUsageError` for
+    malformed paths, duplicate/unknown options, invalid IDs, or selectors. This
+    function neither reads stdin nor changes a database.
+    """
+    command = "prune"
+    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "vacuum"}
+    boolean_options = {"estimate-size", "vacuum"}
+    options: dict[str, str | bool] = {}
+    position = 1
+    while position < len(arguments):
+        token = arguments[position]
+        if not token.startswith("--"):
+            raise CliUsageError(command, "Unexpected positional argument.")
+        name = token[2:]
+        if name not in allowed:
+            raise CliUsageError(command, "Unsupported command option.")
+        if name in options:
+            raise CliUsageError(command, "Command options may not be repeated.")
+        if name in boolean_options:
+            options[name] = True
+            position += 1
+            continue
+        if position + 1 >= len(arguments) or arguments[position + 1].startswith("--"):
+            raise CliUsageError(command, "A command option is missing its value.")
+        options[name] = arguments[position + 1]
+        position += 2
+    selectors = [name for name in ("oldest", "keep-newest", "target-size") if name in options]
+    if len(selectors) != 1:
+        raise CliUsageError(command, "Exactly one prune selector is required.")
+    selector = selectors[0]
+    try:
+        if selector == "target-size":
+            parse_target_size(_option(options, selector))
+        else:
+            parse_selector(_option(options, selector))
+    except PruneError as error:
+        raise CliUsageError(command, str(error)) from error
+    database = _absolute_path(_option(options, "db"), command, "db") if "db" in options else _default_database(command)
+    return PruneRequest(
+        database=database,
+        project_id=_optional_id(options, "project-id", command),
+        oldest=_option(options, "oldest") if "oldest" in options else None,
+        keep_newest=_option(options, "keep-newest") if "keep-newest" in options else None,
+        target_size=_option(options, "target-size") if "target-size" in options else None,
+        estimate_size=bool(options.get("estimate-size", False)),
+        vacuum=bool(options.get("vacuum", False)),
+    )
 
 
 def render_json(result: Result) -> str:
@@ -335,7 +418,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 0
     json_mode = "--json" in values and (
         not values
-        or values[0] not in {"list-projects", "show-project", "show-session", "mv"}
+        or values[0] not in {"list-projects", "show-project", "show-session", "list-sessions", "prune", "mv"}
     )
     try:
         request = parse_command(values)
@@ -357,6 +440,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _execute_transfer(request)
     if isinstance(request, InspectionRequest):
         return _execute_inspection(request)
+    if isinstance(request, PruneRequest):
+        return _execute_prune(request)
     if isinstance(request, MoveCommandRequest):
         return execute_move(request, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     result = _execute(request)
@@ -383,6 +468,8 @@ def _execute_inspection(request: InspectionRequest) -> int:
                 request.command,
                 project_id=request.project_id,
                 session_id=request.session_id,
+                estimate_project_size=request.estimate_project_size,
+                estimate_session_size=request.estimate_session_size,
             )
         )
         return 0
@@ -392,6 +479,58 @@ def _execute_inspection(request: InspectionRequest) -> int:
     except InspectionError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
         return EXIT_PRECONDITION_REFUSED
+
+
+def _execute_prune(request: PruneRequest) -> int:
+    """Execute one noninteractive active session prune and render safe aggregates.
+
+    Parameters: ``request`` has passed grammar validation. Returns zero after a
+    commit (and optional vacuum), safety-refusal exit code for unsupported schema
+    or exact-project failures, and operational-failure exit code for SQLite or
+    filesystem failures. Output contains only counts and byte estimates.
+    """
+    try:
+        outcome = prune_sessions(
+            request.database,
+            project_id=request.project_id,
+            oldest=request.oldest,
+            keep_newest=request.keep_newest,
+            target_size=request.target_size,
+            estimate_size=request.estimate_size,
+            vacuum=request.vacuum,
+        )
+        sys.stdout.write(_render_prune_outcome(request, outcome))
+        return 0
+    except PruneCommittedError as error:
+        sys.stdout.write(_render_prune_outcome(request, error.outcome))
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_OPERATIONAL_FAILURE
+    except PruneOperationalError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_OPERATIONAL_FAILURE
+    except PruneError as error:
+        sys.stderr.write(f"opencode-db: {error}\n")
+        return EXIT_PRECONDITION_REFUSED
+
+
+def _render_prune_outcome(request: PruneRequest, outcome: PruneOutcome) -> str:
+    """Render safe aggregate prune results, including a committed partial result."""
+    lines = [
+        "opencode-db: pruned",
+        f"pruned_sessions: {outcome.deleted_sessions}",
+    ]
+    if request.estimate_size:
+        lines.extend(
+            (
+                f"estimated_logical_bytes_deleted: {outcome.deleted_logical_bytes}",
+                "estimated_logical_database_bytes_after_prune: "
+                f"{outcome.logical_database_bytes}",
+            )
+        )
+    physical_bytes = outcome.physical_database_bytes
+    if physical_bytes is not None:
+        lines.append(f"physical_database_bytes_after_vacuum: {physical_bytes}")
+    return "\n".join(lines) + "\n"
 
 
 def _execute_transfer(request: TransferRequest) -> int:
@@ -936,12 +1075,14 @@ def _wants_help(values: Sequence[str]) -> bool:
 
 
 def _help_text(values: Sequence[str]) -> str:
-    command = values[0] if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session"} else " ".join(values[:2])
+    command = values[0] if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"} else " ".join(values[:2])
     synopses = {
         "mv": "opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--application-timeout-seconds SECONDS] [--yes] [--progress]",
-        "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB]",
-        "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID",
-        "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID",
+        "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB] [--estimate-project-size]",
+        "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]",
+        "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]",
+        "list-sessions": "opencode-db list-sessions [--db ABSOLUTE_DB] [--estimate-session-size] [--project-id ID]",
+        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--vacuum]",
         "export": "opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
         "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview [--database ABSOLUTE_PATH] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
@@ -952,13 +1093,13 @@ def _help_text(values: Sequence[str]) -> str:
         "cleanup rollback": "opencode-db cleanup rollback [--database ABSOLUTE_PATH] --operation ID [--deadline-seconds N] [--json]",
         "cleanup prune-backup": "opencode-db cleanup prune-backup [--database ABSOLUTE_PATH] --snapshot ID [--json]",
     }
-    if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session"}:
+    if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}:
         return synopses[values[0]] + "\n"
     if command in synopses:
         return synopses[command] + "\n"
     return (
         "\n".join(
-            ["usage: opencode-db (cleanup COMMAND | mv | export | import | list-projects | show-project | show-session) [OPTIONS]", *synopses.values()]
+            ["usage: opencode-db (cleanup COMMAND | mv | export | import | list-projects | show-project | show-session | list-sessions | prune) [OPTIONS]", *synopses.values()]
         )
         + "\n"
     )

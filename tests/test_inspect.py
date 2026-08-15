@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from opencode_db import cli
 from opencode_db.inspect import InspectionError, inspect_database
 from opencode_db.model import EXIT_PRECONDITION_REFUSED, EXIT_USAGE
+from opencode_db.prune import session_logical_sizes
 
 
 _TEST_ROOT = Path("/tmp/opencode-db-v1")
@@ -376,6 +378,86 @@ class InspectionTests(unittest.TestCase):
             with self.assertRaisesRegex(InspectionError, "schema"):
                 inspect_database(malformed, "list-projects")
 
+    def test_list_sessions_and_logical_estimates_are_metadata_only_and_read_only(self) -> None:
+        """List newest sessions and expose opt-in estimates without transcript content or writes."""
+        with _temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            with sqlite3.connect(database) as connection:
+                self._insert_project_session(connection, "a", "old")
+                connection.execute("INSERT INTO session VALUES ('new', 'a', '/work/project', 'New', 2)")
+                connection.execute("INSERT INTO project VALUES ('b', '/work/b', 'B', '[]', 1)")
+                connection.execute("INSERT INTO session VALUES ('other', 'b', '/work/b', 'Other', 3)")
+                connection.execute(
+                    "INSERT INTO message VALUES ('secret', 'new', 1, ?)",
+                    (json.dumps({"role": "user", "secret": "do-not-show"}),),
+                )
+            with sqlite3.connect(database) as connection:
+                sizes = session_logical_sizes(connection, project_id="a")
+            before = database.read_bytes()
+            code, stdout, stderr = self._run(
+                ["list-sessions", "--db", str(database), "--project-id", "a", "--estimate-session-size"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(
+                stdout,
+                "\n".join(
+                    (
+                        f"database: {database.resolve()}",
+                        "",
+                        "session:",
+                        "session_id: new",
+                        "project_id: a",
+                        "directory: /work/project",
+                        "title: New",
+                        "time_updated: 2",
+                        f"estimated_session_logical_bytes: {sizes['new']}",
+                        "",
+                        "session:",
+                        "session_id: old",
+                        "project_id: a",
+                        "directory: /work/project",
+                        "title: Session",
+                        "time_updated: 1",
+                        f"estimated_session_logical_bytes: {sizes['old']}",
+                        "",
+                    )
+                ),
+            )
+            self.assertNotIn("counts:", stdout)
+            self.assertNotIn("do-not-show", stdout)
+            self.assertEqual(database.read_bytes(), before)
+
+            code, stdout, stderr = self._run(
+                ["list-projects", "--db", str(database), "--estimate-project-size"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("estimated_project_logical_bytes:", stdout)
+
+            code, stdout, stderr = self._run(
+                ["show-project", "--db", str(database), "--project-id", "a", "--estimate-project-size"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("estimated_project_logical_bytes:", stdout)
+            self.assertNotIn("do-not-show", stdout)
+
+            code, stdout, stderr = self._run(
+                ["show-session", "--db", str(database), "--session-id", "new", "--estimate-session-size"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("estimated_session_logical_bytes:", stdout)
+            self.assertEqual(database.read_bytes(), before)
+
+            code, _stdout, stderr = self._run(
+                ["list-sessions", "--db", str(database), "--project-id", "missing"]
+            )
+            self.assertEqual(code, EXIT_PRECONDITION_REFUSED)
+            self.assertEqual(stderr, "opencode-db: project ID was not found\n")
+
     @staticmethod
     def _create_database(database: Path) -> None:
         """Create a compact supported schema without production-only side effects."""
@@ -392,6 +474,10 @@ class InspectionTests(unittest.TestCase):
                 CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
                 CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
                 CREATE TABLE session_context_epoch (session_id TEXT, baseline TEXT, snapshot TEXT, baseline_seq INTEGER);
+                CREATE TABLE todo (session_id TEXT, data TEXT);
+                CREATE TABLE session_share (session_id TEXT, data TEXT);
+                CREATE TABLE event_sequence (aggregate_id TEXT, data TEXT);
+                CREATE TABLE event (aggregate_id TEXT, data TEXT);
                 """
             )
         finally:
@@ -418,9 +504,11 @@ class InspectionTests(unittest.TestCase):
         """Run the CLI under an isolated environment and capture both output streams."""
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.dict(os.environ, environment or {}, clear=environment is not None):
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = cli.main(arguments)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            with patch.dict(os.environ, environment or {}, clear=environment is not None):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = cli.main(arguments)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
 

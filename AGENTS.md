@@ -44,10 +44,11 @@ database as fallback.
 
 In scope are explicit target selection, bounded diagnostics, private artifact
 handling, normal SQLite recovery on copies, validation, explicit installation,
-bounded recovery, and exact retained-backup pruning as those units are
-implemented. General SQLite salvage, OpenCode runtime changes, journal-policy
-changes, process inspection, cross-node leases, automatic cleanup, automatic
-rollback, retention expiry, and active-database `prune` behavior are excluded.
+bounded recovery, exact retained-backup pruning, and explicit active-database
+session pruning as those units are implemented. General SQLite salvage,
+OpenCode runtime changes, journal-policy changes, process inspection, cross-node
+leases, automatic cleanup, automatic rollback, and retention expiry are
+excluded.
 
 Do not inspect live MkChad state, user credentials, OpenCode session data, or
 private database fixtures unless the current task explicitly authorizes it.

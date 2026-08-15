@@ -10,9 +10,10 @@ OpenCode, starts OpenCode, inspects processes, or coordinates database users.
 The human-only read-only inspection grammar is:
 
 ```text
-opencode-db list-projects [--db ABSOLUTE_DB]
-opencode-db show-project [--db ABSOLUTE_DB] --project-id ID
-opencode-db show-session [--db ABSOLUTE_DB] --session-id ID
+opencode-db list-projects [--db ABSOLUTE_DB] [--estimate-project-size]
+opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]
+opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]
+opencode-db list-sessions [--db ABSOLUTE_DB] [--estimate-session-size] [--project-id ID]
 ```
 
 No inspection command accepts `--json`. An omitted `--db` selects
@@ -51,6 +52,60 @@ not a synthesized chronology. Unsupported required columns or malformed JSON
 are bounded safety refusals rather than guessed or silently omitted output.
 Transcript output is intentionally private; operators must protect stdout and
 must not redirect it to shared logs.
+
+`list-sessions` prints no transcript sections. It lists all matching sessions in
+`time_updated` descending, ID ascending order with safe metadata and optional
+per-session logical-size estimates, never row counts or transcript bodies. Its
+project filter requires one exact existing project. The optional session estimate
+flags and project estimate flags use logical payload bytes: the sum of each
+non-NULL value's UTF-8/blob representation in a session row and all current
+known owned child rows. SQLite record headers, pages, indexes, freelist, WAL,
+and schema bytes are excluded. Project estimates sum sessions. Estimate commands
+require the complete transfer-known session schema and reject unknown
+session-linked tables and triggers instead of silently omitting persisted state.
+
+## Active session pruning
+
+The human-only active pruning grammar is:
+
+```text
+opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--vacuum]
+```
+
+Exactly one selector is required. `N` is a positive base-10 session count.
+`TIME` is a positive integer followed by `d`, `m`, or `y`, representing 24-hour
+days, 30-day months, or 365-day years in OpenCode epoch milliseconds. Count
+selection ranks `time_updated` descending with ID ascending tie-breaks.
+`--oldest N` deletes from the tail of that canonical ranking; `--oldest TIME` deletes the
+inclusive window from the oldest timestamp through that timestamp plus its
+duration. `--keep-newest N` deletes every candidate after the newest N; its TIME
+form deletes candidates older than now minus the duration. `SIZE` is strictly
+`N[B|KiB|MiB|GiB|TiB]`, positive and bounded to signed-64-bit bytes. It retains
+the newest contiguous prefix whose complete known session logical estimates fit;
+when the newest session alone is over target it and all older candidates are
+deleted.
+
+The optional exact project scope is verified before selection. The command opens
+only its existing selected database using SQLite `mode=rw`, sets a bounded busy
+timeout and foreign keys, validates integrity and foreign keys, then performs
+known-child and session deletion in one immediate transaction. It validates again
+before commit and rolls back uncommitted work on failure. Incomplete known
+schemas, unknown session-linked tables, triggers on known session tables, and
+retained session-parent dependencies are refusals. Non-unique session IDs and
+known-table foreign keys crossing selected and retained session ownership are
+also refusals. Output contains only counts and optional estimates, never session
+rows or transcript bodies.
+
+`--estimate-size` prints deleted logical bytes and total logical database bytes
+after prune. Ordinary deletion frees reusable SQLite space but normally does not
+reduce physical file size. `--vacuum` is allowed with every selector and, only
+after a successful deletion transaction or explicit no-match request, compacts
+the physical database and prints its resulting file bytes. Its selection remains
+based on logical estimates. A no-match request otherwise rolls back its read/
+validation transaction unchanged. If deletion commits but post-commit vacuum
+fails, the command reports the committed aggregate outcome, returns an
+operational failure, and warns that the destructive selector must not be
+repeated.
 
 ## Session transfer
 
@@ -158,7 +213,7 @@ absolute. An absolute XDG base wins regardless of selected-file existence; the
 tool does not search HOME based on the file. Neither usable base is a bounded
 refusal. Default selection only constructs a string and never stats, opens, or
 canonicalizes it. Explicit paths remain non-memory and absolute. Preview,
-install, export, import, and inspection require a present regular file through
+install, export, import, prune, and inspection require a present regular file through
 their existing validators. Status, abort, resume, rollback, and `prune-backup`
 can resolve a recorded target while an incomplete installation has moved the
 active main file. Relative paths, `:memory:`, missing preview targets, paths
@@ -308,6 +363,7 @@ manifest-bound files in that exact group and then its catalog record. An
 interrupted prune has no journal or tombstone: retry the same exact ID to remove
 the remaining eligible files. It never opens or mutates the active database.
 
-`cleanup prune` is intentionally absent and reserved for future
-active-database retention. This protocol contains no active-database pruning,
-automatic cleanup, automatic rollback, or general SQLite salvage.
+`cleanup prune-backup` remains limited to retained recovery evidence and never
+opens the active database. Top-level `prune` is the separate active-database
+retention command specified above; neither command performs automatic cleanup,
+automatic rollback, or general SQLite salvage.

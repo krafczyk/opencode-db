@@ -17,6 +17,13 @@ import sqlite3
 import stat
 
 from .target import TargetError, select_default_database
+from .prune import (
+    PruneError,
+    project_logical_bytes,
+    project_logical_sizes,
+    session_logical_sizes,
+    validate_session_schema,
+)
 
 
 class InspectionError(RuntimeError):
@@ -44,17 +51,24 @@ class InspectionOperationalError(InspectionError):
 class InspectionRequest:
     """Represent one grammar-validated read-only inspection selection.
 
-    ``command`` is one of the three public inspection commands. ``database`` is
+    ``command`` is one of the public inspection commands. ``database`` is
     an optional syntactically absolute explicit path; its default resolution and
     existing-file validation occur only when executing the request. Exactly one
-    matching identifier field is present for detail commands. The value has no
-    filesystem or SQLite side effects.
+    matching identifier field is present for detail commands.
+    ``estimate_project_size`` enables project logical-size estimates only for
+    ``list-projects`` and ``show-project``; ``estimate_session_size`` enables
+    per-session logical-size estimates only for ``show-session`` and
+    ``list-sessions``. Both flags default to ``False``. Any enabled estimate
+    requires the complete known session schema. The value has no filesystem or
+    SQLite side effects.
     """
 
     command: str
     database: str | None = None
     project_id: str | None = None
     session_id: str | None = None
+    estimate_project_size: bool = False
+    estimate_session_size: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,29 @@ class _SessionRows:
     v2: list[dict[str, object]]
     legacy: list[dict[str, object]]
     inputs: list[dict[str, object]]
+
+
+_SESSION_METADATA_FIELDS = (
+    "project_id",
+    "workspace_id",
+    "parent_id",
+    "slug",
+    "directory",
+    "path",
+    "title",
+    "version",
+    "agent",
+    "cost",
+    "tokens_input",
+    "tokens_output",
+    "tokens_reasoning",
+    "tokens_cache_read",
+    "tokens_cache_write",
+    "time_created",
+    "time_updated",
+    "time_compacting",
+    "time_archived",
+)
 
 
 def resolve_database_path(explicit: str | None) -> Path:
@@ -99,13 +136,20 @@ def resolve_database_path(explicit: str | None) -> Path:
 
 
 def inspect_database(
-    database: str | Path | None, command: str, *, project_id: str | None = None, session_id: str | None = None
+    database: str | Path | None,
+    command: str,
+    *,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    estimate_project_size: bool = False,
+    estimate_session_size: bool = False,
 ) -> str:
     """Render one selected inspection view from an existing read-only database.
 
     Parameters: ``database`` is an existing absolute regular file, ``command``
-    is ``list-projects``, ``show-project``, or ``show-session``, and the detail
-    commands require their exact identifier. Returns stable human-readable
+    is ``list-projects``, ``show-project``, ``show-session``, or
+    ``list-sessions``; detail commands require their exact identifier. Optional
+    estimate flags require the complete currently known session schema. Returns stable human-readable
     sections ending in a newline. Raises :class:`InspectionError` for malformed
     schemas/data or ambiguous/missing exact rows and
     :class:`InspectionOperationalError` for SQLite read failures. The function
@@ -120,31 +164,88 @@ def inspect_database(
         _require_table(tables, "project")
         _require_columns(connection, "project", {"id"})
         _validate_database(connection)
+        project_sizes: dict[str, int] = {}
+        session_sizes: dict[str, int] = {}
+        if estimate_project_size or estimate_session_size:
+            validate_session_schema(connection)
+        if estimate_project_size:
+            if command == "show-project" and project_id is not None:
+                project_sizes[project_id] = project_logical_bytes(
+                    connection, project_id
+                )
+            else:
+                project_sizes = project_logical_sizes(connection)
+        if estimate_session_size:
+            session_sizes = session_logical_sizes(
+                connection,
+                project_id=project_id if command == "list-sessions" else None,
+                session_id=session_id if command == "show-session" else None,
+            )
         if command == "list-projects":
             lines = [f"database: {path}"]
             project_rows = _project_rows(connection)
             for row in project_rows:
                 lines.extend(("", "project:"))
-                lines.extend(_render_project(connection, row, include_sessions=False))
+                lines.extend(
+                    _render_project(
+                        connection,
+                        row,
+                        include_sessions=False,
+                        estimated_project_bytes=project_sizes.get(_string(row, "id")),
+                    )
+                )
             return "\n".join(lines) + "\n"
         if command == "show-project" and project_id is not None:
             project = _one_project(connection, project_id)
             lines = [f"database: {path}", "", "project:"]
-            lines.extend(_render_project(connection, project, include_sessions=True))
+            lines.extend(
+                _render_project(
+                    connection,
+                    project,
+                    include_sessions=True,
+                    estimated_project_bytes=project_sizes.get(project_id),
+                )
+            )
             return "\n".join(lines) + "\n"
         if command == "show-session" and session_id is not None:
             session = _one_session(connection, session_id)
             project = _one_project(connection, _string(session, "project_id"))
-            rows = _session_rows(connection, _string(session, "id"))
+            transcript_rows = _session_rows(connection, _string(session, "id"))
             lines = [f"database: {path}", "", "session:"]
             lines.extend(_render_session_metadata(session))
             lines.extend(("", "project:"))
             lines.extend(_render_project(connection, project, include_sessions=False))
             lines.extend(("", "counts:"))
-            lines.extend(_render_row_counts(rows))
-            lines.extend(_render_transcripts(connection, _string(session, "id"), rows))
+            lines.extend(_render_row_counts(transcript_rows))
+            if estimate_session_size:
+                lines.append(
+                    f"estimated_session_logical_bytes: {session_sizes[_string(session, 'id')]}"
+                )
+            lines.extend(
+                _render_transcripts(
+                    connection, _string(session, "id"), transcript_rows
+                )
+            )
+            return "\n".join(lines) + "\n"
+        if command == "list-sessions":
+            _require_table(tables, "session")
+            _require_columns(connection, "session", {"id", "project_id", "time_updated"})
+            if project_id is not None:
+                _one_project(connection, project_id)
+            sessions = _session_summary_rows(connection, project_id)
+            lines = [f"database: {path}"]
+            for session in sessions:
+                session_id_value = _string(session, "id")
+                lines.extend(("", "session:"))
+                lines.extend(_render_session_metadata(session))
+                if estimate_session_size:
+                    lines.append(
+                        f"estimated_session_logical_bytes: {session_sizes[session_id_value]}"
+                    )
             return "\n".join(lines) + "\n"
         raise InspectionError("inspection command is invalid")
+    except PruneError as error:
+        raise InspectionError(str(error)) from error
     except (sqlite3.Error, OSError, ValueError, TypeError) as error:
         raise InspectionOperationalError("database inspection failed") from error
     finally:
@@ -240,10 +341,18 @@ def _rows(
 
 
 def _render_project(
-    connection: sqlite3.Connection, project: dict[str, object], *, include_sessions: bool
+    connection: sqlite3.Connection,
+    project: dict[str, object],
+    *,
+    include_sessions: bool,
+    estimated_project_bytes: int | None = None,
 ) -> list[str]:
     project_id = _string(project, "id")
     lines = [f"project_id: {_display(project_id)}"]
+    if estimated_project_bytes is not None:
+        lines.append(
+            f"estimated_project_logical_bytes: {estimated_project_bytes}"
+        )
     for name in ("worktree", "vcs", "name", "time_created", "time_updated", "time_initialized"):
         if name in project:
             value = _absolute(project, name) if name == "worktree" else _safe_scalar(project[name])
@@ -345,13 +454,36 @@ def _render_project_sessions(connection: sqlite3.Connection, project_id: str) ->
     return lines
 
 
+def _session_summary_rows(
+    connection: sqlite3.Connection, project_id: str | None
+) -> list[dict[str, object]]:
+    """Return deterministic newest-first session metadata for a list-only view."""
+    available = set(
+        _require_columns(connection, "session", {"id", "project_id", "time_updated"})
+    )
+    columns = ("id",) + tuple(
+        name for name in _SESSION_METADATA_FIELDS if name in available
+    )
+    where = "WHERE project_id = ?" if project_id is not None else ""
+    parameters: tuple[object, ...] = (project_id,) if project_id is not None else ()
+    selected = ", ".join(_quote(column) for column in columns)
+    records = connection.execute(
+        f"SELECT {selected} FROM session {where} ORDER BY time_updated DESC, id ASC", parameters
+    ).fetchall()
+    if any(len(record) != len(columns) for record in records):
+        raise InspectionError("inspection data is malformed")
+    rows = [dict(zip(columns, record, strict=True)) for record in records]
+    for row in rows:
+        _string(row, "id")
+        _string(row, "project_id")
+        if type(row["time_updated"]) is not int:
+            raise InspectionError("inspection data is malformed")
+    return rows
+
+
 def _render_session_metadata(session: dict[str, object]) -> list[str]:
     lines = [f"session_id: {_display(_string(session, 'id'))}"]
-    for name in (
-        "project_id", "workspace_id", "parent_id", "slug", "directory", "path", "title", "version", "agent",
-        "cost", "tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write",
-        "time_created", "time_updated", "time_compacting", "time_archived",
-    ):
+    for name in _SESSION_METADATA_FIELDS:
         if name in session:
             value = _absolute(session, name) if name == "directory" else _safe_scalar(session[name])
             lines.append(f"{name}: {_display(value)}")

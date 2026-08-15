@@ -38,6 +38,7 @@ inspecting processes:
 opencode-db list-projects
 opencode-db show-project --project-id ID
 opencode-db show-session --session-id ID
+opencode-db list-sessions --project-id ID
 ```
 
 Add `--db /absolute/path/opencode.db` to any inspection command to override the
@@ -52,6 +53,19 @@ registered project directories, workspace directory summaries, and session
 directory/count summaries. `show-project` adds deterministic session summaries
 and separate visible V2, legacy, and pending-input counts, but never prints any
 transcript text.
+
+`list-sessions` lists all sessions, optionally scoped to one exact existing
+project, in `time_updated` newest-first and ID tie-break order. It renders only
+safe metadata and optional logical-size estimates, never row counts or
+transcript bodies. Use
+`--estimate-session-size` with it or `show-session`; use
+`--estimate-project-size` with `list-projects` or `show-project`. An estimate
+is a logical payload-byte count: the UTF-8/blob representation of every non-NULL
+value in the session row and every current known session-owned child row. It
+excludes SQLite record headers, pages, indexes, freelist, WAL, and schema bytes.
+Project estimates sum their sessions. Estimate commands require the complete
+known session schema and refuse unknown session-linked tables or triggers rather
+than omitting state.
 
 `show-session` prints safe session and project metadata, those separate counts,
 then separate V2 and legacy transcript sections when present. It renders only
@@ -309,15 +323,50 @@ opencode-db cleanup prune-backup \
   --snapshot snapshot-YYYYMMDDTHHMMSSZ-HEX --json
 ```
 
-`cleanup prune` is deliberately not implemented. The shorter name is reserved
-for a future active-database retention command and does not currently reclaim
-space in an OpenCode database.
+## Active session pruning
+
+`prune` is a noninteractive active-database retention command. Arrange OpenCode
+shutdown and writer concurrency before running it. It opens only the selected
+existing database through SQLite `mode=rw`, enables foreign keys, uses a bounded
+writer wait, validates integrity and foreign keys before and after its immediate
+transaction, and deletes only complete selected session state. It refuses an
+incomplete schema, unknown session-linked table or trigger, malformed data, or
+an exact missing project instead of guessing ownership. It also refuses
+non-unique session IDs and known-table foreign keys that cross the selected and
+retained ownership boundary.
+
+```bash
+opencode-db prune [--db /absolute/path/opencode.db] [--project-id ID] \
+  (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
+  [--estimate-size] [--vacuum]
+```
+
+Exactly one selector is required. Positive `N` means sessions; the canonical
+count ordering is `time_updated` descending with ID ascending tie-breaks, and
+`--oldest N` deletes from that ranking's tail. `TIME` is a positive integer plus
+`d`, `m`, or `y`, where a day is 24 hours, a month is 30 days, and a year is 365 days.
+`--oldest TIME` deletes the inclusive window from the oldest matching timestamp
+through that timestamp plus the duration. `--keep-newest TIME` deletes sessions
+older than now minus the duration. `SIZE` uses the explicit grammar
+`N[B|KiB|MiB|GiB|TiB]`; it retains a newest prefix whose complete session logical
+estimates fit the target. If the newest session itself exceeds the target, it and
+all older candidates are pruned.
+
+`--estimate-size` reports logical bytes deleted and estimated logical database
+bytes after pruning without rendering any row data. Ordinary deletion makes
+SQLite pages reusable but usually does not shrink the database file.
+`--vacuum` runs only after a successful delete transaction (or an explicit
+no-match request), physically compacts the database, and reports resulting file
+bytes. Selector decisions always use logical estimates, never physical file size.
+If deletion commits but the later vacuum fails, the command reports the committed
+session count and exits with an operational failure that explicitly warns not to
+repeat the destructive prune request.
 
 ## Results, deadlines, and storage
 
 Cleanup commands accept `--json` for exactly one newline-terminated
-schema-version-1 JSON object on stdout. Top-level `export`, `import`, and the
-inspection commands do not accept `--json`; `mv` also has human-only output and
+schema-version-1 JSON object on stdout. Top-level `export`, `import`, `prune`, and
+the inspection commands do not accept `--json`; `mv` also has human-only output and
 does not accept `--json`. Their separate human-only success output is written to
 stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
 syntax/input shape, `3` uncertain decision required, `4` safety-precondition

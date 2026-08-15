@@ -6,7 +6,7 @@ import io
 import json
 import os
 import shlex
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import shutil
 import sqlite3
@@ -236,14 +236,33 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(exit_code, expected_exit)
                 self.assertEqual(stderr.getvalue(), f"opencode-db: {failure}\n")
 
-    def test_prune_is_not_an_exposed_command(self) -> None:
-        """Reserve the future short prune name outside the version-1 grammar."""
-        result = self._run_json(
+    def test_prune_is_an_exposed_human_only_command(self) -> None:
+        """Accept active session retention without repurposing the cleanup grammar."""
+        request = cli.parse_command(
+            ["prune", "--db", "/tmp/opencode.db", "--keep-newest", "2d"]
+        )
+        self.assertEqual(request.command, "prune")
+        self.assertEqual(request.keep_newest, "2d")
+        exit_code, payload = self._run_json(
             ["cleanup", "prune", "--database", "/tmp/opencode.db", "--json"]
         )
+        self.assertEqual(exit_code, EXIT_USAGE)
+        self.assertEqual(payload["status"], Status.SYNTAX_ERROR.value)
 
-        self.assertEqual(result[0], EXIT_USAGE)
-        self.assertEqual(result[1]["status"], Status.SYNTAX_ERROR.value)
+    def test_prune_rejects_oversized_numeric_components_as_bounded_usage_errors(self) -> None:
+        """Reject huge retention values before Python's integer conversion limit can escape."""
+        for selector, value in (
+            ("--oldest", "9" * 5000),
+            ("--keep-newest", ("9" * 5000) + "d"),
+            ("--target-size", ("9" * 5000) + "MiB"),
+        ):
+            with self.subTest(selector=selector):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    exit_code = cli.main(["prune", "--db", "/tmp/opencode.db", selector, value])
+
+                self.assertEqual(exit_code, EXIT_USAGE)
+                self.assertLessEqual(len(stderr.getvalue()), 512)
 
     def test_documentation_and_package_metadata_match_public_contract(self) -> None:
         """Keep install metadata and operator docs aligned with actual command names."""
@@ -267,7 +286,7 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("opencode-db list-projects", text)
             self.assertIn("opencode-db show-project", text)
             self.assertIn("opencode-db show-session", text)
-            self.assertIn("`cleanup prune`", text)
+            self.assertIn("opencode-db prune", text)
             self.assertIn("absolute", text)
             self.assertIn("OpenCode", text)
             self.assertIn("--application-timeout-seconds", text)
@@ -284,6 +303,7 @@ class CliContractTests(unittest.TestCase):
             "list-projects",
             "show-project",
             "show-session",
+            "list-sessions",
             "export",
             "import",
             "cleanup preview",
@@ -440,14 +460,14 @@ class CliContractTests(unittest.TestCase):
                     with redirect_stdout(stdout):
                         arguments = (
                             [action, "--help"]
-                            if action in {"mv", "export", "import", "list-projects", "show-project", "show-session"}
+                            if action in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
                             else ["cleanup", action, "--help"]
                         )
                         self.assertEqual(cli.main(arguments), 0)
                     self.assertIn(action, stdout.getvalue())
                     option = (
                         "[--db ABSOLUTE_DB]"
-                        if action in {"mv", "export", "import", "list-projects", "show-project", "show-session"}
+                        if action in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
                         else "[--database ABSOLUTE_PATH]"
                     )
                     self.assertIn(option, stdout.getvalue())

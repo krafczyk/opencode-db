@@ -56,6 +56,9 @@ CHILD_SESSION_TABLES = (
 
 _SELECTION_TABLE = "_opencode_db_selected_sessions"
 _COPY_BATCH_SIZE = 256
+_ASCII_LOWERCASE = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
 
 
 class TransferError(RuntimeError):
@@ -443,6 +446,20 @@ def _table_names(connection: sqlite3.Connection) -> dict[str, str | None]:
     return {name: sql for name, sql in rows}
 
 
+def _canonical_session_table_name(name: object) -> str | None:
+    """Return a known session table's canonical name from SQLite metadata.
+
+    SQLite compares identifiers case-insensitively for ASCII letters, while its
+    schema and pragma metadata preserve the spelling used in DDL.  ``None``
+    identifies a valid but non-session table name.  Raises :class:`TransferError`
+    for malformed metadata rather than treating it as unrelated state.
+    """
+    if not isinstance(name, str) or not name or "\x00" in name:
+        raise TransferError("database schema is invalid")
+    canonical = name.translate(_ASCII_LOWERCASE)
+    return canonical if canonical in SESSION_SELECTOR_COLUMNS else None
+
+
 def _columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
     """Return ordered table column names while rejecting malformed SQLite metadata."""
     rows = connection.execute(f"PRAGMA table_info({_quote(table)})").fetchall()
@@ -488,8 +505,11 @@ def _refuse_unknown_session_tables(
         foreign_keys = connection.execute(
             f"PRAGMA foreign_key_list({_quote(table)})"
         ).fetchall()
-        if any(len(row) > 2 and row[2] in SESSION_TABLES for row in foreign_keys):
-            raise TransferError("unknown session-linked table")
+        for foreign_key in foreign_keys:
+            if len(foreign_key) < 3:
+                raise TransferError("database schema is invalid")
+            if _canonical_session_table_name(foreign_key[2]) is not None:
+                raise TransferError("unknown session-linked table")
 
 
 def _refuse_session_triggers(connection: sqlite3.Connection) -> None:
@@ -497,8 +517,11 @@ def _refuse_session_triggers(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         "SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger'"
     ).fetchall()
-    if any(row and row[0] in SESSION_TABLES for row in rows):
-        raise TransferError("database session schema is incompatible")
+    for row in rows:
+        if len(row) != 1:
+            raise TransferError("database schema is invalid")
+        if _canonical_session_table_name(row[0]) is not None:
+            raise TransferError("database session schema is incompatible")
 
 
 def _resolve_project(
@@ -691,16 +714,21 @@ def _validate_transferred_foreign_keys(
         for foreign_key in foreign_keys:
             if len(foreign_key) < 5:
                 raise TransferError("database session schema is invalid")
-            key_id, _sequence, parent_table, child_column, parent_column = foreign_key[
+            key_id, sequence, parent_table, child_column, parent_column = foreign_key[
                 :5
             ]
             if (
-                not isinstance(parent_table, str)
-                or parent_table not in SESSION_TABLES
+                type(key_id) is not int
+                or type(sequence) is not int
                 or not isinstance(child_column, str)
-                or not isinstance(parent_column, str)
+                or not child_column
             ):
+                raise TransferError("database session schema is invalid")
+            parent_table = _canonical_session_table_name(parent_table)
+            if parent_table is None:
                 continue
+            if not isinstance(parent_column, str) or not parent_column:
+                raise TransferError("database session schema is invalid")
             grouped.setdefault((key_id, parent_table), []).append(
                 (child_column, parent_column)
             )
