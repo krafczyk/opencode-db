@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -88,7 +89,7 @@ class SessionPruneTests(unittest.TestCase):
                     cli.parse_command(arguments)
 
     def test_cli_refuses_detached_prune_without_mutating(self) -> None:
-        """Require interactive authorization before crossing the prune mutation boundary."""
+        """Render review evidence before detached-stream refusal and avoid application."""
         cases = (
             ("detached stdout", _ReadTrackingTty("y\n"), io.StringIO()),
             ("detached stdin", _DetachedStream("y\n"), _TtyStream()),
@@ -96,8 +97,8 @@ class SessionPruneTests(unittest.TestCase):
         )
         for name, stdin, stdout in cases:
             with self.subTest(name=name), patch.object(
-                cli, "prune_sessions"
-            ) as prune:
+                cli, "plan_prune", return_value=_reviewed_prune_plan()
+            ), patch.object(cli, "apply_prune_plan") as apply:
                 stderr = io.StringIO()
                 with patch.object(sys, "stdin", stdin), patch.object(
                     sys, "stdout", stdout
@@ -109,15 +110,16 @@ class SessionPruneTests(unittest.TestCase):
                 self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
                 self.assertEqual(stdin.readline_count, 0)
                 self.assertIn("terminal", stderr.getvalue())
-                prune.assert_not_called()
+                self.assertIn("opencode-db: prune preview\n", stdout.getvalue())
+                apply.assert_not_called()
 
     def test_cli_requires_exact_confirmation_and_yes_bypasses_prompt(self) -> None:
-        """Mutate only after exact terminal confirmation or an explicit yes flag."""
+        """Preview before exact authorization and let ``--yes`` bypass only input."""
         outcome = prune_module.PruneOutcome(1, None, None)
         for reply in ("n\n", "Y\n", " y\n", "y \n", "y", "", "\n"):
             with self.subTest(reply=reply), patch.object(
-                cli, "prune_sessions", return_value=outcome
-            ) as prune:
+                cli, "plan_prune", return_value=_reviewed_prune_plan()
+            ), patch.object(cli, "apply_prune_plan", return_value=outcome) as apply:
                 stdin = _TtyStream(reply)
                 stdout = _TtyStream()
                 stderr = _TtyStream()
@@ -129,9 +131,15 @@ class SessionPruneTests(unittest.TestCase):
                     )
                 self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
                 self.assertIn("cancelled", stderr.getvalue())
-                prune.assert_not_called()
+                self.assertLess(
+                    stdout.getvalue().index("opencode-db: prune preview"),
+                    stdout.getvalue().index("Prune matching sessions? [y/N] "),
+                )
+                apply.assert_not_called()
 
-        with patch.object(cli, "prune_sessions", return_value=outcome) as prune:
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan", return_value=outcome) as apply:
             stdin = _InterruptingTty()
             stdout = _TtyStream()
             stderr = _TtyStream()
@@ -143,12 +151,13 @@ class SessionPruneTests(unittest.TestCase):
                 )
             self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
             self.assertIn("cancelled", stderr.getvalue())
-            prune.assert_not_called()
+            self.assertIn("opencode-db: prune preview", stdout.getvalue())
+            apply.assert_not_called()
 
         for reply in ("y\n", "y\r", "y\r\n"):
             with self.subTest(reply=reply), patch.object(
-                cli, "prune_sessions", return_value=outcome
-            ) as prune:
+                cli, "plan_prune", return_value=_reviewed_prune_plan()
+            ), patch.object(cli, "apply_prune_plan", return_value=outcome) as apply:
                 stdin = _TtyStream(reply)
                 stdout = _TtyStream()
                 stderr = _TtyStream()
@@ -160,9 +169,15 @@ class SessionPruneTests(unittest.TestCase):
                     )
                 self.assertEqual(exit_code, 0)
                 self.assertIn("Prune matching sessions? [y/N] ", stdout.getvalue())
-                prune.assert_called_once()
+                self.assertLess(
+                    stdout.getvalue().index("opencode-db: prune preview"),
+                    stdout.getvalue().index("Prune matching sessions? [y/N] "),
+                )
+                apply.assert_called_once()
 
-        with patch.object(cli, "prune_sessions", return_value=outcome) as prune:
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan", return_value=outcome) as apply:
             code, stdout, stderr = self._run(
                 [
                     "prune",
@@ -176,7 +191,246 @@ class SessionPruneTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertNotIn("[y/N]", stdout)
             self.assertEqual(stderr, "")
-            prune.assert_called_once()
+            self.assertIn("opencode-db: prune preview", stdout)
+            apply.assert_called_once()
+
+    def test_cli_preview_flush_failure_refuses_before_writable_application(self) -> None:
+        """Treat a buffered preview flush failure as an operational no-application failure."""
+        stdout = _FlushFailingTty()
+        stderr = io.StringIO()
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan") as apply, patch.object(
+            sys, "stdout", stdout
+        ), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertIn("could not write prune preview", stderr.getvalue())
+        apply.assert_not_called()
+
+    def test_cli_preview_write_failure_refuses_before_writable_application(self) -> None:
+        """Treat a preview write failure as an operational no-application failure."""
+        stderr = io.StringIO()
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan") as apply, patch.object(
+            sys, "stdout", _WriteFailingTty()
+        ), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertIn("could not write prune preview", stderr.getvalue())
+        apply.assert_not_called()
+
+    def test_cli_preview_short_write_refuses_before_writable_application(self) -> None:
+        """Require the complete preview to reach stdout before writable application."""
+        stderr = io.StringIO()
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan") as apply, patch.object(
+            sys, "stdout", _ShortWriteTty()
+        ), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertIn("could not write prune preview", stderr.getvalue())
+        apply.assert_not_called()
+
+    def test_cli_prompt_flush_failure_refuses_before_writable_application(self) -> None:
+        """Bound prompt delivery failure after the preview and before authorization."""
+        stdout = _PromptFlushFailingTty()
+        stderr = io.StringIO()
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan") as apply, patch.object(
+            sys, "stdin", _TtyStream("y\n")
+        ), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1"]
+            )
+
+        self.assertEqual(exit_code, EXIT_OPERATIONAL_FAILURE)
+        self.assertIn("could not write prune confirmation prompt", stderr.getvalue())
+        apply.assert_not_called()
+
+    def test_cli_flushes_preview_before_yes_application(self) -> None:
+        """Flush the complete buffered preview before the noninteractive writer phase."""
+        stdout = _FlushTrackingTty()
+        outcome = prune_module.PruneOutcome(1, None, None)
+
+        def apply(reviewed: prune_module.ReviewedPrunePlan) -> prune_module.PruneOutcome:
+            self.assertGreater(stdout.flush_count, 0)
+            self.assertEqual(reviewed, _reviewed_prune_plan())
+            return outcome
+
+        with patch.object(
+            cli, "plan_prune", return_value=_reviewed_prune_plan()
+        ), patch.object(cli, "apply_prune_plan", side_effect=apply), patch.object(
+            sys, "stdin", _ReadTrackingTty()
+        ), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", io.StringIO()):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.flush_count, 1)
+
+    def test_cli_zero_preview_skips_terminal_probe_unless_vacuum_remains(self) -> None:
+        """Return compatible zero output without a terminal check unless vacuum can mutate."""
+        no_op = _reviewed_prune_plan(
+            sessions_to_prune=0, sessions_to_keep=2, timestamp=None
+        )
+        stdout = _OSErrorTty()
+        stderr = io.StringIO()
+        with patch.object(cli, "plan_prune", return_value=no_op), patch.object(
+            cli, "apply_prune_plan"
+        ) as apply, patch.object(sys, "stdin", _OSErrorTty()), patch.object(
+            sys, "stdout", stdout
+        ), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(["prune", "--db", "/tmp/opencode.db", "--oldest", "1"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "opencode-db: prune preview",
+                "sessions_to_prune: 0",
+                "sessions_to_keep: 2",
+                "oldest_surviving_session_updated: none",
+                "opencode-db: pruned",
+                "pruned_sessions: 0",
+            ],
+        )
+        self.assertEqual(stderr.getvalue(), "")
+        apply.assert_not_called()
+
+        combined = _reviewed_prune_plan(vacuum=True)
+        stdout = _TtyStream()
+        with patch.object(cli, "plan_prune", return_value=combined), patch.object(
+            cli, "apply_prune_plan"
+        ) as apply, patch.object(sys, "stdin", _TtyStream("n\n")), patch.object(
+            sys, "stdout", stdout
+        ), patch.object(sys, "stderr", io.StringIO()):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--vacuum"]
+            )
+
+        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+        self.assertIn(
+            "Prune matching sessions and vacuum database? [y/N] ", stdout.getvalue()
+        )
+        apply.assert_not_called()
+
+        vacuum = _reviewed_prune_plan(sessions_to_prune=0, sessions_to_keep=2, vacuum=True)
+        stdin = _TtyStream("y\n")
+        stdout = _TtyStream()
+        with patch.object(cli, "plan_prune", return_value=vacuum), patch.object(
+            cli, "apply_prune_plan", return_value=prune_module.PruneOutcome(0, None, None, 1)
+        ) as apply, patch.object(sys, "stdin", stdin), patch.object(
+            sys, "stdout", stdout
+        ), patch.object(sys, "stderr", io.StringIO()):
+            exit_code = cli.main(["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--vacuum"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Vacuum database? [y/N] ", stdout.getvalue())
+        apply.assert_called_once()
+
+    def test_cli_preview_estimates_local_time_and_no_leaks(self) -> None:
+        """Render exact aggregate estimates with a local offset and no private evidence."""
+        reviewed = _reviewed_prune_plan(
+            sessions_to_prune=1,
+            sessions_to_keep=2,
+            estimate=True,
+            timestamp=0,
+        )
+        stdin = _ReadTrackingTty()
+        stdout = _TtyStream()
+        stderr = _TtyStream()
+        previous_timezone = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            time.tzset()
+            with patch.object(cli, "plan_prune", return_value=reviewed), patch.object(
+                cli, "apply_prune_plan", return_value=prune_module.PruneOutcome(1, 17, 31)
+            ) as apply, patch.object(sys, "stdin", stdin), patch.object(
+                sys, "stdout", stdout
+            ), patch.object(sys, "stderr", stderr):
+                exit_code = cli.main(
+                    [
+                        "prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--estimate-size", "--yes",
+                    ]
+                )
+        finally:
+            if previous_timezone is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous_timezone
+            time.tzset()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdin.readline_count, 0)
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "opencode-db: prune preview",
+                "sessions_to_prune: 1",
+                "sessions_to_keep: 2",
+                "oldest_surviving_session_updated: 1969-12-31T19:00:00-05:00",
+                "projected_logical_bytes_deleted: 17",
+                "projected_logical_database_bytes_after_prune: 31",
+                "opencode-db: pruned",
+                "pruned_sessions: 1",
+                "estimated_logical_bytes_deleted: 17",
+                "estimated_logical_database_bytes_after_prune: 31",
+            ],
+        )
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("distinctive-session-id", stdout.getvalue().lower())
+        apply.assert_called_once()
+
+    def test_cli_refuses_malformed_timestamp_and_stale_review_without_success_output(self) -> None:
+        """Fail closed for malformed timestamps and report a rerun-needed stale review."""
+        malformed = _reviewed_prune_plan(timestamp="malformed")
+        stdout = _TtyStream()
+        stderr = _TtyStream()
+        with patch.object(cli, "plan_prune", return_value=malformed), patch.object(
+            cli, "apply_prune_plan"
+        ) as apply, patch.object(sys, "stdout", stdout), patch.object(
+            sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("timestamp is invalid", stderr.getvalue())
+        self.assertNotIn("malformed", stderr.getvalue())
+        apply.assert_not_called()
+
+        with self.assertRaisesRegex(PruneError, "timestamp is invalid"):
+            cli._render_prune_preview_timestamp(10**100)
+
+        stdout = _TtyStream()
+        stderr = _TtyStream()
+        with patch.object(cli, "plan_prune", return_value=_reviewed_prune_plan()), patch.object(
+            cli, "apply_prune_plan", side_effect=PruneError("prune preview is stale: rerun the command")
+        ), patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+            exit_code = cli.main(
+                ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--yes"]
+            )
+
+        self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+        self.assertIn("opencode-db: prune preview", stdout.getvalue())
+        self.assertNotIn("opencode-db: pruned", stdout.getvalue())
+        self.assertIn("stale: rerun", stderr.getvalue())
+        self.assertNotIn("distinctive-session-id", stderr.getvalue().lower())
 
     def test_count_time_and_target_policies_preserve_unrelated_projects(self) -> None:
         """Delete only selected project rows using deterministic count, time, and size policies."""
@@ -702,6 +956,35 @@ class SessionPruneTests(unittest.TestCase):
         return code, stdout.getvalue(), stderr.getvalue()
 
 
+def _reviewed_prune_plan(
+    *,
+    sessions_to_prune: int = 1,
+    sessions_to_keep: int = 2,
+    vacuum: bool = False,
+    estimate: bool = False,
+    timestamp: object = 0,
+) -> prune_module.ReviewedPrunePlan:
+    """Build aggregate-only reviewed evidence for CLI authorization tests."""
+    request = PruneRequest(
+        "/tmp/opencode.db", oldest="1", vacuum=vacuum, estimate_size=estimate
+    )
+    preview = prune_module.PrunePreview(
+        sessions_to_prune,
+        sessions_to_keep,
+        timestamp,
+        17 if estimate else None,
+        31 if estimate else None,
+    )
+    evidence = prune_module.PruneEvidence(
+        0, ("distinctive-session-id",) * sessions_to_prune, preview
+    )
+    return prune_module.ReviewedPrunePlan(
+        request,
+        prune_module.PruneSelector("oldest", "count", 1),
+        evidence,
+    )
+
+
 class _TtyStream(io.StringIO):
     """Provide an in-memory stream that reports terminal capability."""
 
@@ -746,6 +1029,60 @@ class _InterruptingTty(_TtyStream):
     def readline(self) -> str:
         """Interrupt instead of returning authorization input."""
         raise KeyboardInterrupt
+
+
+class _FlushFailingTty(_TtyStream):
+    """Model a buffered preview stream that fails deterministically on flush."""
+
+    def flush(self) -> None:
+        """Refuse to flush the preview after accepting its buffered write."""
+        raise OSError("output unavailable")
+
+
+class _WriteFailingTty(_TtyStream):
+    """Model a preview stream that fails before buffering any output."""
+
+    def write(self, value: str) -> int:
+        """Refuse a complete preview write without exposing the buffered value."""
+        raise OSError("output unavailable")
+
+
+class _ShortWriteTty(_TtyStream):
+    """Model a stream that accepts only part of the complete preview."""
+
+    def write(self, value: str) -> int:
+        """Report an incomplete write without raising an exception."""
+        return max(0, len(value) - 1)
+
+
+class _PromptFlushFailingTty(_TtyStream):
+    """Flush the preview but refuse to deliver the later confirmation prompt."""
+
+    def __init__(self) -> None:
+        """Initialize with no completed flush."""
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        """Complete the preview flush and fail the prompt flush."""
+        self.flush_count += 1
+        if self.flush_count > 1:
+            raise OSError("output unavailable")
+        super().flush()
+
+
+class _FlushTrackingTty(_TtyStream):
+    """Record successful preview flushes before a mocked writer phase."""
+
+    def __init__(self) -> None:
+        """Initialize a terminal stream with an empty successful-flush count."""
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        """Record and complete one buffered preview flush."""
+        self.flush_count += 1
+        super().flush()
 
 
 if __name__ == "__main__":

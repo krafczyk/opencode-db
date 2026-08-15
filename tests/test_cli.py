@@ -328,6 +328,21 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("--yes", text)
             self.assertIn("--progress", text)
             self.assertIn("structured", text)
+        for text in (readme, protocol):
+            self.assertIn("opencode-db: prune preview", text)
+            self.assertIn("sessions_to_prune", text)
+            self.assertIn("sessions_to_keep", text)
+            self.assertIn("oldest_surviving_session_updated", text)
+            self.assertIn("numeric UTC offset", text)
+            self.assertIn("--estimate-size", text)
+            self.assertIn("--vacuum", text)
+            self.assertIn("--yes", text)
+            self.assertIn("rerun", text)
+            self.assertIn("mode=ro", text)
+            self.assertIn("250,000", text)
+            self.assertIn("16 KiB", text)
+            self.assertIn("64 MiB", text)
+            self.assertIn("ten-second", text)
 
     def test_prune_backup_rejects_nonexact_snapshot_selectors_before_execution(
         self,
@@ -474,6 +489,15 @@ class CliContractTests(unittest.TestCase):
                     self.assertIn(option, stdout.getvalue())
                     if action == "prune":
                         self.assertIn("--yes", stdout.getvalue())
+                        self.assertIn("--estimate-size", stdout.getvalue())
+                        self.assertIn("--vacuum", stdout.getvalue())
+                        self.assertIn("sessions_to_prune", stdout.getvalue())
+                        self.assertIn("sessions_to_keep", stdout.getvalue())
+                        self.assertIn(
+                            "oldest_surviving_session_updated", stdout.getvalue()
+                        )
+                        self.assertIn("bypasses only the prompt", stdout.getvalue())
+                        self.assertIn("rerun", stdout.getvalue())
 
             self.assertEqual(database.read_bytes(), before)
 

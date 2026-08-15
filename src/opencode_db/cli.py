@@ -15,6 +15,7 @@ import shlex
 import sys
 import time
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 
 from .artifacts import (
     CaptureError,
@@ -58,9 +59,11 @@ from .prune import (
     PruneOperationalError,
     PruneOutcome,
     PruneRequest,
+    ReviewedPrunePlan,
+    apply_prune_plan,
     parse_selector,
     parse_target_size,
-    prune_sessions,
+    plan_prune,
 )
 from .transfer import (
     TransferError,
@@ -482,40 +485,44 @@ def _execute_inspection(request: InspectionRequest) -> int:
 
 
 def _execute_prune(request: PruneRequest) -> int:
-    """Authorize and execute one active session prune, then render safe aggregates.
+    """Preview, authorize, and execute one active session prune safely.
 
     Parameters: ``request`` has passed grammar validation. Returns zero after a
-    commit (and optional vacuum), safety-refusal exit code for detached streams,
-    cancellation, unsupported schema, or exact-project failures, and operational-
-    failure exit code for SQLite or filesystem failures. Unless ``request.yes``
-    is set, only an exact lowercase terminal response authorizes mutation. Output
-    contains only the prompt, counts, and byte estimates.
+    committed prune, requested vacuum, or reviewed zero-selection outcome; the
+    safety-refusal exit code for detached streams, cancellation, unsupported
+    schema, exact-project failures, or stale evidence; and the operational-failure
+    exit code for SQLite, filesystem, or preview-output failures. The command
+    calculates, renders, and flushes aggregate preview evidence from a read-only
+    snapshot before terminal checks, input, or writable application. Unless
+    ``request.yes`` is set, only an exact lowercase terminal response authorizes
+    a remaining mutation. Output never contains session identifiers or content.
     """
-    if not request.yes:
-        if not _is_terminal(sys.stdin) or not _is_terminal(sys.stdout):
-            sys.stderr.write(
-                "opencode-db: prune requires terminal stdin and stdout unless --yes; no changes were applied\n"
-            )
-            return EXIT_PRECONDITION_REFUSED
-        sys.stdout.write("Prune matching sessions? [y/N] ")
-        sys.stdout.flush()
-        try:
-            response = sys.stdin.readline()
-        except KeyboardInterrupt:
-            response = ""
-        if response not in ("y\n", "y\r", "y\r\n"):
-            sys.stderr.write("opencode-db: prune cancelled; no changes were applied\n")
-            return EXIT_PRECONDITION_REFUSED
     try:
-        outcome = prune_sessions(
-            request.database,
-            project_id=request.project_id,
-            oldest=request.oldest,
-            keep_newest=request.keep_newest,
-            target_size=request.target_size,
-            estimate_size=request.estimate_size,
-            vacuum=request.vacuum,
-        )
+        reviewed = plan_prune(request)
+        _render_prune_preview(reviewed, sys.stdout)
+        if reviewed.preview.sessions_to_prune == 0 and not request.vacuum:
+            outcome = PruneOutcome(
+                0,
+                reviewed.preview.projected_logical_bytes_deleted,
+                reviewed.preview.projected_logical_database_bytes_after_prune,
+            )
+            sys.stdout.write(_render_prune_outcome(request, outcome))
+            return 0
+        if not request.yes:
+            if not _is_terminal(sys.stdin) or not _is_terminal(sys.stdout):
+                sys.stderr.write(
+                    "opencode-db: prune requires terminal stdin and stdout unless --yes; no changes were applied\n"
+                )
+                return EXIT_PRECONDITION_REFUSED
+            _write_prune_confirmation_prompt(reviewed, request, sys.stdout)
+            try:
+                response = sys.stdin.readline()
+            except KeyboardInterrupt:
+                response = ""
+            if response not in ("y\n", "y\r", "y\r\n"):
+                sys.stderr.write("opencode-db: prune cancelled; no changes were applied\n")
+                return EXIT_PRECONDITION_REFUSED
+        outcome = apply_prune_plan(reviewed)
         sys.stdout.write(_render_prune_outcome(request, outcome))
         return 0
     except PruneCommittedError as error:
@@ -528,6 +535,109 @@ def _execute_prune(request: PruneRequest) -> int:
     except PruneError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
         return EXIT_PRECONDITION_REFUSED
+
+
+def _render_prune_preview(reviewed: ReviewedPrunePlan, stdout: object) -> None:
+    """Write and flush one canonical aggregate prune preview.
+
+    Parameters: ``reviewed`` is an immutable read-only prune plan and ``stdout``
+    is the selected human-output stream. Returns ``None`` after writing the
+    complete preview in its fixed field order and flushing it before any writable
+    application. Raises :class:`PruneOperationalError` when output cannot be
+    delivered and :class:`PruneError` for an unrenderable persisted timestamp;
+    neither failure exposes session identifiers or content.
+    """
+    preview = reviewed.preview
+    try:
+        timestamp = _render_prune_preview_timestamp(
+            preview.oldest_surviving_session_updated
+        )
+        lines = [
+            "opencode-db: prune preview",
+            f"sessions_to_prune: {preview.sessions_to_prune}",
+            f"sessions_to_keep: {preview.sessions_to_keep}",
+            f"oldest_surviving_session_updated: {timestamp}",
+        ]
+        if reviewed.request.estimate_size:
+            lines.extend(
+                (
+                    "projected_logical_bytes_deleted: "
+                    f"{preview.projected_logical_bytes_deleted}",
+                    "projected_logical_database_bytes_after_prune: "
+                    f"{preview.projected_logical_database_bytes_after_prune}",
+                )
+            )
+        rendered = "\n".join(lines) + "\n"
+        if stdout.write(rendered) != len(rendered):
+            raise PruneOperationalError("could not write prune preview")
+        stdout.flush()
+    except PruneError:
+        raise
+    except (AttributeError, OSError, ValueError, TypeError) as error:
+        raise PruneOperationalError("could not write prune preview") from error
+
+
+def _render_prune_preview_timestamp(value: int | None) -> str:
+    """Render one bounded epoch-millisecond preview time in local ISO 8601 form.
+
+    Parameters: ``value`` is the retained session update time from reviewed
+    aggregate evidence, or ``None`` when the selected scope has no survivor.
+    Returns ``none`` or a timezone-aware local ISO 8601 timestamp with a numeric
+    UTC offset. Raises :class:`PruneError` for malformed or unrepresentable
+    persisted values without exposing the value itself.
+    """
+    if value is None:
+        return "none"
+    if type(value) is not int:
+        raise PruneError("prune preview timestamp is invalid")
+    try:
+        seconds, milliseconds = divmod(value, 1_000)
+        rendered = (
+            datetime(1970, 1, 1, tzinfo=timezone.utc)
+            + timedelta(seconds=seconds, milliseconds=milliseconds)
+        ).astimezone()
+        if rendered.utcoffset() is None:
+            raise ValueError("local timestamp has no offset")
+        return rendered.isoformat()
+    except (OSError, OverflowError, ValueError) as error:
+        raise PruneError("prune preview timestamp is invalid") from error
+
+
+def _prune_confirmation_prompt(reviewed: ReviewedPrunePlan, request: PruneRequest) -> str:
+    """Return the exact confirmation prompt for the reviewed remaining mutation.
+
+    Parameters: ``reviewed`` provides aggregate selected-session count and
+    ``request`` carries the vacuum option. Returns the terminal prompt for a
+    prune, vacuum, or both; it performs no I/O and exposes no private evidence.
+    """
+    if reviewed.preview.sessions_to_prune == 0:
+        return "Vacuum database? [y/N] "
+    if request.vacuum:
+        return "Prune matching sessions and vacuum database? [y/N] "
+    return "Prune matching sessions? [y/N] "
+
+
+def _write_prune_confirmation_prompt(
+    reviewed: ReviewedPrunePlan, request: PruneRequest, stdout: object
+) -> None:
+    """Write and flush the complete prompt before reading authorization input.
+
+    Parameters: ``reviewed`` and ``request`` select the mutation-specific prompt;
+    ``stdout`` is the already validated terminal stream. Returns ``None`` after
+    complete delivery. Raises :class:`PruneOperationalError` on a short write or
+    output failure, before writable application begins.
+    """
+    prompt = _prune_confirmation_prompt(reviewed, request)
+    try:
+        if stdout.write(prompt) != len(prompt):
+            raise PruneOperationalError("could not write prune confirmation prompt")
+        stdout.flush()
+    except PruneError:
+        raise
+    except (AttributeError, OSError, ValueError, TypeError) as error:
+        raise PruneOperationalError(
+            "could not write prune confirmation prompt"
+        ) from error
 
 
 def _render_prune_outcome(request: PruneRequest, outcome: PruneOutcome) -> str:
@@ -1119,8 +1229,18 @@ def _help_text(values: Sequence[str]) -> str:
         "cleanup rollback": "opencode-db cleanup rollback [--database ABSOLUTE_PATH] --operation ID [--deadline-seconds N] [--json]",
         "cleanup prune-backup": "opencode-db cleanup prune-backup [--database ABSOLUTE_PATH] --snapshot ID [--json]",
     }
+    details = {
+        "prune": (
+            "Preview fields: sessions_to_prune, sessions_to_keep, "
+            "oldest_surviving_session_updated, and optional projected logical bytes.\n"
+            "--yes bypasses only the prompt; zero matches skip confirmation unless "
+            "--vacuum remains, and stale previews refuse with instructions to rerun."
+        )
+    }
     if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}:
-        return synopses[values[0]] + "\n"
+        selected = values[0]
+        detail = f"\n{details[selected]}" if selected in details else ""
+        return synopses[selected] + detail + "\n"
     if command in synopses:
         return synopses[command] + "\n"
     return (

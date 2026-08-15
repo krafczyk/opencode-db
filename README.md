@@ -325,18 +325,50 @@ opencode-db cleanup prune-backup \
 
 ## Active session pruning
 
-`prune` is an interactive active-database retention command. Arrange OpenCode
-shutdown and writer concurrency before running it. Without `--yes`, both stdin
-and stdout must be terminals and only an exact lowercase `y` authorizes the
-operation; any other input, EOF, or interruption cancels before the database is
-opened. `--yes` bypasses only that prompt for explicit automation. The command
-opens only the selected existing database through SQLite `mode=rw`, enables
-foreign keys, uses a bounded writer wait, validates integrity and foreign keys
-before and after its immediate transaction, and deletes only complete selected
-session state. It refuses an incomplete schema, unknown session-linked table or
-trigger, malformed data, or an exact missing project instead of guessing
-ownership. It also refuses non-unique session IDs and known-table foreign keys
-that cross the selected and retained ownership boundary.
+`prune` is an active-database retention command. Arrange OpenCode shutdown and
+writer concurrency before running it. It first opens the selected existing
+database read-only to calculate and flush an aggregate preview: scoped sessions
+to prune and keep, plus the oldest surviving scoped update time in local ISO
+8601 form with a numeric UTC offset (or `none`). With `--estimate-size`, the
+preview also reports projected deleted logical bytes and projected logical
+database bytes after pruning. It never prints session IDs, titles, transcripts,
+payloads, or per-session deletion lines.
+
+```text
+opencode-db: prune preview
+sessions_to_prune: N
+sessions_to_keep: N
+oldest_surviving_session_updated: LOCAL_ISO8601_WITH_NUMERIC_OFFSET | none
+projected_logical_bytes_deleted: N
+projected_logical_database_bytes_after_prune: N
+```
+
+The projected fields appear only with `--estimate-size`.
+
+Read-only planning and writer-side revalidation each accept at most 250,000
+scoped candidate sessions, 16 KiB per persisted session ID, and 64 MiB of
+captured candidate evidence. Each phase has its own fixed ten-second execution
+deadline. Slow or oversized evidence fails with a bounded diagnostic before
+authorization or deletion.
+
+Without `--yes`, both stdin and stdout must be terminals after that preview and
+only an exact lowercase `y` authorizes any remaining mutation; other input, EOF,
+or interruption cancels without opening SQLite writable. `--yes` bypasses only
+the prompt, not preview or revalidation. A zero-selection request without
+`--vacuum` returns its compatible zero result after preview without probing the
+terminal or opening SQLite writable. A zero-selection request with `--vacuum`
+still requires authorization because compaction changes the database. After
+authorization, the command revalidates the reviewed selection under its writer
+transaction; a changed selection refuses without deletion and instructs the
+operator to rerun the command.
+
+The writable phase opens only the selected existing database through SQLite
+`mode=rw`, enables foreign keys, uses a bounded writer wait, validates integrity
+and foreign keys before and after its immediate transaction, and deletes only
+complete selected session state. It refuses an incomplete schema, unknown
+session-linked table or trigger, malformed data, or an exact missing project
+instead of guessing ownership. It also refuses non-unique session IDs and
+known-table foreign keys that cross the selected and retained ownership boundary.
 
 ```bash
 opencode-db prune [--db /absolute/path/opencode.db] [--project-id ID] \
@@ -355,15 +387,16 @@ older than now minus the duration. `SIZE` uses the explicit grammar
 estimates fit the target. If the newest session itself exceeds the target, it and
 all older candidates are pruned.
 
-`--estimate-size` reports logical bytes deleted and estimated logical database
-bytes after pruning without rendering any row data. Ordinary deletion makes
-SQLite pages reusable but usually does not shrink the database file.
-`--vacuum` runs only after a successful delete transaction (or an explicit
-no-match request), physically compacts the database, and reports resulting file
-bytes. Selector decisions always use logical estimates, never physical file size.
-If deletion commits but the later vacuum fails, the command reports the committed
-session count and exits with an operational failure that explicitly warns not to
-repeat the destructive prune request.
+`--estimate-size` reports projected logical bytes before authorization and
+committed logical bytes after pruning without rendering row data. Ordinary
+deletion makes SQLite pages reusable but usually does not shrink the database
+file.
+`--vacuum` runs only after a successful revalidated delete transaction (or a
+revalidated zero-selection request), physically compacts the database, and
+reports resulting file bytes. Selector decisions always use logical estimates,
+never physical file size. If deletion commits but the later vacuum fails, the
+command reports the committed session count and exits with an operational failure
+that explicitly warns not to repeat the destructive prune request.
 
 ## Results, deadlines, and storage
 

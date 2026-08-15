@@ -85,30 +85,61 @@ the newest contiguous prefix whose complete known session logical estimates fit;
 when the newest session alone is over target it and all older candidates are
 deleted.
 
-Without `--yes`, both stdin and stdout must be terminals. Only exact lowercase
-`y` authorizes pruning; other input, EOF, interruption, or detached streams
-refuse before the database is opened. `--yes` bypasses only this prompt. The
-optional exact project scope is verified before selection. The command opens
-only its existing selected database using SQLite `mode=rw`, sets a bounded busy
-timeout and foreign keys, validates integrity and foreign keys, then performs
-known-child and session deletion in one immediate transaction. It validates
-again before commit and rolls back uncommitted work on failure. Incomplete known
-schemas, unknown session-linked tables, triggers on known session tables, and
-retained session-parent dependencies are refusals. Non-unique session IDs and
-known-table foreign keys crossing selected and retained session ownership are
-also refusals. Output contains only the confirmation prompt, counts, and optional
-estimates, never session rows or transcript bodies.
+The command first opens only its existing selected database through SQLite
+`mode=ro` and calculates, writes, and flushes this canonical aggregate preview
+before checking terminal capability, reading input, or opening SQLite writable:
 
-`--estimate-size` prints deleted logical bytes and total logical database bytes
-after prune. Ordinary deletion frees reusable SQLite space but normally does not
-reduce physical file size. `--vacuum` is allowed with every selector and, only
-after a successful deletion transaction or explicit no-match request, compacts
-the physical database and prints its resulting file bytes. Its selection remains
-based on logical estimates. A no-match request otherwise rolls back its read/
-validation transaction unchanged. If deletion commits but post-commit vacuum
-fails, the command reports the committed aggregate outcome, returns an
-operational failure, and warns that the destructive selector must not be
-repeated.
+```text
+opencode-db: prune preview
+sessions_to_prune: N
+sessions_to_keep: N
+oldest_surviving_session_updated: LOCAL_ISO8601_WITH_NUMERIC_OFFSET | none
+projected_logical_bytes_deleted: N
+projected_logical_database_bytes_after_prune: N
+```
+
+The final two fields appear only with `--estimate-size`; a rendered surviving
+time always includes its numeric UTC offset. Counts and the oldest survivor are
+limited to the selected project when `--project-id` is supplied;
+otherwise they cover the complete candidate scope. Preview output never includes
+session IDs, titles, transcript content, payloads, or per-session deletion lines.
+Read-only planning and writer-side revalidation each cap the scoped candidate
+set at 250,000 sessions, each persisted session ID at 16 KiB, and captured
+candidate evidence at 64 MiB. Each phase has its own fixed ten-second execution
+deadline; exceeding a count, byte, or time bound refuses before authorization or
+deletion.
+
+Without `--yes`, both stdin and stdout must be terminals after preview. Only
+exact lowercase `y` authorizes a remaining mutation; other input, EOF,
+interruption, or detached streams refuse without opening SQLite writable.
+`--yes` bypasses only this prompt. A zero-selection request without `--vacuum`
+prints the preview and compatible zero result without terminal probing or a
+writable SQLite connection. A zero-selection request with `--vacuum` still
+requires authorization and writer-side revalidation before compaction. The
+interactive prompt names the remaining operation: `Prune matching sessions? [y/N] `,
+`Prune matching sessions and vacuum database? [y/N] `, or `Vacuum database? [y/N] `.
+
+The optional exact project scope is verified before selection. After
+authorization, the command opens its selected database using SQLite `mode=rw`,
+sets a bounded busy timeout and foreign keys, revalidates the preview, then
+performs known-child and session deletion in one immediate transaction. Any
+changed selection or displayed statistic refuses without mutation and instructs
+the operator to rerun. It validates again before commit and rolls back
+uncommitted work on failure. Incomplete known schemas, unknown session-linked
+tables, triggers on known session tables, and retained session-parent dependencies
+are refusals. Non-unique session IDs and known-table foreign keys crossing
+selected and retained session ownership are also refusals.
+
+`--estimate-size` prints projected deleted logical bytes and projected total
+logical database bytes after prune in the preview, then committed logical values
+after success. Ordinary deletion frees reusable SQLite space but normally does
+not reduce physical file size. `--vacuum` is allowed with every selector and,
+only after a successful revalidated deletion transaction or revalidated
+zero-selection request, compacts the physical database and prints its resulting
+file bytes. Its selection remains based on logical estimates. If deletion commits
+but post-commit vacuum fails, the command reports the committed aggregate outcome,
+returns an operational failure, and warns that the destructive selector must not
+be repeated.
 
 ## Session transfer
 
