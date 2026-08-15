@@ -335,6 +335,7 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("oldest_surviving_session_updated", text)
             self.assertIn("numeric UTC offset", text)
             self.assertIn("--estimate-size", text)
+            self.assertIn("--timeout-seconds", text)
             self.assertIn("--vacuum", text)
             self.assertIn("--yes", text)
             self.assertIn("rerun", text)
@@ -342,7 +343,8 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("250,000", text)
             self.assertIn("16 KiB", text)
             self.assertIn("64 MiB", text)
-            self.assertIn("ten-second", text)
+            self.assertIn("300-second", text)
+            self.assertIn("86,400", text)
 
     def test_prune_backup_rejects_nonexact_snapshot_selectors_before_execution(
         self,

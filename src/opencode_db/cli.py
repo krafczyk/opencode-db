@@ -54,6 +54,7 @@ from .move_cli import (
     parse_move_command,
 )
 from .prune import (
+    PRUNE_TIMEOUT_SECONDS,
     PruneCommittedError,
     PruneError,
     PruneOperationalError,
@@ -62,6 +63,7 @@ from .prune import (
     ReviewedPrunePlan,
     apply_prune_plan,
     parse_selector,
+    parse_prune_timeout,
     parse_target_size,
     plan_prune,
 )
@@ -286,7 +288,7 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
     function neither reads stdin nor changes a database.
     """
     command = "prune"
-    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "vacuum", "yes"}
+    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "timeout-seconds", "vacuum", "yes"}
     boolean_options = {"estimate-size", "vacuum", "yes"}
     options: dict[str, str | bool] = {}
     position = 1
@@ -318,6 +320,12 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
             parse_selector(_option(options, selector))
     except PruneError as error:
         raise CliUsageError(command, str(error)) from error
+    timeout_seconds = PRUNE_TIMEOUT_SECONDS
+    if "timeout-seconds" in options:
+        try:
+            timeout_seconds = parse_prune_timeout(_option(options, "timeout-seconds"))
+        except PruneError as error:
+            raise CliUsageError(command, str(error)) from error
     database = _absolute_path(_option(options, "db"), command, "db") if "db" in options else _default_database(command)
     return PruneRequest(
         database=database,
@@ -328,6 +336,7 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
         estimate_size=bool(options.get("estimate-size", False)),
         vacuum=bool(options.get("vacuum", False)),
         yes=bool(options.get("yes", False)),
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -1212,7 +1221,7 @@ def _help_text(values: Sequence[str]) -> str:
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]",
         "list-sessions": "opencode-db list-sessions [--db ABSOLUTE_DB] [--estimate-session-size] [--project-id ID]",
-        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--vacuum] [--yes]",
+        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]",
         "export": "opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
         "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview [--database ABSOLUTE_PATH] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",

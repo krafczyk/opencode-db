@@ -27,6 +27,7 @@ from opencode_db.prune import (
     prune_sessions,
     session_logical_sizes,
 )
+from opencode_db.transfer import TransferOperationalError
 
 
 _TEST_ROOT = Path("/tmp/opencode-db-v1")
@@ -74,6 +75,30 @@ class SessionPruneTests(unittest.TestCase):
         self.assertEqual(valid.oldest, "2")
         self.assertTrue(valid.estimate_size)
         self.assertTrue(valid.yes)
+        self.assertEqual(valid.timeout_seconds, 300.0)
+        overridden = cli.parse_command(
+            [
+                "prune",
+                "--db",
+                "/tmp/opencode.db",
+                "--oldest",
+                "1",
+                "--timeout-seconds",
+                "200",
+            ]
+        )
+        self.assertEqual(overridden.timeout_seconds, 200.0)
+        for invalid_timeout in (True, 0, -1, float("inf"), float("nan"), 86_401, "bad"):
+            with self.subTest(invalid_timeout=invalid_timeout), self.assertRaisesRegex(
+                PruneError, "timeout seconds"
+            ):
+                plan_prune(
+                    PruneRequest(
+                        "/tmp/opencode.db",
+                        oldest="1",
+                        timeout_seconds=invalid_timeout,  # type: ignore[arg-type]
+                    )
+                )
         for arguments in (
             ["prune", "--db", "/tmp/opencode.db"],
             ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--keep-newest", "1"],
@@ -83,6 +108,10 @@ class SessionPruneTests(unittest.TestCase):
             ["prune", "--db", "/tmp/opencode.db", "--target-size", "0B"],
             ["prune", "--db", "/tmp/opencode.db", "--target-size", "1KB"],
             ["prune", "--db", "/tmp/opencode.db", "--target-size", "1.5MiB"],
+            ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds"],
+            ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "0"],
+            ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "nan"],
+            ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--timeout-seconds", "86401"],
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(cli.CliUsageError):
@@ -717,7 +746,7 @@ class SessionPruneTests(unittest.TestCase):
             self._create_database(database)
             self._insert_session(database, "one", "a", 1, b"one")
             self._insert_session(database, "two", "a", 2, b"two")
-            request = PruneRequest(str(database), oldest="1")
+            request = PruneRequest(str(database), oldest="1", timeout_seconds=10.0)
 
             with patch.object(prune_module, "_MAX_PRUNE_CANDIDATES", 1):
                 with self.assertRaisesRegex(PruneOperationalError, "candidate evidence") as error:
@@ -747,9 +776,78 @@ class SessionPruneTests(unittest.TestCase):
             with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 38):
                 self.assertEqual(plan_prune(size_request).preview.sessions_to_prune, 2)
 
-            with patch.object(prune_module.time, "monotonic", side_effect=(0.0, 11.0)):
+            with patch.object(
+                prune_module.time, "monotonic", side_effect=(0.0, 11.0, 11.0)
+            ):
                 with self.assertRaisesRegex(PruneOperationalError, "timed out"):
                     plan_prune(request)
+
+    def test_timeout_override_gives_planning_and_application_independent_windows(self) -> None:
+        """Start a fresh full caller-selected timeout for each prune phase."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "one", "a", 1, b"one")
+            self._insert_session(database, "two", "a", 2, b"two")
+            request = PruneRequest(
+                str(database), oldest="1", timeout_seconds=200.0
+            )
+
+            with patch.object(
+                prune_module.time, "monotonic", return_value=10.0
+            ), patch.object(
+                prune_module,
+                "_install_prune_deadline",
+                wraps=prune_module._install_prune_deadline,
+            ) as install_deadline:
+                reviewed = plan_prune(request)
+                outcome = apply_prune_plan(reviewed)
+
+            self.assertEqual(outcome.deleted_sessions, 1)
+            self.assertEqual(
+                [call.args[1] for call in install_deadline.call_args_list],
+                [210.0, 210.0],
+            )
+
+    def test_integrity_interruption_reports_phase_timeout_without_deleting(self) -> None:
+        """Classify deadline interruption by prune phase instead of as corruption."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "one", "a", 1, b"one")
+            self._insert_session(database, "two", "a", 2, b"two")
+            request = PruneRequest(str(database), oldest="1", timeout_seconds=1.0)
+
+            with patch.object(
+                prune_module,
+                "_validate_database",
+                side_effect=TransferOperationalError(
+                    "database integrity validation failed"
+                ),
+            ), patch.object(
+                prune_module.time, "monotonic", side_effect=(0.0, 0.0, 2.0)
+            ):
+                with self.assertRaisesRegex(
+                    PruneOperationalError, "prune planning timed out"
+                ):
+                    plan_prune(request)
+
+            reviewed = plan_prune(request)
+            with patch.object(
+                prune_module,
+                "_validate_database",
+                side_effect=TransferOperationalError(
+                    "database integrity validation failed"
+                ),
+            ), patch.object(
+                prune_module.time, "monotonic", side_effect=(0.0, 0.0, 2.0)
+            ):
+                with self.assertRaisesRegex(
+                    PruneOperationalError, "prune application timed out"
+                ):
+                    apply_prune_plan(reviewed)
+
+            self.assertEqual(self._session_ids(database), ["one", "two"])
 
     def test_writer_revalidation_reuses_caps_and_deadline_then_rolls_back(self) -> None:
         """Bound application work after locking and retain rows after a revalidation refusal."""
@@ -758,14 +856,18 @@ class SessionPruneTests(unittest.TestCase):
             self._create_database(database)
             self._insert_session(database, "one", "a", 1, b"one")
             self._insert_session(database, "two", "a", 2, b"two")
-            reviewed = plan_prune(PruneRequest(str(database), oldest="1"))
+            reviewed = plan_prune(
+                PruneRequest(str(database), oldest="1", timeout_seconds=10.0)
+            )
 
             with patch.object(prune_module, "_MAX_PRUNE_CANDIDATES", 1):
                 with self.assertRaisesRegex(PruneOperationalError, "candidate evidence"):
                     apply_prune_plan(reviewed)
             self.assertEqual(self._session_ids(database), ["one", "two"])
 
-            with patch.object(prune_module.time, "monotonic", side_effect=(0.0, 11.0)):
+            with patch.object(
+                prune_module.time, "monotonic", side_effect=(0.0, 11.0, 11.0)
+            ):
                 with self.assertRaisesRegex(PruneOperationalError, "timed out"):
                     apply_prune_plan(reviewed)
             self.assertEqual(self._session_ids(database), ["one", "two"])
@@ -1118,7 +1220,11 @@ class SessionPruneTests(unittest.TestCase):
             database = root / "opencode.db"
             self._create_database(database)
             self._insert_sessions(database)
-            reviewed = plan_prune(PruneRequest(str(database), project_id="a", oldest="1"))
+            reviewed = plan_prune(
+                PruneRequest(
+                    str(database), project_id="a", oldest="1", timeout_seconds=0.1
+                )
+            )
             before = self._session_ids(database)
             reader = sqlite3.connect(database, isolation_level=None)
             try:
@@ -1126,9 +1232,8 @@ class SessionPruneTests(unittest.TestCase):
                 reader.execute("BEGIN")
                 reader.execute("SELECT id FROM session").fetchall()
                 started = time.monotonic()
-                with patch.object(prune_module, "_PRUNE_TIMEOUT_SECONDS", 0.1):
-                    with self.assertRaisesRegex(PruneOperationalError, "application timed out"):
-                        apply_prune_plan(reviewed)
+                with self.assertRaisesRegex(PruneOperationalError, "application timed out"):
+                    apply_prune_plan(reviewed)
                 elapsed = time.monotonic() - started
             finally:
                 reader.rollback()

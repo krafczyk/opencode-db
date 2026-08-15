@@ -347,9 +347,12 @@ The projected fields appear only with `--estimate-size`.
 
 Read-only planning and writer-side revalidation each accept at most 250,000
 scoped candidate sessions, 16 KiB per persisted session ID, and 64 MiB of
-captured candidate evidence. Each phase has its own fixed ten-second execution
-deadline. Slow or oversized evidence fails with a bounded diagnostic before
-authorization or deletion.
+captured candidate evidence. Each phase has its own 300-second execution
+deadline by default. `--timeout-seconds` accepts finite positive seconds up to
+86,400 and gives planning and application separate full windows; time spent
+reviewing or confirming the preview consumes neither window. Slow or oversized
+evidence fails with a bounded phase-specific diagnostic before authorization or
+deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after that preview and
 only an exact lowercase `y` authorizes any remaining mutation; other input, EOF,
@@ -373,7 +376,7 @@ known-table foreign keys that cross the selected and retained ownership boundary
 ```bash
 opencode-db prune [--db /absolute/path/opencode.db] [--project-id ID] \
   (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
-  [--estimate-size] [--vacuum] [--yes]
+  [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]
 ```
 
 Exactly one selector is required. Positive `N` means sessions; the canonical

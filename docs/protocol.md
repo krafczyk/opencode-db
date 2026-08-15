@@ -69,7 +69,7 @@ session-linked tables and triggers instead of silently omitting persisted state.
 The human-only active pruning grammar is:
 
 ```text
-opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--vacuum] [--yes]
+opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--timeout-seconds SECONDS] [--vacuum] [--yes]
 ```
 
 Exactly one selector is required. `N` is a positive base-10 session count.
@@ -105,9 +105,11 @@ otherwise they cover the complete candidate scope. Preview output never includes
 session IDs, titles, transcript content, payloads, or per-session deletion lines.
 Read-only planning and writer-side revalidation each cap the scoped candidate
 set at 250,000 sessions, each persisted session ID at 16 KiB, and captured
-candidate evidence at 64 MiB. Each phase has its own fixed ten-second execution
-deadline; exceeding a count, byte, or time bound refuses before authorization or
-deletion.
+candidate evidence at 64 MiB. Each phase has its own 300-second execution
+deadline by default. `--timeout-seconds` accepts finite positive seconds through
+86,400 and gives planning and application separate full windows; preview review
+and confirmation time consumes neither window. Exceeding a count, byte, or time
+bound refuses with a phase-specific diagnostic before authorization or deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after preview. Only
 exact lowercase `y` authorizes a remaining mutation; other input, EOF,

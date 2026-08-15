@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import math
 import re
 import sqlite3
 import sys
@@ -35,7 +36,6 @@ _MAX_NUMERIC_DIGITS = len(str(_MAX_VALUE))
 _BUSY_TIMEOUT_MS = 10_000
 _SELECTION_TABLE = "_opencode_db_prune_selection"
 _SELECTION_BATCH_SIZE = 1_000
-_PRUNE_TIMEOUT_SECONDS = 10.0
 _PRUNE_PROGRESS_OPCODES = 1_000
 _MAX_PRUNE_CANDIDATES = 250_000
 _MAX_PRUNE_SESSION_ID_BYTES = 16 * 1024
@@ -44,6 +44,12 @@ _TIME_PATTERN = re.compile(r"([1-9][0-9]*)([dmy])\Z")
 _SIZE_PATTERN = re.compile(r"([1-9][0-9]*)(B|KiB|MiB|GiB|TiB)\Z")
 _SIZE_MULTIPLIERS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
 _TIME_MULTIPLIERS_MS = {"d": 86_400_000, "m": 30 * 86_400_000, "y": 365 * 86_400_000}
+
+PRUNE_TIMEOUT_SECONDS = 300.0
+"""Default wall-clock limit for each prune planning or application phase."""
+
+MAX_PRUNE_TIMEOUT_SECONDS = 86_400.0
+"""Largest caller-selected prune phase timeout in seconds."""
 
 
 class PruneError(RuntimeError):
@@ -88,7 +94,8 @@ class PruneRequest:
 
     ``database`` is an absolute selected path, only one selector is populated,
     and optional flags control reporting, physical compaction, or explicit
-    confirmation bypass. The value has no SQLite or filesystem side effects.
+    confirmation bypass. ``timeout_seconds`` independently bounds planning and
+    application. The value has no SQLite or filesystem side effects.
     """
 
     database: str
@@ -100,6 +107,7 @@ class PruneRequest:
     vacuum: bool = False
     yes: bool = False
     command: str = "prune"
+    timeout_seconds: float = PRUNE_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -226,6 +234,30 @@ def parse_target_size(value: str) -> int:
     if numeric > _MAX_VALUE // multiplier:
         raise PruneError("target size is outside supported bounds")
     return numeric * multiplier
+
+
+def parse_prune_timeout(value: str | int | float) -> float:
+    """Validate one finite positive prune phase timeout.
+
+    Parameters: ``value`` is a numeric value or base-10 string in seconds.
+    Returns a finite float greater than zero and no greater than 86,400.
+    Raises :class:`PruneError` for booleans, malformed values, non-finite values,
+    zero, negatives, or values above the supported bound. Parsing performs no I/O.
+    """
+    if isinstance(value, bool):
+        raise PruneError("prune timeout seconds are outside supported finite bounds")
+    try:
+        timeout_seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise PruneError(
+            "prune timeout seconds require a finite positive number"
+        ) from error
+    if (
+        not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= MAX_PRUNE_TIMEOUT_SECONDS
+    ):
+        raise PruneError("prune timeout seconds are outside supported finite bounds")
+    return timeout_seconds
 
 
 def session_logical_bytes(connection: sqlite3.Connection, session_id: str) -> int:
@@ -397,15 +429,16 @@ def prune_sessions(
     estimate_size: bool = False,
     vacuum: bool = False,
     now_ms: int | None = None,
+    timeout_seconds: float = PRUNE_TIMEOUT_SECONDS,
 ) -> PruneOutcome:
     """Atomically prune selected sessions from one existing SQLite database.
 
     Parameters: ``database`` is an existing absolute regular file; ``project_id``
     optionally scopes candidates to one exact existing project; exactly one
     selector is supplied; ``estimate_size`` enables human reporting; ``vacuum``
-    requests post-commit physical compaction; and ``now_ms`` optionally fixes
-    the time selector clock. Returns committed counts and requested logical
-    estimates. Raises
+    requests post-commit physical compaction; ``now_ms`` optionally fixes the
+    time selector clock; and ``timeout_seconds`` independently bounds planning
+    and application. Returns committed counts and requested logical estimates. Raises
     :class:`PruneError` for selector, path, schema, project, or ownership
     refusals, :class:`PruneOperationalError` for bounded SQLite/filesystem
     failures, and :class:`PruneCommittedError` with the committed outcome when a
@@ -425,6 +458,7 @@ def prune_sessions(
             target_size=target_size,
             estimate_size=estimate_size,
             vacuum=vacuum,
+            timeout_seconds=timeout_seconds,
         ),
         now_ms=now_ms,
     )
@@ -447,6 +481,7 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
     """
     if not isinstance(request, PruneRequest):
         raise PruneError("prune request is malformed")
+    timeout_seconds = parse_prune_timeout(request.timeout_seconds)
     selector = _normalize_selector(request)
     captured_now_ms = _captured_now_ms(selector, now_ms)
     path = _prune_database_path(request.database)
@@ -454,14 +489,20 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
     deadline: float | None = None
     try:
         connection = _open_prune_read_connection(path)
-        deadline = time.monotonic() + _PRUNE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         _install_prune_deadline(connection, deadline)
         connection.execute("BEGIN")
         evidence = _evaluate_prune(
             connection, request, selector, captured_now_ms, deadline
         )
         return ReviewedPrunePlan(request, selector, evidence)
-    except PruneError:
+    except PruneError as error:
+        if (
+            isinstance(error, PruneOperationalError)
+            and deadline is not None
+            and time.monotonic() >= deadline
+        ):
+            raise PruneOperationalError("prune planning timed out") from error
         raise
     except TransferOperationalError as error:
         raise PruneOperationalError(str(error)) from error
@@ -495,6 +536,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
         raise PruneError("prune reviewed plan is malformed")
     if not isinstance(reviewed.evidence, PruneEvidence):
         raise PruneError("prune reviewed plan is malformed")
+    timeout_seconds = parse_prune_timeout(reviewed.request.timeout_seconds)
     if _normalize_selector(reviewed.request) != reviewed.selector:
         raise PruneError("prune reviewed plan is malformed")
     clock_required = reviewed.selector.name == "keep_newest" and reviewed.selector.kind == "time"
@@ -510,7 +552,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     try:
         connection = _open_prune_connection(path)
         connection.execute("BEGIN IMMEDIATE")
-        deadline = time.monotonic() + _PRUNE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         _install_prune_deadline(connection, deadline)
         connection.execute("PRAGMA defer_foreign_keys = ON")
         current = _evaluate_prune(
@@ -596,6 +638,12 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 "sessions were pruned but post-commit work failed; do not repeat the prune request",
                 outcome,
             ) from error
+        if (
+            isinstance(error, PruneOperationalError)
+            and deadline is not None
+            and time.monotonic() >= deadline
+        ):
+            raise PruneOperationalError("prune application timed out") from error
         raise
     except TransferOperationalError as error:
         raise PruneOperationalError(str(error)) from error
@@ -787,7 +835,7 @@ def _outcome_from_evidence(evidence: PruneEvidence) -> PruneOutcome:
 
 
 def _install_prune_deadline(connection: sqlite3.Connection, deadline: float) -> None:
-    """Interrupt SQLite work after the fixed planning or transaction deadline."""
+    """Interrupt SQLite work after the selected planning or transaction deadline."""
     connection.set_progress_handler(
         lambda: int(time.monotonic() >= deadline), _PRUNE_PROGRESS_OPCODES
     )
