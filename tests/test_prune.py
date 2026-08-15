@@ -891,6 +891,102 @@ class SessionPruneTests(unittest.TestCase):
             self.assertIn("do not repeat the prune request", stderr)
             self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
 
+    def test_post_commit_cleanup_failures_report_the_committed_prune(self) -> None:
+        """Keep the committed count and retry warning when post-commit cleanup fails."""
+        for failure in ("progress clear", "close"):
+            with self.subTest(failure=failure), self._temporary_directory() as root:
+                database = root / "opencode.db"
+                self._create_database(database)
+                self._insert_sessions(database)
+                open_connection = prune_module._open_prune_connection
+
+                def open_failing_connection(path: Path) -> _CleanupFailingConnection:
+                    return _CleanupFailingConnection(open_connection(path), failure)
+
+                with patch.object(
+                    prune_module, "_open_prune_connection", side_effect=open_failing_connection
+                ):
+                    code, stdout, stderr = self._run(
+                        [
+                            "prune",
+                            "--db",
+                            str(database),
+                            "--project-id",
+                            "a",
+                            "--oldest",
+                            "1",
+                            "--yes",
+                        ]
+                    )
+
+                self.assertEqual(code, EXIT_OPERATIONAL_FAILURE)
+                self.assertIn("pruned_sessions: 1", stdout)
+                self.assertIn("do not repeat the prune request", stderr)
+                self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+
+    def test_post_commit_cleanup_preserves_vacuum_failure_reporting(self) -> None:
+        """Do not let cleanup replace the committed vacuum-failure classification."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            open_connection = prune_module._open_prune_connection
+
+            def open_failing_connection(path: Path) -> _CleanupFailingConnection:
+                return _CleanupFailingConnection(open_connection(path), "close")
+
+            with patch.object(
+                prune_module, "_open_prune_connection", side_effect=open_failing_connection
+            ), patch.object(
+                prune_module,
+                "_vacuum",
+                side_effect=PruneOperationalError("database vacuum failed"),
+            ):
+                code, stdout, stderr = self._run(
+                    [
+                        "prune",
+                        "--db",
+                        str(database),
+                        "--project-id",
+                        "a",
+                        "--oldest",
+                        "1",
+                        "--vacuum",
+                        "--yes",
+                    ]
+                )
+
+            self.assertEqual(code, EXIT_OPERATIONAL_FAILURE)
+            self.assertIn("pruned_sessions: 1", stdout)
+            self.assertIn("do not repeat the prune request", stderr)
+            self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+
+    def test_commit_lock_wait_respects_the_transaction_deadline_and_rolls_back(self) -> None:
+        """Limit rollback-journal commit lock waits to the writer transaction deadline."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            reviewed = plan_prune(PruneRequest(str(database), project_id="a", oldest="1"))
+            before = self._session_ids(database)
+            reader = sqlite3.connect(database, isolation_level=None)
+            try:
+                self.assertEqual(reader.execute("PRAGMA journal_mode = DELETE").fetchone(), ("delete",))
+                reader.execute("BEGIN")
+                reader.execute("SELECT id FROM session").fetchall()
+                started = time.monotonic()
+                with patch.object(prune_module, "_PRUNE_TIMEOUT_SECONDS", 0.1):
+                    with self.assertRaisesRegex(PruneOperationalError, "application timed out"):
+                        apply_prune_plan(reviewed)
+                elapsed = time.monotonic() - started
+            finally:
+                reader.rollback()
+                reader.close()
+
+            self.assertGreaterEqual(elapsed, 0.04)
+            self.assertLessEqual(elapsed, 0.75)
+            self.assertEqual(self._session_ids(database), before)
+
     @staticmethod
     @contextmanager
     def _temporary_directory():
@@ -1109,6 +1205,31 @@ class _FlushTrackingTty(_TtyStream):
         """Record and complete one buffered preview flush."""
         self.flush_count += 1
         super().flush()
+
+
+class _CleanupFailingConnection:
+    """Delegate SQLite work while failing one requested post-commit cleanup action."""
+
+    def __init__(self, connection: sqlite3.Connection, failure: str) -> None:
+        """Wrap ``connection`` and select either progress-clear or close failure."""
+        self._connection = connection
+        self._failure = failure
+
+    def __getattr__(self, name: str) -> object:
+        """Delegate unmodified SQLite connection behavior to the real connection."""
+        return getattr(self._connection, name)
+
+    def set_progress_handler(self, handler: object, instructions: int) -> None:
+        """Fail only when the application clears its post-commit deadline handler."""
+        self._connection.set_progress_handler(handler, instructions)
+        if self._failure == "progress clear" and handler is None:
+            raise sqlite3.OperationalError("injected progress cleanup failure")
+
+    def close(self) -> None:
+        """Close the real connection before reporting the injected cleanup failure."""
+        self._connection.close()
+        if self._failure == "close":
+            raise sqlite3.OperationalError("injected close cleanup failure")
 
 
 if __name__ == "__main__":

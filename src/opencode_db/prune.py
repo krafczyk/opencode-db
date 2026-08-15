@@ -64,16 +64,16 @@ class PruneOperationalError(PruneError):
 
     This subtype distinguishes an unavailable writer, validation failure, or
     vacuum failure from a schema or selector safety refusal. A successful delete
-    commit remains durable if a later requested vacuum fails.
+    commit is instead reported by :class:`PruneCommittedError` if later work fails.
     """
 
 
 class PruneCommittedError(PruneOperationalError):
-    """Report a failed post-commit vacuum while preserving the prune outcome.
+    """Report failed post-commit work while preserving the prune outcome.
 
     ``outcome`` records the deletion that committed before physical compaction
-    failed. Callers must report that committed state so an operator does not
-    repeat a destructive selector while trying to retry only the vacuum.
+    or connection cleanup failed. Callers must report that committed state so an
+    operator does not repeat a destructive selector while retrying later work.
     """
 
     def __init__(self, message: str, outcome: "PruneOutcome") -> None:
@@ -485,7 +485,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     instructs the caller to rerun before any deletion; raises
     :class:`PruneOperationalError` for bounded writer, SQLite, deadline, or
     cleanup failures; and raises :class:`PruneCommittedError` if post-commit
-    vacuum fails.  It opens SQLite ``mode=rw``, acquires a writer transaction
+    work fails. It opens SQLite ``mode=rw``, acquires a writer transaction
     only after review, deletes known selected state on an exact revalidation,
     and rolls back every uncommitted change.
     """
@@ -506,6 +506,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
     committed = False
+    outcome: PruneOutcome | None = None
     try:
         connection = _open_prune_connection(path)
         connection.execute("BEGIN IMMEDIATE")
@@ -550,17 +551,29 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 else None
             )
             _check_prune_deadline(deadline)
+            outcome = PruneOutcome(
+                len(deleted_ids),
+                current.preview.projected_logical_bytes_deleted,
+                logical_database_bytes,
+                None,
+            )
+            remaining_commit_timeout_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_commit_timeout_ms <= 0:
+                raise PruneOperationalError("prune operation timed out")
+            connection.execute(f"PRAGMA busy_timeout = {remaining_commit_timeout_ms}")
             connection.commit()
             committed = True
+            _check_prune_deadline(deadline)
         else:
             logical_database_bytes = current.preview.projected_logical_database_bytes_after_prune
             connection.rollback()
-        outcome = PruneOutcome(
-            len(deleted_ids),
-            current.preview.projected_logical_bytes_deleted,
-            logical_database_bytes,
-            None,
-        )
+            outcome = PruneOutcome(
+                len(deleted_ids),
+                current.preview.projected_logical_bytes_deleted,
+                logical_database_bytes,
+                None,
+            )
+        assert outcome is not None
         connection.set_progress_handler(None, 0)
         if reviewed.request.vacuum:
             try:
@@ -574,18 +587,34 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 raise PruneOperationalError("database vacuum failed") from error
             outcome = replace(outcome, physical_database_bytes=physical_database_bytes)
         return outcome
-    except PruneError:
+    except PruneCommittedError:
+        raise
+    except PruneError as error:
+        if committed:
+            assert outcome is not None
+            raise PruneCommittedError(
+                "sessions were pruned but post-commit work failed; do not repeat the prune request",
+                outcome,
+            ) from error
         raise
     except TransferOperationalError as error:
         raise PruneOperationalError(str(error)) from error
     except TransferError as error:
         raise PruneError(str(error)) from error
     except (sqlite3.Error, OSError, ValueError, OverflowError) as error:
+        if committed:
+            assert outcome is not None
+            raise PruneCommittedError(
+                "sessions were pruned but post-commit work failed; do not repeat the prune request",
+                outcome,
+            ) from error
         if deadline is not None and time.monotonic() >= deadline:
             raise PruneOperationalError("prune application timed out") from error
         raise PruneOperationalError("session prune failed") from error
     finally:
-        _cleanup_prune_connection(connection, "application", sys.exception())
+        _cleanup_prune_connection(
+            connection, "application", sys.exception(), outcome if committed else None
+        )
 
 
 def database_logical_bytes(
@@ -771,9 +800,12 @@ def _check_prune_deadline(deadline: float | None) -> None:
 
 
 def _cleanup_prune_connection(
-    connection: sqlite3.Connection | None, phase: str, original: BaseException | None
+    connection: sqlite3.Connection | None,
+    phase: str,
+    original: BaseException | None,
+    committed_outcome: PruneOutcome | None = None,
 ) -> None:
-    """Clear deadlines, confirm rollback, and close without leaking SQLite details."""
+    """Clear deadlines, confirm rollback, and close without masking committed pruning."""
     if connection is None:
         return
     failure: sqlite3.Error | None = None
@@ -792,11 +824,21 @@ def _cleanup_prune_connection(
             failure = error
     if failure is None:
         return
+    if isinstance(original, PruneCommittedError):
+        raise original
     message = (
         f"prune {phase} rollback could not be confirmed"
         if rollback_failed
         else f"prune {phase} cleanup could not be confirmed"
     )
+    if committed_outcome is not None:
+        committed = PruneCommittedError(
+            "sessions were pruned but application cleanup failed; do not repeat the prune request",
+            committed_outcome,
+        )
+        if original is not None:
+            raise committed from original
+        raise committed from failure
     operational = PruneOperationalError(message)
     if original is not None:
         raise operational from original
