@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -62,6 +63,9 @@ REVALIDATION_TIMEOUT_SECONDS = 10.0
 
 WRITER_TRANSACTION_TIMEOUT_SECONDS = 10.0
 """Maximum wall-clock time for all work after the writer transaction begins."""
+
+MAX_WRITER_TRANSACTION_TIMEOUT_SECONDS = 86_400.0
+"""Largest caller-selected writer transaction timeout in seconds."""
 
 SQLITE_PROGRESS_OPCODES = 1_000
 """SQLite virtual-machine instructions between transaction deadline checks."""
@@ -264,6 +268,7 @@ def apply_sibling_move(
     reviewed: ReviewedMovePlan,
     *,
     progress: Callable[[str, int | None, int | None, bool], None] | None = None,
+    application_timeout_seconds: float | None = None,
 ) -> None:
     """Atomically apply one previously reviewed sibling move plan.
 
@@ -273,7 +278,10 @@ def apply_sibling_move(
     :class:`MoveError` when the reviewed state, schema, directory, Git evidence,
     target project-directory keys, integrity, or foreign keys have changed or are
     invalid; ``progress``, when supplied, receives fixed revalidation and update
-    group aggregate observations without affecting the transaction. Raises
+    group aggregate observations without affecting the transaction.
+    ``application_timeout_seconds`` overrides the finite positive writer
+    transaction deadline and defaults to
+    :data:`WRITER_TRANSACTION_TIMEOUT_SECONDS`. Raises
     :class:`MoveOperationalError` if SQLite cannot acquire its
     bounded writer lock or perform the transaction. The function writes only the
     selected project's worktree, sandbox JSON, project-directory keys, session
@@ -284,6 +292,17 @@ def apply_sibling_move(
     """
     if not isinstance(reviewed, ReviewedMovePlan):
         raise MoveError("move reviewed plan is malformed")
+    timeout_seconds = (
+        WRITER_TRANSACTION_TIMEOUT_SECONDS
+        if application_timeout_seconds is None
+        else application_timeout_seconds
+    )
+    if (
+        type(timeout_seconds) not in (int, float)
+        or not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= MAX_WRITER_TRANSACTION_TIMEOUT_SECONDS
+    ):
+        raise MoveError("move application timeout is outside supported finite bounds")
     database = _existing_database(reviewed.request.database)
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
@@ -294,7 +313,7 @@ def apply_sibling_move(
         if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
             raise MoveOperationalError("move SQLite foreign keys could not be enabled")
         connection.execute("BEGIN IMMEDIATE")
-        deadline = time.monotonic() + WRITER_TRANSACTION_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         _install_transaction_deadline(connection, deadline)
         _check_transaction_deadline(deadline)
         _validate_database_health(connection, deadline)

@@ -106,7 +106,7 @@ idempotent and does not alter unrelated project state.
 The human-only metadata move grammar is:
 
 ```text
-opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--yes] [--progress]
+opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--application-timeout-seconds SECONDS] [--yes] [--progress]
 ```
 
 `--project-id` and `--target-project-dir` are required. `--method` defaults to
@@ -135,6 +135,11 @@ the command revalidates and atomically updates only supported structured
 worktree, sandbox, project-directory, session-directory, and non-null
 workspace-directory fields. Historical messages, prompts, tools, output, and
 other free-form content are not rewritten.
+
+Application uses a 10-second writer transaction deadline by default.
+`--application-timeout-seconds` accepts finite positive seconds up to 86,400
+and overrides only that post-confirmation deadline. SQLite writer-lock
+acquisition and individual Git probes keep their independent fixed bounds.
 
 `--progress` is opt-in. It writes only fixed phase labels and aggregate counts to
 stderr: bounded collection, Git-pair validation, revalidation, and update

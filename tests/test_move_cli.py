@@ -30,7 +30,8 @@ class MoveCliTests(unittest.TestCase):
         """Accept only sibling selectors before any planner access."""
         arguments = [
             "mv", "--project-id", "project", "--target-project-dir", "/target/main",
-            "--db", "/tmp/opencode.db", "--method", "sibling", "--yes", "--progress",
+            "--db", "/tmp/opencode.db", "--method", "sibling",
+            "--application-timeout-seconds", "60.5", "--yes", "--progress",
         ]
 
         request = cli.parse_command(arguments)
@@ -40,18 +41,24 @@ class MoveCliTests(unittest.TestCase):
         self.assertEqual(request.method, "sibling")
         self.assertTrue(request.yes)
         self.assertTrue(request.progress)
+        self.assertEqual(request.application_timeout_seconds, 60.5)
         with patch.dict(os.environ, {"XDG_DATA_HOME": "/xdg", "HOME": "relative"}, clear=True):
             defaulted = cli.parse_command(
                 ["mv", "--project-id", "project", "--target-project-dir", "/target/main"]
             )
         self.assertEqual(defaulted.database, "/xdg/opencode/opencode.db")
         self.assertEqual(defaulted.method, "sibling")
+        self.assertEqual(defaulted.application_timeout_seconds, 10.0)
         for rejected in (
             ["mv", "--project-id", "project"],
             ["mv", "--project-id", "project", "--project-id", "other", "--target-project-dir", "/target/main"],
             ["mv", "--project-id", "project", "--target-project-dir", "relative"],
             ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--method", "other"],
             ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--json"],
+            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--application-timeout-seconds"],
+            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--application-timeout-seconds", "0"],
+            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--application-timeout-seconds", "nan"],
+            ["mv", "--project-id", "project", "--target-project-dir", "/target/main", "--application-timeout-seconds", "86401"],
         ):
             with self.subTest(arguments=rejected):
                 stderr = io.StringIO()
@@ -221,8 +228,14 @@ class MoveCliTests(unittest.TestCase):
             progress("Git pair validation", 1, 1, True)
             return reviewed
 
-        def fail_during_revalidation(_reviewed: object, *, progress: object = None) -> None:
+        def fail_during_revalidation(
+            _reviewed: object,
+            *,
+            progress: object = None,
+            application_timeout_seconds: float,
+        ) -> None:
             assert callable(progress)
+            self.assertEqual(application_timeout_seconds, 10.0)
             progress("revalidation", 0, 1, False)
             raise move_cli.MoveOperationalError("git is unavailable")
 
@@ -259,6 +272,36 @@ class MoveCliTests(unittest.TestCase):
         self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
         self.assertIn("schema is incomplete", stderr.getvalue())
         apply.assert_not_called()
+
+    def test_mv_forwards_application_timeout_to_atomic_apply(self) -> None:
+        """Pass the validated timeout override only to the application boundary."""
+        reviewed = _reviewed_move()
+        with patch.object(move_cli, "plan_sibling_move", return_value=reviewed), patch.object(
+            move_cli, "apply_sibling_move"
+        ) as apply:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "mv",
+                        "--project-id",
+                        "project",
+                        "--target-project-dir",
+                        "/target/main",
+                        "--db",
+                        "/tmp/opencode.db",
+                        "--application-timeout-seconds",
+                        "45.25",
+                        "--yes",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        apply.assert_called_once_with(
+            reviewed,
+            progress=None,
+            application_timeout_seconds=45.25,
+        )
 
     def test_mv_keeps_actionable_planner_refusals_on_stderr(self) -> None:
         """Preserve missing-location categories and quoted paths through the CLI boundary."""

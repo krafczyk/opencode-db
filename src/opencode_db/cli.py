@@ -938,7 +938,7 @@ def _wants_help(values: Sequence[str]) -> bool:
 def _help_text(values: Sequence[str]) -> str:
     command = values[0] if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session"} else " ".join(values[:2])
     synopses = {
-        "mv": "opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--yes] [--progress]",
+        "mv": "opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--application-timeout-seconds SECONDS] [--yes] [--progress]",
         "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB]",
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID",

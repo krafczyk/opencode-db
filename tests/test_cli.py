@@ -270,6 +270,7 @@ class CliContractTests(unittest.TestCase):
             self.assertIn("`cleanup prune`", text)
             self.assertIn("absolute", text)
             self.assertIn("OpenCode", text)
+            self.assertIn("--application-timeout-seconds", text)
         self.assertIn("[--db", protocol)
         self.assertIn("Add `--db /absolute/path", readme)
         self.assertIn("Linux only", readme)

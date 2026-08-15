@@ -631,6 +631,22 @@ class MovePlanningTests(unittest.TestCase):
             _source_parent, target_parent, database = self._fixture(root)
             reviewed = plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
 
+            def short_delay(group: str) -> None:
+                if group == "project":
+                    time.sleep(0.02)
+
+            with mock.patch.object(move, "_after_move_update_group", side_effect=short_delay):
+                apply_sibling_move(reviewed, application_timeout_seconds=1.0)
+
+        for invalid_timeout in (0, -1, float("inf"), float("nan"), True, 86_401):
+            with self.subTest(invalid_timeout=invalid_timeout):
+                with self.assertRaisesRegex(MoveError, "application timeout"):
+                    apply_sibling_move(reviewed, application_timeout_seconds=invalid_timeout)
+
+        with _temporary_directory() as root:
+            _source_parent, target_parent, database = self._fixture(root)
+            reviewed = plan_sibling_move(MoveRequest(database, "project", str(target_parent / "main")))
+
             def failing_progress(_phase: str, _completed: int | None, _total: int | None, _complete: bool) -> None:
                 raise RuntimeError("observer failed")
 

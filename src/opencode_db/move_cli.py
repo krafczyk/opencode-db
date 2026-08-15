@@ -11,13 +11,16 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 
 from .model import EXIT_OPERATIONAL_FAILURE, EXIT_PRECONDITION_REFUSED
 from .move import (
     MoveError,
+    MAX_WRITER_TRANSACTION_TIMEOUT_SECONDS,
     MoveOperationalError,
     MoveRequest,
     ReviewedMovePlan,
+    WRITER_TRANSACTION_TIMEOUT_SECONDS,
     apply_sibling_move,
     plan_sibling_move,
 )
@@ -33,7 +36,8 @@ class MoveCommandRequest:
     ``database`` is an explicit or bounded-default absolute path, ``project_id``
     selects one stored project, and ``target_project_dir`` is its copied target
     main worktree. ``method`` is presently always ``sibling``; ``yes`` bypasses
-    only terminal confirmation; and ``progress`` enables stderr-only progress.
+    only terminal confirmation; ``progress`` enables stderr-only progress; and
+    ``application_timeout_seconds`` sets the finite writer transaction deadline.
     Constructing this value has no SQLite, Git, filesystem, or stream effects.
     """
 
@@ -43,6 +47,7 @@ class MoveCommandRequest:
     method: str
     yes: bool
     progress: bool
+    application_timeout_seconds: float
 
     @property
     def command(self) -> str:
@@ -68,7 +73,15 @@ def parse_move_command(
     unsupported options. This parser neither opens SQLite nor executes Git.
     """
     command = "mv"
-    allowed = {"project-id", "target-project-dir", "db", "method", "yes", "progress"}
+    allowed = {
+        "project-id",
+        "target-project-dir",
+        "db",
+        "method",
+        "yes",
+        "progress",
+        "application-timeout-seconds",
+    }
     required = {"project-id", "target-project-dir"}
     booleans = {"yes", "progress"}
     options: MoveOptions = {}
@@ -105,6 +118,24 @@ def parse_move_command(
         if "db" in options
         else default_database(command)
     )
+    application_timeout_seconds = WRITER_TRANSACTION_TIMEOUT_SECONDS
+    if "application-timeout-seconds" in options:
+        timeout_value = option(options, "application-timeout-seconds")
+        try:
+            application_timeout_seconds = float(timeout_value)
+        except ValueError as error:
+            raise usage_error(
+                command,
+                "--application-timeout-seconds requires finite positive seconds.",
+            ) from error
+        if (
+            not math.isfinite(application_timeout_seconds)
+            or not 0 < application_timeout_seconds <= MAX_WRITER_TRANSACTION_TIMEOUT_SECONDS
+        ):
+            raise usage_error(
+                command,
+                "--application-timeout-seconds is outside supported finite bounds.",
+            )
     return MoveCommandRequest(
         database,
         project_id,
@@ -112,6 +143,7 @@ def parse_move_command(
         method,
         bool(options.get("yes")),
         bool(options.get("progress")),
+        application_timeout_seconds,
     )
 
 
@@ -151,7 +183,11 @@ def execute_move(request: MoveCommandRequest, *, stdin: object, stdout: object, 
             if response.removesuffix("\n").removesuffix("\r") != "y":
                 stderr.write("opencode-db: move cancelled; no changes were applied\n")
                 return EXIT_PRECONDITION_REFUSED
-        apply_sibling_move(reviewed, progress=callback)
+        apply_sibling_move(
+            reviewed,
+            progress=callback,
+            application_timeout_seconds=request.application_timeout_seconds,
+        )
     except MoveOperationalError as error:
         if reporter is not None:
             reporter.fail()

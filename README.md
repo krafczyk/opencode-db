@@ -135,7 +135,8 @@ use, and finally performs any old-directory cleanup separately.
 ```bash
 opencode-db mv --project-id ID \
   --target-project-dir /absolute/new-parent/project \
-  [--db /absolute/path/opencode.db] [--method sibling] [--yes] [--progress]
+  [--db /absolute/path/opencode.db] [--method sibling] \
+  [--application-timeout-seconds SECONDS] [--yes] [--progress]
 ```
 
 `--project-id` and `--target-project-dir` are required. `--method` defaults to
@@ -151,6 +152,11 @@ after the input line ending is removed authorizes the transaction. Any other
 input, end-of-input, or interruption cancels without applying metadata changes.
 `--yes` bypasses only that prompt, never the preview, filesystem checks, Git
 correspondence checks, schema checks, or freshness-bound transaction.
+
+The post-confirmation SQLite writer transaction has a 10-second deadline by
+default. `--application-timeout-seconds` accepts finite positive seconds up to
+86,400 and changes only that complete application deadline; writer-lock
+acquisition and individual Git probes retain their separate bounded timeouts.
 
 `--progress` is opt-in and writes only fixed phase labels and aggregate counts
 to stderr. Terminal stderr may redraw an ASCII bar; redirected stderr receives
