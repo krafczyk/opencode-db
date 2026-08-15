@@ -34,6 +34,7 @@ _MAX_VALUE = (1 << 63) - 1
 _MAX_NUMERIC_DIGITS = len(str(_MAX_VALUE))
 _BUSY_TIMEOUT_MS = 10_000
 _SELECTION_TABLE = "_opencode_db_prune_selection"
+_SELECTION_BATCH_SIZE = 1_000
 _PRUNE_TIMEOUT_SECONDS = 10.0
 _PRUNE_PROGRESS_OPCODES = 1_000
 _MAX_PRUNE_CANDIDATES = 250_000
@@ -138,13 +139,12 @@ class PruneEvidence:
     """Capture immutable private selection and displayed evidence from one snapshot.
 
     ``selected_session_ids`` is retained only for exact writer-side freshness
-    comparison and is intentionally omitted from representations.  ``now_ms``
-    is the sole clock captured by planning, preventing elapsed authorization
-    time from changing time-based retention.  The value neither authorizes nor
-    performs a mutation.
+    comparison and is intentionally omitted from representations. ``now_ms`` is
+    the sole clock captured for time-based ``keep_newest`` planning and is
+    otherwise ``None``. The value neither authorizes nor performs a mutation.
     """
 
-    now_ms: int
+    now_ms: int | None
     selected_session_ids: tuple[str, ...] = field(repr=False)
     preview: PrunePreview
 
@@ -428,8 +428,6 @@ def prune_sessions(
         ),
         now_ms=now_ms,
     )
-    if not reviewed.evidence.selected_session_ids and not vacuum:
-        return _outcome_from_evidence(reviewed.evidence)
     return apply_prune_plan(reviewed)
 
 
@@ -438,7 +436,8 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
 
     Parameters: ``request`` identifies an existing selected database, optional
     project scope, exactly one retention selector, and size/vacuum options;
-    ``now_ms`` optionally supplies the single clock value used by time selectors.
+    ``now_ms`` optionally supplies the single clock value used by time-based
+    ``keep_newest`` selection and is ignored by selectors that do not use time.
     Returns immutable :class:`ReviewedPrunePlan` evidence that authorizes no
     mutation.  Raises :class:`PruneError` for malformed request, path, schema,
     selector, ownership, or capped evidence; raises :class:`PruneOperationalError`
@@ -449,7 +448,7 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
     if not isinstance(request, PruneRequest):
         raise PruneError("prune request is malformed")
     selector = _normalize_selector(request)
-    captured_now_ms = _captured_now_ms(now_ms)
+    captured_now_ms = _captured_now_ms(selector, now_ms)
     path = _prune_database_path(request.database)
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
@@ -494,10 +493,15 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
         raise PruneError("prune reviewed plan is malformed")
     if not isinstance(reviewed.request, PruneRequest) or not isinstance(reviewed.selector, PruneSelector):
         raise PruneError("prune reviewed plan is malformed")
-    if not isinstance(reviewed.evidence, PruneEvidence) or type(reviewed.evidence.now_ms) is not int:
+    if not isinstance(reviewed.evidence, PruneEvidence):
         raise PruneError("prune reviewed plan is malformed")
     if _normalize_selector(reviewed.request) != reviewed.selector:
         raise PruneError("prune reviewed plan is malformed")
+    clock_required = reviewed.selector.name == "keep_newest" and reviewed.selector.kind == "time"
+    if clock_required != (type(reviewed.evidence.now_ms) is int):
+        raise PruneError("prune reviewed plan is malformed")
+    if not reviewed.evidence.selected_session_ids and not reviewed.request.vacuum:
+        return _outcome_from_evidence(reviewed.evidence)
     path = _prune_database_path(reviewed.request.database)
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
@@ -631,8 +635,10 @@ def _normalize_selector(request: PruneRequest) -> PruneSelector:
     return PruneSelector(name, kind, value)
 
 
-def _captured_now_ms(now_ms: int | None) -> int:
+def _captured_now_ms(selector: PruneSelector, now_ms: int | None) -> int | None:
     """Resolve and validate the one wall-clock value reused across both phases."""
+    if selector.name != "keep_newest" or selector.kind != "time":
+        return None
     captured = int(time.time() * 1000) if now_ms is None else now_ms
     if type(captured) is not int:
         raise PruneError("prune clock is malformed")
@@ -655,7 +661,7 @@ def _evaluate_prune(
     connection: sqlite3.Connection,
     request: PruneRequest,
     selector: PruneSelector,
-    now_ms: int,
+    now_ms: int | None,
     deadline: float,
 ) -> PruneEvidence:
     """Collect exactly the selection and preview evidence under one connection view."""
@@ -682,23 +688,16 @@ def _evaluate_prune(
         )
     deleted_ids = tuple(
         _select_deleted_ids(
-            candidates,
-            selector.name,
-            selector.kind,
-            selector.value,
-            logical_sizes,
-            now_ms=now_ms,
-            deadline=deadline,
+            candidates, selector, logical_sizes, now_ms=now_ms, deadline=deadline
         )
     )
     selected = set(deleted_ids)
     oldest_survivor: int | None = None
-    for session_id, updated in candidates:
+    for session_id, updated in reversed(candidates):
         _check_prune_deadline(deadline)
-        if session_id not in selected and (
-            oldest_survivor is None or updated < oldest_survivor
-        ):
+        if session_id not in selected:
             oldest_survivor = updated
+            break
     deleted_bytes: int | None = None
     database_after: int | None = None
     if request.estimate_size:
@@ -729,29 +728,22 @@ def _validate_logical_size_evidence(
     deadline: float,
 ) -> None:
     """Require complete bounded size evidence for the already bounded candidate set."""
-    candidate_ids: set[str] = set()
+    if len(logical_sizes) != len(candidates):
+        raise PruneError("database logical size estimate is invalid")
     for session_id, _updated in candidates:
         _check_prune_deadline(deadline)
-        candidate_ids.add(session_id)
         evidence_bytes += 8
         if evidence_bytes > _MAX_PRUNE_EVIDENCE_BYTES:
             raise PruneOperationalError("prune candidate evidence exceeds supported bounds")
-    if set(logical_sizes) != candidate_ids:
-        raise PruneError("database logical size estimate is invalid")
+        if session_id not in logical_sizes:
+            raise PruneError("database logical size estimate is invalid")
 
 
 def _same_reviewed_evidence(expected: PruneEvidence, current: PruneEvidence) -> bool:
     """Compare only selection and preview fields that were authorized for mutation."""
     return (
         expected.selected_session_ids == current.selected_session_ids
-        and expected.preview.sessions_to_prune == current.preview.sessions_to_prune
-        and expected.preview.sessions_to_keep == current.preview.sessions_to_keep
-        and expected.preview.oldest_surviving_session_updated
-        == current.preview.oldest_surviving_session_updated
-        and expected.preview.projected_logical_bytes_deleted
-        == current.preview.projected_logical_bytes_deleted
-        and expected.preview.projected_logical_database_bytes_after_prune
-        == current.preview.projected_logical_database_bytes_after_prune
+        and expected.preview == current.preview
     )
 
 
@@ -872,7 +864,9 @@ def _candidate_sessions(
     where = "WHERE project_id = ?" if project_id is not None else ""
     parameters: tuple[object, ...] = (project_id,) if project_id is not None else ()
     rows = connection.execute(
-        f"SELECT id, time_updated FROM session {where} ORDER BY time_updated DESC, id ASC", parameters
+        f"SELECT id, time_updated FROM session {where} "
+        f"ORDER BY time_updated DESC, id ASC LIMIT {_MAX_PRUNE_CANDIDATES + 1}",
+        parameters,
     )
     candidates: list[tuple[str, int]] = []
     evidence_bytes = 0
@@ -910,26 +904,24 @@ def _validate_global_session_ids(connection: sqlite3.Connection) -> None:
 
 def _select_deleted_ids(
     candidates: list[tuple[str, int]],
-    selector_name: str,
-    selector_kind: str,
-    selector_value: int,
+    selector: PruneSelector,
     logical_sizes: dict[str, int] | None,
     *,
     now_ms: int | None,
     deadline: float | None = None,
 ) -> list[str]:
-    if selector_name == "oldest":
-        return _oldest_selection(candidates, selector_kind, selector_value)
-    if selector_name == "keep_newest":
-        return _keep_newest_selection(candidates, selector_kind, selector_value, now_ms)
-    if selector_name == "target_size":
+    if selector.name == "oldest":
+        return _oldest_selection(candidates, selector.kind, selector.value)
+    if selector.name == "keep_newest":
+        return _keep_newest_selection(candidates, selector.kind, selector.value, now_ms)
+    if selector.name == "target_size":
         if logical_sizes is None:
             raise AssertionError("target-size selection requires logical estimates")
         retained = 0
         for index, (session_id, _updated) in enumerate(candidates):
             _check_prune_deadline(deadline)
             estimate = logical_sizes[session_id]
-            if retained + estimate > selector_value:
+            if retained + estimate > selector.value:
                 selected: list[str] = []
                 for candidate_id, _time in candidates[index:]:
                     _check_prune_deadline(deadline)
@@ -957,8 +949,9 @@ def _keep_newest_selection(
 ) -> list[str]:
     if kind == "count":
         return [session_id for session_id, _updated in candidates[value:]]
-    cutoff = int(time.time() * 1000) if now_ms is None else now_ms
-    cutoff -= value
+    if type(now_ms) is not int:
+        raise PruneError("prune clock is malformed")
+    cutoff = now_ms - value
     return [session_id for session_id, updated in candidates if updated < cutoff]
 
 
@@ -966,10 +959,12 @@ def _prepare_selection(
     connection: sqlite3.Connection, session_ids: tuple[str, ...], deadline: float | None = None
 ) -> None:
     connection.execute(f"CREATE TEMP TABLE {_quote(_SELECTION_TABLE)} (id TEXT PRIMARY KEY)")
-    for session_id in session_ids:
+    statement = f"INSERT INTO temp.{_quote(_SELECTION_TABLE)} VALUES (?)"
+    for offset in range(0, len(session_ids), _SELECTION_BATCH_SIZE):
         _check_prune_deadline(deadline)
-        connection.execute(
-            f"INSERT INTO temp.{_quote(_SELECTION_TABLE)} VALUES (?)", (session_id,)
+        connection.executemany(
+            statement,
+            ((session_id,) for session_id in session_ids[offset : offset + _SELECTION_BATCH_SIZE]),
         )
 
 

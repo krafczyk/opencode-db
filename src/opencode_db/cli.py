@@ -501,11 +501,7 @@ def _execute_prune(request: PruneRequest) -> int:
         reviewed = plan_prune(request)
         _render_prune_preview(reviewed, sys.stdout)
         if reviewed.preview.sessions_to_prune == 0 and not request.vacuum:
-            outcome = PruneOutcome(
-                0,
-                reviewed.preview.projected_logical_bytes_deleted,
-                reviewed.preview.projected_logical_database_bytes_after_prune,
-            )
+            outcome = apply_prune_plan(reviewed)
             sys.stdout.write(_render_prune_outcome(request, outcome))
             return 0
         if not request.yes:
@@ -514,7 +510,7 @@ def _execute_prune(request: PruneRequest) -> int:
                     "opencode-db: prune requires terminal stdin and stdout unless --yes; no changes were applied\n"
                 )
                 return EXIT_PRECONDITION_REFUSED
-            _write_prune_confirmation_prompt(reviewed, request, sys.stdout)
+            _write_prune_confirmation_prompt(reviewed, sys.stdout)
             try:
                 response = sys.stdin.readline()
             except KeyboardInterrupt:
@@ -596,38 +592,36 @@ def _render_prune_preview_timestamp(value: int | None) -> str:
             datetime(1970, 1, 1, tzinfo=timezone.utc)
             + timedelta(seconds=seconds, milliseconds=milliseconds)
         ).astimezone()
-        if rendered.utcoffset() is None:
-            raise ValueError("local timestamp has no offset")
         return rendered.isoformat()
     except (OSError, OverflowError, ValueError) as error:
         raise PruneError("prune preview timestamp is invalid") from error
 
 
-def _prune_confirmation_prompt(reviewed: ReviewedPrunePlan, request: PruneRequest) -> str:
+def _prune_confirmation_prompt(reviewed: ReviewedPrunePlan) -> str:
     """Return the exact confirmation prompt for the reviewed remaining mutation.
 
     Parameters: ``reviewed`` provides aggregate selected-session count and
-    ``request`` carries the vacuum option. Returns the terminal prompt for a
-    prune, vacuum, or both; it performs no I/O and exposes no private evidence.
+    the reviewed request carries the vacuum option. Returns the terminal prompt
+    for a prune, vacuum, or both; it performs no I/O and exposes no private evidence.
     """
     if reviewed.preview.sessions_to_prune == 0:
         return "Vacuum database? [y/N] "
-    if request.vacuum:
+    if reviewed.request.vacuum:
         return "Prune matching sessions and vacuum database? [y/N] "
     return "Prune matching sessions? [y/N] "
 
 
 def _write_prune_confirmation_prompt(
-    reviewed: ReviewedPrunePlan, request: PruneRequest, stdout: object
+    reviewed: ReviewedPrunePlan, stdout: object
 ) -> None:
     """Write and flush the complete prompt before reading authorization input.
 
-    Parameters: ``reviewed`` and ``request`` select the mutation-specific prompt;
-    ``stdout`` is the already validated terminal stream. Returns ``None`` after
+    Parameters: ``reviewed`` selects the mutation-specific prompt and ``stdout``
+    is the already validated terminal stream. Returns ``None`` after
     complete delivery. Raises :class:`PruneOperationalError` on a short write or
     output failure, before writable application begins.
     """
-    prompt = _prune_confirmation_prompt(reviewed, request)
+    prompt = _prune_confirmation_prompt(reviewed)
     try:
         if stdout.write(prompt) != len(prompt):
             raise PruneOperationalError("could not write prune confirmation prompt")

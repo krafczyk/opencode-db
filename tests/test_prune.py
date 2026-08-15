@@ -290,7 +290,9 @@ class SessionPruneTests(unittest.TestCase):
         stdout = _OSErrorTty()
         stderr = io.StringIO()
         with patch.object(cli, "plan_prune", return_value=no_op), patch.object(
-            cli, "apply_prune_plan"
+            cli,
+            "apply_prune_plan",
+            return_value=prune_module.PruneOutcome(0, None, None),
         ) as apply, patch.object(sys, "stdin", _OSErrorTty()), patch.object(
             sys, "stdout", stdout
         ), patch.object(sys, "stderr", stderr):
@@ -309,7 +311,7 @@ class SessionPruneTests(unittest.TestCase):
             ],
         )
         self.assertEqual(stderr.getvalue(), "")
-        apply.assert_not_called()
+        apply.assert_called_once_with(no_op)
 
         combined = _reviewed_prune_plan(vacuum=True)
         stdout = _TtyStream()
@@ -503,11 +505,35 @@ class SessionPruneTests(unittest.TestCase):
         with self._temporary_directory() as root:
             database = root / "opencode.db"
             self._create_database(database)
+            reviewed = plan_prune(
+                PruneRequest(str(database), oldest="1", project_id="a")
+            )
             with patch("opencode_db.prune._open_prune_connection") as open_writable:
+                applied = apply_prune_plan(reviewed)
                 outcome = prune_sessions(database, oldest="1", project_id="a")
 
+            self.assertEqual(applied.deleted_sessions, 0)
             self.assertEqual(outcome.deleted_sessions, 0)
             open_writable.assert_not_called()
+
+    def test_now_override_is_validated_only_for_time_based_keep_newest(self) -> None:
+        """Ignore an irrelevant clock override while rejecting it for time retention."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "one", "a", 1, b"one")
+
+            reviewed = plan_prune(
+                PruneRequest(str(database), oldest="1"),
+                now_ms="ignored",  # type: ignore[arg-type]
+            )
+
+            self.assertEqual(reviewed.preview.sessions_to_prune, 1)
+            with self.assertRaisesRegex(PruneError, "clock is malformed"):
+                plan_prune(
+                    PruneRequest(str(database), keep_newest="1d"),
+                    now_ms="invalid",  # type: ignore[arg-type]
+                )
 
     def test_read_only_plan_observes_committed_wal_rows_without_changing_main_or_wal(self) -> None:
         """Read the committed WAL snapshot without checkpointing or opening SQLite rw."""
@@ -976,7 +1002,7 @@ def _reviewed_prune_plan(
         31 if estimate else None,
     )
     evidence = prune_module.PruneEvidence(
-        0, ("distinctive-session-id",) * sessions_to_prune, preview
+        None, ("distinctive-session-id",) * sessions_to_prune, preview
     )
     return prune_module.ReviewedPrunePlan(
         request,
