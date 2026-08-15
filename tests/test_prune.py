@@ -397,6 +397,59 @@ class SessionPruneTests(unittest.TestCase):
         self.assertNotIn("distinctive-session-id", stdout.getvalue().lower())
         apply.assert_called_once()
 
+    def test_cli_real_nonzero_preview_matches_the_committed_result(self) -> None:
+        """Exercise parse, planning, preview, application, and result without mocks."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_sessions(database)
+            previous_timezone = os.environ.get("TZ")
+            try:
+                os.environ["TZ"] = "UTC"
+                time.tzset()
+                code, stdout, stderr = self._run(
+                    [
+                        "prune",
+                        "--db",
+                        str(database),
+                        "--project-id",
+                        "a",
+                        "--oldest",
+                        "1",
+                        "--estimate-size",
+                        "--yes",
+                    ]
+                )
+            finally:
+                if previous_timezone is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = previous_timezone
+                time.tzset()
+
+            fields = dict(
+                line.split(": ", 1) for line in stdout.splitlines() if ": " in line
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(fields["sessions_to_prune"], "1")
+            self.assertEqual(fields["sessions_to_keep"], "2")
+            self.assertEqual(
+                fields["oldest_surviving_session_updated"],
+                "1970-01-03T00:00:00+00:00",
+            )
+            self.assertEqual(
+                fields["projected_logical_bytes_deleted"],
+                fields["estimated_logical_bytes_deleted"],
+            )
+            self.assertEqual(
+                fields["projected_logical_database_bytes_after_prune"],
+                fields["estimated_logical_database_bytes_after_prune"],
+            )
+            self.assertEqual(self._session_ids(database), ["a-2", "a-3", "b-1"])
+            for private_value in ("a-1", "A", "body"):
+                self.assertNotIn(private_value, stdout)
+
     def test_cli_refuses_malformed_timestamp_and_stale_review_without_success_output(self) -> None:
         """Fail closed for malformed timestamps and report a rerun-needed stale review."""
         malformed = _reviewed_prune_plan(timestamp="malformed")
@@ -499,6 +552,59 @@ class SessionPruneTests(unittest.TestCase):
                 apply_prune_plan(reviewed)
 
             self.assertEqual(self._session_ids(database), ["a-0", "a-1", "a-2", "a-3", "b-1"])
+
+    def test_revalidation_refuses_each_relevant_evidence_change(self) -> None:
+        """Reject deletion, timestamp, scope, and target-size selection drift."""
+        for drift in ("deletion", "timestamp", "scope", "target size"):
+            with self.subTest(drift=drift), self._temporary_directory() as root:
+                database = root / "opencode.db"
+                self._create_database(database)
+                self._insert_sessions(database)
+                if drift == "target size":
+                    with _connection(database) as connection:
+                        sizes = session_logical_sizes(connection, project_id="a")
+                    target = sizes["a-3"] + sizes["a-2"]
+                    reviewed = plan_prune(
+                        PruneRequest(
+                            str(database), project_id="a", target_size=f"{target}B"
+                        )
+                    )
+                else:
+                    reviewed = plan_prune(
+                        PruneRequest(str(database), project_id="a", oldest="1")
+                    )
+
+                with _connection(database) as connection:
+                    if drift == "deletion":
+                        for table in _CHILD_TABLES:
+                            selector = (
+                                "aggregate_id"
+                                if table in {"event_sequence", "event"}
+                                else "session_id"
+                            )
+                            connection.execute(
+                                f"DELETE FROM {table} WHERE {selector} = 'a-1'"
+                            )
+                        connection.execute("DELETE FROM session WHERE id = 'a-1'")
+                    elif drift == "timestamp":
+                        connection.execute(
+                            "UPDATE session SET time_updated = 0 WHERE id = 'a-2'"
+                        )
+                    elif drift == "scope":
+                        connection.execute(
+                            "UPDATE session SET project_id = 'b' WHERE id = 'a-1'"
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE session SET payload = ? WHERE id = 'a-2'",
+                            (b"x" * (target + 1),),
+                        )
+                before_apply = self._session_ids(database)
+
+                with self.assertRaisesRegex(PruneError, "preview is stale.*rerun"):
+                    apply_prune_plan(reviewed)
+
+                self.assertEqual(self._session_ids(database), before_apply)
 
     def test_direct_zero_selection_without_vacuum_does_not_open_writable_sqlite(self) -> None:
         """Return a no-op from reviewed read evidence without entering the writer phase."""
@@ -634,6 +740,13 @@ class SessionPruneTests(unittest.TestCase):
             with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 22):
                 self.assertEqual(plan_prune(request).preview.sessions_to_prune, 1)
 
+            size_request = PruneRequest(str(database), target_size="1B")
+            with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 37):
+                with self.assertRaisesRegex(PruneOperationalError, "candidate evidence"):
+                    plan_prune(size_request)
+            with patch.object(prune_module, "_MAX_PRUNE_EVIDENCE_BYTES", 38):
+                self.assertEqual(plan_prune(size_request).preview.sessions_to_prune, 2)
+
             with patch.object(prune_module.time, "monotonic", side_effect=(0.0, 11.0)):
                 with self.assertRaisesRegex(PruneOperationalError, "timed out"):
                     plan_prune(request)
@@ -656,6 +769,21 @@ class SessionPruneTests(unittest.TestCase):
                 with self.assertRaisesRegex(PruneOperationalError, "timed out"):
                     apply_prune_plan(reviewed)
             self.assertEqual(self._session_ids(database), ["one", "two"])
+
+    def test_sqlite_progress_handler_interrupts_work_after_deadline(self) -> None:
+        """Prove the installed phase deadline interrupts active SQLite VM work."""
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            prune_module._install_prune_deadline(connection, time.monotonic() - 1)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "interrupted"):
+                connection.execute(
+                    "WITH RECURSIVE counter(value) AS ("
+                    "SELECT 1 UNION ALL SELECT value + 1 FROM counter WHERE value < 1000000"
+                    ") SELECT SUM(value) FROM counter"
+                ).fetchone()
+        finally:
+            connection.set_progress_handler(None, 0)
+            connection.close()
 
     def test_keep_newest_count_uses_newest_first_id_tie_break(self) -> None:
         """Retain exactly the requested newest count and deterministically break ties."""
@@ -759,6 +887,29 @@ class SessionPruneTests(unittest.TestCase):
             self.assertEqual(vacuumed.deleted_sessions, 0)
             self.assertEqual(vacuumed.physical_database_bytes, database.stat().st_size)
             self.assertEqual(open_connection.call_count, 1)
+            with patch.object(
+                prune_module,
+                "_vacuum",
+                side_effect=PruneOperationalError("database vacuum failed"),
+            ):
+                code, stdout, stderr = self._run(
+                    [
+                        "prune",
+                        "--db",
+                        str(database),
+                        "--project-id",
+                        "empty",
+                        "--oldest",
+                        "1",
+                        "--vacuum",
+                        "--yes",
+                    ]
+                )
+            self.assertEqual(code, EXIT_OPERATIONAL_FAILURE)
+            self.assertIn("sessions_to_prune: 0", stdout)
+            self.assertNotIn("opencode-db: pruned", stdout)
+            self.assertNotIn("do not repeat", stderr)
+            self.assertEqual(self._session_ids(database), ["old"])
             outcome = prune_sessions(database, oldest="1", estimate_size=True)
 
             self.assertGreater(outcome.deleted_logical_bytes, len("secret-payload"))
