@@ -293,7 +293,7 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("[--db", protocol)
         self.assertIn("Add `--db /absolute/path", readme)
         self.assertIn("Linux only", readme)
-        self.assertIn("`mv` is the sole interactive exception", normalized_readme)
+        self.assertIn("The destructive `mv` and `prune` commands ask for confirmation", normalized_readme)
         self.assertIn("never starts OpenCode", normalized_readme)
         for text in (normalized_readme, normalized_protocol):
             self.assertIn("source or target project checkout entries", text)
@@ -452,6 +452,7 @@ class CliContractTests(unittest.TestCase):
                 "list-projects",
                 "show-project",
                 "show-session",
+                "prune",
             ]
 
             for action in actions:
@@ -471,6 +472,8 @@ class CliContractTests(unittest.TestCase):
                         else "[--database ABSOLUTE_PATH]"
                     )
                     self.assertIn(option, stdout.getvalue())
+                    if action == "prune":
+                        self.assertIn("--yes", stdout.getvalue())
 
             self.assertEqual(database.read_bytes(), before)
 

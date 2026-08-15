@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from opencode_db import cli
 import opencode_db.prune as prune_module
-from opencode_db.model import EXIT_OPERATIONAL_FAILURE
+from opencode_db.model import EXIT_OPERATIONAL_FAILURE, EXIT_PRECONDITION_REFUSED
 from opencode_db.prune import (
     PruneError,
     PruneOperationalError,
@@ -56,11 +56,20 @@ class SessionPruneTests(unittest.TestCase):
     def test_parse_requires_one_positive_selector_and_bounded_target_size(self) -> None:
         """Reject absent, conflicting, malformed, zero, and negative prune selectors."""
         valid = cli.parse_command(
-            ["prune", "--db", "/tmp/opencode.db", "--oldest", "2", "--estimate-size"]
+            [
+                "prune",
+                "--db",
+                "/tmp/opencode.db",
+                "--oldest",
+                "2",
+                "--estimate-size",
+                "--yes",
+            ]
         )
         self.assertEqual(valid.command, "prune")
         self.assertEqual(valid.oldest, "2")
         self.assertTrue(valid.estimate_size)
+        self.assertTrue(valid.yes)
         for arguments in (
             ["prune", "--db", "/tmp/opencode.db"],
             ["prune", "--db", "/tmp/opencode.db", "--oldest", "1", "--keep-newest", "1"],
@@ -74,6 +83,97 @@ class SessionPruneTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(cli.CliUsageError):
                     cli.parse_command(arguments)
+
+    def test_cli_refuses_detached_prune_without_mutating(self) -> None:
+        """Require interactive authorization before crossing the prune mutation boundary."""
+        cases = (
+            ("detached stdout", _ReadTrackingTty("y\n"), io.StringIO()),
+            ("detached stdin", _DetachedStream("y\n"), _TtyStream()),
+            ("stdin isatty error", _OSErrorTty("y\n"), _TtyStream()),
+        )
+        for name, stdin, stdout in cases:
+            with self.subTest(name=name), patch.object(
+                cli, "prune_sessions"
+            ) as prune:
+                stderr = io.StringIO()
+                with patch.object(sys, "stdin", stdin), patch.object(
+                    sys, "stdout", stdout
+                ), patch.object(sys, "stderr", stderr):
+                    exit_code = cli.main(
+                        ["prune", "--db", "/tmp/opencode.db", "--oldest", "1"]
+                    )
+
+                self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+                self.assertEqual(stdin.readline_count, 0)
+                self.assertIn("terminal", stderr.getvalue())
+                prune.assert_not_called()
+
+    def test_cli_requires_exact_confirmation_and_yes_bypasses_prompt(self) -> None:
+        """Mutate only after exact terminal confirmation or an explicit yes flag."""
+        outcome = prune_module.PruneOutcome(1, None, None)
+        for reply in ("n\n", "Y\n", " y\n", "y \n", "y", "", "\n"):
+            with self.subTest(reply=reply), patch.object(
+                cli, "prune_sessions", return_value=outcome
+            ) as prune:
+                stdin = _TtyStream(reply)
+                stdout = _TtyStream()
+                stderr = _TtyStream()
+                with patch.object(sys, "stdin", stdin), patch.object(
+                    sys, "stdout", stdout
+                ), patch.object(sys, "stderr", stderr):
+                    exit_code = cli.main(
+                        ["prune", "--db", "/tmp/opencode.db", "--oldest", "1"]
+                    )
+                self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+                self.assertIn("cancelled", stderr.getvalue())
+                prune.assert_not_called()
+
+        with patch.object(cli, "prune_sessions", return_value=outcome) as prune:
+            stdin = _InterruptingTty()
+            stdout = _TtyStream()
+            stderr = _TtyStream()
+            with patch.object(sys, "stdin", stdin), patch.object(
+                sys, "stdout", stdout
+            ), patch.object(sys, "stderr", stderr):
+                exit_code = cli.main(
+                    ["prune", "--db", "/tmp/opencode.db", "--oldest", "1"]
+                )
+            self.assertEqual(exit_code, EXIT_PRECONDITION_REFUSED)
+            self.assertIn("cancelled", stderr.getvalue())
+            prune.assert_not_called()
+
+        for reply in ("y\n", "y\r", "y\r\n"):
+            with self.subTest(reply=reply), patch.object(
+                cli, "prune_sessions", return_value=outcome
+            ) as prune:
+                stdin = _TtyStream(reply)
+                stdout = _TtyStream()
+                stderr = _TtyStream()
+                with patch.object(sys, "stdin", stdin), patch.object(
+                    sys, "stdout", stdout
+                ), patch.object(sys, "stderr", stderr):
+                    exit_code = cli.main(
+                        ["prune", "--db", "/tmp/opencode.db", "--oldest", "1"]
+                    )
+                self.assertEqual(exit_code, 0)
+                self.assertIn("Prune matching sessions? [y/N] ", stdout.getvalue())
+                prune.assert_called_once()
+
+        with patch.object(cli, "prune_sessions", return_value=outcome) as prune:
+            code, stdout, stderr = self._run(
+                [
+                    "prune",
+                    "--db",
+                    "/tmp/opencode.db",
+                    "--oldest",
+                    "1",
+                    "--yes",
+                ]
+            )
+            self.assertEqual(code, 0)
+            self.assertNotIn("[y/N]", stdout)
+            self.assertEqual(stderr, "")
+            prune.assert_called_once()
 
     def test_count_time_and_target_policies_preserve_unrelated_projects(self) -> None:
         """Delete only selected project rows using deterministic count, time, and size policies."""
@@ -207,7 +307,15 @@ class SessionPruneTests(unittest.TestCase):
             self.assertGreater(outcome.deleted_logical_bytes, len("secret-payload"))
             self.assertGreater(outcome.logical_database_bytes, 0)
             code, stdout, stderr = self._run(
-                ["prune", "--db", str(database), "--oldest", "1", "--estimate-size"]
+                [
+                    "prune",
+                    "--db",
+                    str(database),
+                    "--oldest",
+                    "1",
+                    "--estimate-size",
+                    "--yes",
+                ]
             )
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
@@ -317,6 +425,7 @@ class SessionPruneTests(unittest.TestCase):
                         "--oldest",
                         "1",
                         "--vacuum",
+                        "--yes",
                     ]
                 )
 
@@ -414,6 +523,52 @@ class SessionPruneTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = cli.main(arguments)
         return code, stdout.getvalue(), stderr.getvalue()
+
+
+class _TtyStream(io.StringIO):
+    """Provide an in-memory stream that reports terminal capability."""
+
+    def isatty(self) -> bool:
+        """Return true so prune confirmation paths can be exercised."""
+        return True
+
+
+class _ReadTrackingTty(_TtyStream):
+    """Record attempts to read confirmation input from one terminal stream."""
+
+    def __init__(self, initial_value: str = "") -> None:
+        """Initialize a terminal stream with no recorded reads."""
+        super().__init__(initial_value)
+        self.readline_count = 0
+
+    def readline(self, *args: object, **kwargs: object) -> str:
+        """Count and perform one confirmation read."""
+        self.readline_count += 1
+        return super().readline(*args, **kwargs)
+
+
+class _DetachedStream(_ReadTrackingTty):
+    """Provide a readable stream that reports no terminal capability."""
+
+    def isatty(self) -> bool:
+        """Return false to model redirected stdin."""
+        return False
+
+
+class _OSErrorTty(_ReadTrackingTty):
+    """Model a stream whose terminal capability cannot be queried."""
+
+    def isatty(self) -> bool:
+        """Raise the supported terminal-probe failure."""
+        raise OSError("terminal probe failed")
+
+
+class _InterruptingTty(_TtyStream):
+    """Model an operator interrupt at the prune confirmation prompt."""
+
+    def readline(self) -> str:
+        """Interrupt instead of returning authorization input."""
+        raise KeyboardInterrupt
 
 
 if __name__ == "__main__":

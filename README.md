@@ -22,9 +22,9 @@ salvage tool.
   OpenCode or falls back based on file existence. Explicit values never accept a
   relative or in-memory target.
 - The operator owns shutdown, restart, and concurrent-use safety. Commands do
-  not inspect processes or coordinate other users. `mv` is the sole interactive
-  exception: it previews its complete metadata mapping and asks for confirmation
-  unless `--yes` is explicit.
+  not inspect processes or coordinate other users. The destructive `mv` and
+  `prune` commands ask for confirmation unless `--yes` is explicit; `mv` first
+  previews its complete metadata mapping.
 - The tool never starts OpenCode. After a successful install, start OpenCode
   separately using its unchanged normal command and configuration.
 
@@ -325,20 +325,23 @@ opencode-db cleanup prune-backup \
 
 ## Active session pruning
 
-`prune` is a noninteractive active-database retention command. Arrange OpenCode
-shutdown and writer concurrency before running it. It opens only the selected
-existing database through SQLite `mode=rw`, enables foreign keys, uses a bounded
-writer wait, validates integrity and foreign keys before and after its immediate
-transaction, and deletes only complete selected session state. It refuses an
-incomplete schema, unknown session-linked table or trigger, malformed data, or
-an exact missing project instead of guessing ownership. It also refuses
-non-unique session IDs and known-table foreign keys that cross the selected and
-retained ownership boundary.
+`prune` is an interactive active-database retention command. Arrange OpenCode
+shutdown and writer concurrency before running it. Without `--yes`, both stdin
+and stdout must be terminals and only an exact lowercase `y` authorizes the
+operation; any other input, EOF, or interruption cancels before the database is
+opened. `--yes` bypasses only that prompt for explicit automation. The command
+opens only the selected existing database through SQLite `mode=rw`, enables
+foreign keys, uses a bounded writer wait, validates integrity and foreign keys
+before and after its immediate transaction, and deletes only complete selected
+session state. It refuses an incomplete schema, unknown session-linked table or
+trigger, malformed data, or an exact missing project instead of guessing
+ownership. It also refuses non-unique session IDs and known-table foreign keys
+that cross the selected and retained ownership boundary.
 
 ```bash
 opencode-db prune [--db /absolute/path/opencode.db] [--project-id ID] \
   (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
-  [--estimate-size] [--vacuum]
+  [--estimate-size] [--vacuum] [--yes]
 ```
 
 Exactly one selector is required. Positive `N` means sessions; the canonical
@@ -370,7 +373,8 @@ the inspection commands do not accept `--json`; `mv` also has human-only output 
 does not accept `--json`. Their separate human-only success output is written to
 stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
 syntax/input shape, `3` uncertain decision required, `4` safety-precondition
-refusal (including `mv` validation, detached-stream refusal, and cancellation),
+refusal (including `mv` validation and destructive-command detached-stream
+refusal or cancellation),
 `5` bounded operational SQLite or Git failure, and `6` manual recovery required.
 
 The default deadline is 30 minutes. `--deadline-seconds` accepts finite whole

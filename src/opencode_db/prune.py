@@ -80,8 +80,8 @@ class PruneRequest:
     """Represent one grammar-validated active session pruning request.
 
     ``database`` is an absolute selected path, only one selector is populated,
-    and optional flags control reporting or physical compaction. The value has
-    no SQLite or filesystem side effects.
+    and optional flags control reporting, physical compaction, or explicit
+    confirmation bypass. The value has no SQLite or filesystem side effects.
     """
 
     database: str
@@ -91,6 +91,7 @@ class PruneRequest:
     target_size: str | None = None
     estimate_size: bool = False
     vacuum: bool = False
+    yes: bool = False
     command: str = "prune"
 
 

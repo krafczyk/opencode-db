@@ -69,7 +69,7 @@ session-linked tables and triggers instead of silently omitting persisted state.
 The human-only active pruning grammar is:
 
 ```text
-opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--vacuum]
+opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) [--estimate-size] [--vacuum] [--yes]
 ```
 
 Exactly one selector is required. `N` is a positive base-10 session count.
@@ -85,16 +85,19 @@ the newest contiguous prefix whose complete known session logical estimates fit;
 when the newest session alone is over target it and all older candidates are
 deleted.
 
-The optional exact project scope is verified before selection. The command opens
+Without `--yes`, both stdin and stdout must be terminals. Only exact lowercase
+`y` authorizes pruning; other input, EOF, interruption, or detached streams
+refuse before the database is opened. `--yes` bypasses only this prompt. The
+optional exact project scope is verified before selection. The command opens
 only its existing selected database using SQLite `mode=rw`, sets a bounded busy
 timeout and foreign keys, validates integrity and foreign keys, then performs
-known-child and session deletion in one immediate transaction. It validates again
-before commit and rolls back uncommitted work on failure. Incomplete known
+known-child and session deletion in one immediate transaction. It validates
+again before commit and rolls back uncommitted work on failure. Incomplete known
 schemas, unknown session-linked tables, triggers on known session tables, and
 retained session-parent dependencies are refusals. Non-unique session IDs and
 known-table foreign keys crossing selected and retained session ownership are
-also refusals. Output contains only counts and optional estimates, never session
-rows or transcript bodies.
+also refusals. Output contains only the confirmation prompt, counts, and optional
+estimates, never session rows or transcript bodies.
 
 `--estimate-size` prints deleted logical bytes and total logical database bytes
 after prune. Ordinary deletion frees reusable SQLite space but normally does not

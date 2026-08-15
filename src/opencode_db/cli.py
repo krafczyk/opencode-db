@@ -283,8 +283,8 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
     function neither reads stdin nor changes a database.
     """
     command = "prune"
-    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "vacuum"}
-    boolean_options = {"estimate-size", "vacuum"}
+    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "vacuum", "yes"}
+    boolean_options = {"estimate-size", "vacuum", "yes"}
     options: dict[str, str | bool] = {}
     position = 1
     while position < len(arguments):
@@ -324,6 +324,7 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
         target_size=_option(options, "target-size") if "target-size" in options else None,
         estimate_size=bool(options.get("estimate-size", False)),
         vacuum=bool(options.get("vacuum", False)),
+        yes=bool(options.get("yes", False)),
     )
 
 
@@ -408,9 +409,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     documented exit class. Machine-mode parse errors emit one JSON result on
     stdout and no diagnostics there. ``cleanup preview`` captures an explicit
     target and cleans only a fresh scratch copy; other commands safely refuse
-    execution until later units implement their artifact operations. ``mv`` is
-    the sole prompting command: it previews to stdout and reads one terminal
-    confirmation unless ``--yes`` is explicit.
+    execution until later units implement their artifact operations. ``mv`` and
+    ``prune`` read one terminal confirmation unless ``--yes`` is explicit.
     """
     values = list(sys.argv[1:] if arguments is None else arguments)
     if _wants_help(values):
@@ -482,13 +482,30 @@ def _execute_inspection(request: InspectionRequest) -> int:
 
 
 def _execute_prune(request: PruneRequest) -> int:
-    """Execute one noninteractive active session prune and render safe aggregates.
+    """Authorize and execute one active session prune, then render safe aggregates.
 
     Parameters: ``request`` has passed grammar validation. Returns zero after a
-    commit (and optional vacuum), safety-refusal exit code for unsupported schema
-    or exact-project failures, and operational-failure exit code for SQLite or
-    filesystem failures. Output contains only counts and byte estimates.
+    commit (and optional vacuum), safety-refusal exit code for detached streams,
+    cancellation, unsupported schema, or exact-project failures, and operational-
+    failure exit code for SQLite or filesystem failures. Unless ``request.yes``
+    is set, only an exact lowercase terminal response authorizes mutation. Output
+    contains only the prompt, counts, and byte estimates.
     """
+    if not request.yes:
+        if not _is_terminal(sys.stdin) or not _is_terminal(sys.stdout):
+            sys.stderr.write(
+                "opencode-db: prune requires terminal stdin and stdout unless --yes; no changes were applied\n"
+            )
+            return EXIT_PRECONDITION_REFUSED
+        sys.stdout.write("Prune matching sessions? [y/N] ")
+        sys.stdout.flush()
+        try:
+            response = sys.stdin.readline()
+        except KeyboardInterrupt:
+            response = ""
+        if response not in ("y\n", "y\r", "y\r\n"):
+            sys.stderr.write("opencode-db: prune cancelled; no changes were applied\n")
+            return EXIT_PRECONDITION_REFUSED
     try:
         outcome = prune_sessions(
             request.database,
@@ -531,6 +548,15 @@ def _render_prune_outcome(request: PruneRequest, outcome: PruneOutcome) -> str:
     if physical_bytes is not None:
         lines.append(f"physical_database_bytes_after_vacuum: {physical_bytes}")
     return "\n".join(lines) + "\n"
+
+
+def _is_terminal(stream: object) -> bool:
+    """Return terminal capability without assuming a stream exposes ``isatty``."""
+    isatty = getattr(stream, "isatty", None)
+    try:
+        return bool(isatty()) if callable(isatty) else False
+    except OSError:
+        return False
 
 
 def _execute_transfer(request: TransferRequest) -> int:
@@ -1082,7 +1108,7 @@ def _help_text(values: Sequence[str]) -> str:
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]",
         "list-sessions": "opencode-db list-sessions [--db ABSOLUTE_DB] [--estimate-session-size] [--project-id ID]",
-        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--vacuum]",
+        "prune": "opencode-db prune [--db ABSOLUTE_DB] [--project-id ID] (--oldest N|TIME | --keep-newest N|TIME | --target-size N[B|KiB|MiB|GiB|TiB]) [--estimate-size] [--vacuum] [--yes]",
         "export": "opencode-db export [--db ABSOLUTE_DB] --project-dir ABSOLUTE_PROJECT_DIR --export-dir ABSOLUTE_EXPORT_DIR",
         "import": "opencode-db import --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] --import ABSOLUTE_IMPORT_FILE",
         "cleanup preview": "opencode-db cleanup preview [--database ABSOLUTE_PATH] [--scratch-dir ABSOLUTE_PATH] [--deadline-seconds N] [--json]",
