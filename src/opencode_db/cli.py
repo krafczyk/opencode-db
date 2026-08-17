@@ -53,6 +53,11 @@ from .move_cli import (
     execute_move,
     parse_move_command,
 )
+from .move_repair_cli import (
+    MoveRepairCommandRequest,
+    execute_move_repair,
+    parse_move_repair_command,
+)
 from .prune import (
     PRUNE_TIMEOUT_SECONDS,
     PruneCommittedError,
@@ -134,13 +139,13 @@ class CliUsageError(ValueError):
 
 def parse_command(
     arguments: Sequence[str],
-) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest | PruneRequest:
-    """Parse one cleanup, transfer, inspection, or sibling move command without state access.
+) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest | MoveRepairCommandRequest | PruneRequest:
+    """Parse one cleanup, transfer, inspection, move, or move-repair command.
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
     Returns a :class:`CommandRequest`, :class:`TransferRequest`,
-    :class:`InspectionRequest`, :class:`MoveCommandRequest`, or
-    :class:`PruneRequest` with validated
+    :class:`InspectionRequest`, :class:`MoveCommandRequest`,
+    :class:`MoveRepairCommandRequest`, or :class:`PruneRequest` with validated
     fields; cleanup requests use a concrete environment-selected database string
     when their option is omitted.
     Raises :class:`CliUsageError` or
@@ -157,6 +162,15 @@ def parse_command(
         return parse_transfer_command(values)
     if values and values[0] == "mv":
         return parse_move_command(
+            values,
+            usage_error=CliUsageError,
+            option=_option,
+            absolute_path=_absolute_path,
+            optional_id=_optional_id,
+            default_database=_default_database,
+        )
+    if values and values[0] == "repair-move":
+        return parse_move_repair_command(
             values,
             usage_error=CliUsageError,
             option=_option,
@@ -436,7 +450,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     stdout and no diagnostics there. ``cleanup preview`` captures an explicit
     target and cleans only a fresh scratch copy; other commands safely refuse
     execution until later units implement their artifact operations. ``mv`` and
-    ``prune`` read one terminal confirmation unless ``--yes`` is explicit.
+    ``prune`` and ``repair-move`` read one terminal confirmation unless
+    ``--yes`` is explicit.
     """
     values = list(sys.argv[1:] if arguments is None else arguments)
     if _wants_help(values):
@@ -444,7 +459,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 0
     json_mode = "--json" in values and (
         not values
-        or values[0] not in {"list-projects", "show-project", "show-session", "list-sessions", "prune", "mv"}
+        or values[0] not in {"list-projects", "show-project", "show-session", "list-sessions", "prune", "mv", "repair-move"}
     )
     try:
         request = parse_command(values)
@@ -470,6 +485,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _execute_prune(request)
     if isinstance(request, MoveCommandRequest):
         return execute_move(request, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+    if isinstance(request, MoveRepairCommandRequest):
+        return execute_move_repair(request, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     result = _execute(request)
     if request.json:
         sys.stdout.write(render_json(result))
@@ -1238,9 +1255,11 @@ def _wants_help(values: Sequence[str]) -> bool:
 
 
 def _help_text(values: Sequence[str]) -> str:
-    command = values[0] if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"} else " ".join(values[:2])
+    top_level = {"mv", "repair-move", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
+    command = values[0] if values and values[0] in top_level else " ".join(values[:2])
     synopses = {
         "mv": "opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--application-timeout-seconds SECONDS] [--yes] [--progress]",
+        "repair-move": "opencode-db repair-move --project-id ID --source-project-dir ABSOLUTE_SOURCE_PROJECT_DIR --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--application-timeout-seconds SECONDS] [--yes]",
         "list-projects": "opencode-db list-projects [--db ABSOLUTE_DB] [--estimate-project-size]",
         "show-project": "opencode-db show-project [--db ABSOLUTE_DB] --project-id ID [--estimate-project-size]",
         "show-session": "opencode-db show-session [--db ABSOLUTE_DB] --session-id ID [--estimate-session-size]",
@@ -1265,7 +1284,7 @@ def _help_text(values: Sequence[str]) -> str:
             "stale previews refuse with instructions to rerun."
         )
     }
-    if values and values[0] in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}:
+    if values and values[0] in top_level:
         selected = values[0]
         detail = f"\n{details[selected]}" if selected in details else ""
         return synopses[selected] + detail + "\n"
@@ -1273,7 +1292,7 @@ def _help_text(values: Sequence[str]) -> str:
         return synopses[command] + "\n"
     return (
         "\n".join(
-            ["usage: opencode-db (cleanup COMMAND | mv | export | import | list-projects | show-project | show-session | list-sessions | prune) [OPTIONS]", *synopses.values()]
+            ["usage: opencode-db (cleanup COMMAND | mv | repair-move | export | import | list-projects | show-project | show-session | list-sessions | prune) [OPTIONS]", *synopses.values()]
         )
         + "\n"
     )

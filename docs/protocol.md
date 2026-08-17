@@ -243,6 +243,50 @@ redirected stderr receives capped newline-delimited records without carriage
 returns. Progress contains no IDs, paths, remotes, or database content and does
 not alter stdout, prompting, validation, or transaction behavior.
 
+## Sibling move repair
+
+The human-only metadata repair grammar is:
+
+```text
+opencode-db repair-move --project-id ID --source-project-dir ABSOLUTE_SOURCE_PROJECT_DIR --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--application-timeout-seconds SECONDS] [--yes]
+```
+
+The command repairs a completed sibling move after OpenCode has re-registered
+locations from the retained source family. The selected primary worktree must
+already equal the explicit target main path. Source and target main basenames
+must match, their parents must differ, and every selected structured location
+must be an immediate sibling in one of those two families. A third, nested, or
+external location refuses the complete repair. Both members of every mapped
+source/target pair must be existing Git roots with the same normalized project
+identity. Checkout state, branch, and HEAD are freshness evidence but need not
+match because the target may legitimately advance after the original move.
+
+Planning opens SQLite read-only and emits deterministic source/target lines to
+stdout. Each line groups exact structured category counts under `drop` or
+`rebase`. A source sandbox is dropped only when its target is the primary or is
+already represented in the target sandbox array. A source project-directory row
+is dropped only when a target row with the same type and strategy exists; a
+conflicting target refuses. Every other source sandbox, project-directory,
+session-directory, or non-null workspace-directory owner is rebased to its
+target sibling. A null workspace remains null. No source location means the
+repair refuses without mutation.
+
+Without `--yes`, both stdin and stdout must be terminals and only exact lowercase
+`y` after line-ending removal authorizes application. The complete preview is
+flushed before confirmation or `--yes` application; detached streams,
+cancellation, short writes, and flush failures cannot authorize mutation. The
+application revalidates the complete selected schema, rows, paths, and Git
+evidence under a bounded writer transaction, applies every reviewed action,
+checks the exact expected result plus SQLite integrity and foreign keys, then
+commits atomically. The writer deadline defaults to 10 seconds and accepts the
+same finite `--application-timeout-seconds` override as `mv`.
+
+The operator must stop OpenCode and owns concurrent-use safety. `repair-move`
+never copies, moves, removes, or changes source or target project checkout
+entries or contents. It leaves timestamps, free-form history, and unrelated
+projects unchanged. Accessing the retained source family after repair can
+register it again.
+
 ## Target and identities
 
 Every database-accepting command accepts an explicit absolute database option or
@@ -356,8 +400,8 @@ reported as `scratch_cleanup_required` and is not removed remotely.
 
 Cleanup commands with `--json` emit exactly one UTF-8, ASCII-safe,
 newline-terminated object on stdout, capped at 64 KiB. Top-level transfer and
-inspection commands instead use their documented human-only output. `mv` is also
-human-only and has no JSON result. The cleanup result has
+inspection commands instead use their documented human-only output. `mv` and
+`repair-move` are also human-only and have no JSON result. The cleanup result has
 no unknown version-1 fields:
 
 ```text
@@ -378,8 +422,8 @@ mutate active files.
 | 0 | terminal success | complete preview, installed, rolled back, status, backup pruned |
 | 2 | syntax/input shape | malformed command, relative path, incomplete ID |
 | 3 | decision required | validated uncertain preview or missing exact uncertain approval |
-| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence, malformed transfer archive, ambiguous project, incompatible schema, `mv` validation refusal, cancellation, or detached-stream refusal |
-| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure, transfer filesystem/SQLite/integrity/publication failure, bounded `mv` SQLite or Git execution failure |
+| 4 | safety precondition refusal | changed source, unsupported journal, invalid target, mismatched evidence, malformed transfer archive, ambiguous project, incompatible schema, move or move-repair validation refusal, cancellation, or detached-stream refusal |
+| 5 | operational/validation failure | invalid candidate, deadline, bounded I/O or validation failure, transfer filesystem/SQLite/integrity/publication failure, bounded move or move-repair SQLite or Git execution failure |
 | 6 | manual recovery required | unreconcilable active installation or cross-host scratch cleanup |
 
 Stable status values are `complete`, `uncertain`, `source_changed`, `invalid`,

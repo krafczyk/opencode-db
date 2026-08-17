@@ -22,9 +22,9 @@ salvage tool.
   OpenCode or falls back based on file existence. Explicit values never accept a
   relative or in-memory target.
 - The operator owns shutdown, restart, and concurrent-use safety. Commands do
-  not inspect processes or coordinate other users. The destructive `mv` and
-  `prune` commands ask for confirmation unless `--yes` is explicit; `mv` first
-  previews its complete metadata mapping.
+  not inspect processes or coordinate other users. The destructive `mv`,
+  `repair-move`, and `prune` commands ask for confirmation unless `--yes` is
+  explicit; move commands first preview their complete metadata actions.
 - The tool never starts OpenCode. After a successful install, start OpenCode
   separately using its unchanged normal command and configuration.
 
@@ -179,6 +179,38 @@ authorization, validation, or transaction behavior. The rewrite changes only
 the supported project worktree, sandbox, project-directory, session-directory,
 and non-null workspace-directory fields. Historical messages, prompts, tools,
 output, and other free-form content remain unchanged.
+
+### Repairing a re-registered source family
+
+If OpenCode accesses a retained source checkout after `mv`, it can register that
+old main checkout and its Git worktrees again even though the primary worktree
+and sessions were moved. `repair-move` removes that source-family contamination
+without changing either checkout family:
+
+```bash
+opencode-db repair-move --project-id ID \
+  --source-project-dir /absolute/old-parent/project \
+  --target-project-dir /absolute/new-parent/project \
+  [--db /absolute/path/opencode.db] \
+  [--application-timeout-seconds SECONDS] [--yes]
+```
+
+Run it while OpenCode is stopped. The selected project's primary worktree must
+already equal the target, source and target main basenames must match, and every
+structured location must be an immediate child of one of those two parents.
+Each source/target pair must exist as a Git checkout with the same project
+identity; the target may have advanced to another branch or commit after the
+move.
+
+The preview labels every source owner as `drop` or `rebase`. An old sandbox is
+dropped when its target is already the primary or a recorded sandbox. A source
+`project_directory` row is dropped only when its target twin has the same type
+and strategy; conflicting twins refuse the whole repair. Other source rows are
+rebased to their target sibling. After confirmation, the command revalidates the
+complete selected state and applies all actions in one bounded transaction.
+Source and target filesystem content, timestamps, opaque history, and unrelated
+projects remain unchanged. Opening the retained source family again can
+re-register it, so delete, archive, or avoid that family after verification.
 
 ## Standalone install
 
@@ -413,12 +445,12 @@ storage even when its timeout is long enough.
 
 Cleanup commands accept `--json` for exactly one newline-terminated
 schema-version-1 JSON object on stdout. Top-level `export`, `import`, `prune`, and
-the inspection commands do not accept `--json`; `mv` also has human-only output and
-does not accept `--json`. Their separate human-only success output is written to
-stdout and their bounded diagnostics to stderr. Exit classes are `0` success, `2`
-syntax/input shape, `3` uncertain decision required, `4` safety-precondition
-refusal (including `mv` validation and destructive-command detached-stream
-refusal or cancellation),
+the inspection commands do not accept `--json`; `mv` and `repair-move` also have
+human-only output and do not accept `--json`. Their separate human-only success
+output is written to stdout and their bounded diagnostics to stderr. Exit classes
+are `0` success, `2` syntax/input shape, `3` uncertain decision required, `4`
+safety-precondition refusal (including move validation and destructive-command
+detached-stream refusal or cancellation),
 `5` bounded operational SQLite or Git failure, and `6` manual recovery required.
 
 The default deadline is 30 minutes. `--deadline-seconds` accepts finite whole

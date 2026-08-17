@@ -283,6 +283,7 @@ class CliContractTests(unittest.TestCase):
         for text in (readme, protocol):
             self.assertIn("prune-backup", text)
             self.assertIn("opencode-db import --target-project-dir", text)
+            self.assertIn("opencode-db repair-move --project-id", text)
             self.assertIn("opencode-db list-projects", text)
             self.assertIn("opencode-db show-project", text)
             self.assertIn("opencode-db show-session", text)
@@ -293,13 +294,14 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("[--db", protocol)
         self.assertIn("Add `--db /absolute/path", readme)
         self.assertIn("Linux only", readme)
-        self.assertIn("The destructive `mv` and `prune` commands ask for confirmation", normalized_readme)
+        self.assertIn("The destructive `mv`, `repair-move`, and `prune` commands ask for confirmation", normalized_readme)
         self.assertIn("never starts OpenCode", normalized_readme)
         for text in (normalized_readme, normalized_protocol):
             self.assertIn("source or target project checkout entries", text)
             self.assertIn("SQLite-managed standard sidecars", text)
         for command in (
             "mv",
+            "repair-move",
             "list-projects",
             "show-project",
             "show-session",
@@ -458,6 +460,7 @@ class CliContractTests(unittest.TestCase):
             before = database.read_bytes()
             actions = [
                 "mv",
+                "repair-move",
                 "export",
                 "import",
                 "preview",
@@ -479,14 +482,14 @@ class CliContractTests(unittest.TestCase):
                     with redirect_stdout(stdout):
                         arguments = (
                             [action, "--help"]
-                            if action in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
+                            if action in {"mv", "repair-move", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
                             else ["cleanup", action, "--help"]
                         )
                         self.assertEqual(cli.main(arguments), 0)
                     self.assertIn(action, stdout.getvalue())
                     option = (
                         "[--db ABSOLUTE_DB]"
-                        if action in {"mv", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
+                        if action in {"mv", "repair-move", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
                         else "[--database ABSOLUTE_PATH]"
                     )
                     self.assertIn(option, stdout.getvalue())
