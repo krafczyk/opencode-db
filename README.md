@@ -384,7 +384,8 @@ deadline by default. `--timeout-seconds` accepts finite positive seconds up to
 86,400 and gives planning, application, and requested vacuum separate full
 windows; time spent reviewing or confirming the preview consumes none of those
 windows. Slow or oversized evidence fails with a bounded phase-specific
-diagnostic before authorization or deletion.
+diagnostic before authorization or deletion. On large databases, allow planning
+for one health scan and application for two scans plus deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after that preview and
 only an exact lowercase `y` authorizes any remaining mutation; other input, EOF,
@@ -398,12 +399,15 @@ transaction; a changed selection refuses without deletion and instructs the
 operator to rerun the command.
 
 The writable phase opens only the selected existing database through SQLite
-`mode=rw`, enables foreign keys, uses a bounded writer wait, validates integrity
-and foreign keys before and after its immediate transaction, and deletes only
-complete selected session state. It refuses an incomplete schema, unknown
-session-linked table or trigger, malformed data, or an exact missing project
-instead of guessing ownership. It also refuses non-unique session IDs and
-known-table foreign keys that cross the selected and retained ownership boundary.
+`mode=rw`, enables foreign keys, uses a bounded writer wait, runs SQLite
+`quick_check` and foreign-key validation before and after its immediate
+transaction, and deletes only complete selected session state. It refuses an
+incomplete schema, unknown session-linked table or trigger, malformed data, or
+an exact missing project instead of guessing ownership. It also refuses
+non-unique session IDs and known-table foreign keys that cross the selected and
+retained ownership boundary. `quick_check` validates table and page structure
+but omits the full index/table consistency work of `integrity_check`; run a full
+offline SQLite integrity check first when index corruption is suspected.
 
 ```bash
 opencode-db prune [--db /absolute/path/opencode.db] \

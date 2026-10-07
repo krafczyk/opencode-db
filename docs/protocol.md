@@ -110,7 +110,8 @@ deadline by default. `--timeout-seconds` accepts finite positive seconds through
 86,400 and gives planning, application, and requested vacuum separate full
 windows; preview review and confirmation time consumes none of those windows.
 Exceeding a count, byte, or time bound refuses with a phase-specific diagnostic
-before authorization or deletion.
+before authorization or deletion. Large-database timeout selection must allow
+planning for one health scan and application for two scans plus deletion.
 
 Without `--yes`, both stdin and stdout must be terminals after preview. Only
 exact lowercase `y` authorizes a remaining mutation; other input, EOF,
@@ -124,14 +125,18 @@ interactive prompt names the remaining operation: `Prune matching sessions? [y/N
 
 The optional exact project scope is verified before selection. After
 authorization, the command opens its selected database using SQLite `mode=rw`,
-sets a bounded busy timeout and foreign keys, revalidates the preview, then
+sets a bounded busy timeout and foreign keys, runs SQLite `quick_check` and
+foreign-key validation, revalidates the preview, then
 performs known-child and session deletion in one immediate transaction. Any
 changed selection or displayed statistic refuses without mutation and instructs
 the operator to rerun. It validates again before commit and rolls back
 uncommitted work on failure. Incomplete known schemas, unknown session-linked
 tables, triggers on known session tables, and retained session-parent dependencies
 are refusals. Non-unique session IDs and known-table foreign keys crossing
-selected and retained session ownership are also refusals.
+selected and retained session ownership are also refusals. SQLite `quick_check`
+validates table and page structure but omits the full index/table consistency
+work of `integrity_check`; suspected index corruption requires a full offline
+SQLite integrity check before pruning.
 
 `--estimate-size` prints projected deleted logical bytes and projected total
 logical database bytes after prune in the preview, then committed logical values

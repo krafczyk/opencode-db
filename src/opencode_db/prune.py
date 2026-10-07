@@ -27,7 +27,6 @@ from .transfer import (
     _existing_regular_path,
     _open_rw,
     _quote,
-    _validate_database,
     _validate_session_schema,
 )
 
@@ -964,11 +963,19 @@ def _open_prune_read_connection(path: Path) -> sqlite3.Connection:
 
 
 def _validate_for_prune(connection: sqlite3.Connection) -> None:
-    try:
-        _validate_database(connection)
-    except TransferOperationalError as error:
-        raise PruneOperationalError(str(error)) from error
+    _validate_prune_database_health(connection)
     validate_session_schema(connection)
+
+
+def _validate_prune_database_health(connection: sqlite3.Connection) -> None:
+    """Require bounded SQLite page and foreign-key checks before pruning."""
+    try:
+        if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise PruneOperationalError("database integrity check failed")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise PruneOperationalError("database foreign key check failed")
+    except sqlite3.Error as error:
+        raise PruneOperationalError("database integrity validation failed") from error
 
 
 def _require_project_table(connection: sqlite3.Connection) -> None:

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -27,7 +27,6 @@ from opencode_db.prune import (
     prune_sessions,
     session_logical_sizes,
 )
-from opencode_db.transfer import TransferOperationalError
 
 
 _TEST_ROOT = Path("/tmp/opencode-db-v1")
@@ -876,8 +875,8 @@ class SessionPruneTests(unittest.TestCase):
 
             with patch.object(
                 prune_module,
-                "_validate_database",
-                side_effect=TransferOperationalError(
+                "_validate_prune_database_health",
+                side_effect=PruneOperationalError(
                     "database integrity validation failed"
                 ),
             ), patch.object(
@@ -891,8 +890,8 @@ class SessionPruneTests(unittest.TestCase):
             reviewed = plan_prune(request)
             with patch.object(
                 prune_module,
-                "_validate_database",
-                side_effect=TransferOperationalError(
+                "_validate_prune_database_health",
+                side_effect=PruneOperationalError(
                     "database integrity validation failed"
                 ),
             ), patch.object(
@@ -904,6 +903,37 @@ class SessionPruneTests(unittest.TestCase):
                     apply_prune_plan(reviewed)
 
             self.assertEqual(self._session_ids(database), ["one", "two"])
+
+    def test_prune_validation_uses_quick_integrity_check(self) -> None:
+        """Avoid an unbounded full index scan while retaining database health checks."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            statements: list[str] = []
+
+            with _connection(database) as connection:
+                connection.set_trace_callback(statements.append)
+                prune_module._validate_for_prune(connection)
+
+            pragmas = [statement.lower() for statement in statements]
+            self.assertIn("pragma quick_check", pragmas)
+            self.assertNotIn("pragma integrity_check", pragmas)
+
+    def test_prune_health_checks_refuse_integrity_and_foreign_key_failures(self) -> None:
+        """Fail closed when either bounded database health check reports a problem."""
+        connection = Mock(spec=sqlite3.Connection)
+        quick_check = Mock()
+        quick_check.fetchall.return_value = [("corrupt",)]
+        connection.execute.return_value = quick_check
+        with self.assertRaisesRegex(PruneOperationalError, "integrity check failed"):
+            prune_module._validate_prune_database_health(connection)
+
+        quick_check.fetchall.return_value = [("ok",)]
+        foreign_key_check = Mock()
+        foreign_key_check.fetchone.return_value = ("message", 1, "session", 0)
+        connection.execute.side_effect = (quick_check, foreign_key_check)
+        with self.assertRaisesRegex(PruneOperationalError, "foreign key check failed"):
+            prune_module._validate_prune_database_health(connection)
 
     def test_writer_revalidation_reuses_caps_and_deadline_then_rolls_back(self) -> None:
         """Bound application work after locking and retain rows after a revalidation refusal."""
@@ -1170,6 +1200,21 @@ class SessionPruneTests(unittest.TestCase):
             self.assertEqual(outcome.deleted_sessions, 1)
             self.assertIsNotNone(outcome.physical_database_bytes)
             self.assertEqual(outcome.physical_database_bytes, database.stat().st_size)
+
+    def test_vacuum_physically_truncates_pages_freed_by_prune(self) -> None:
+        """Reduce the database file rather than only making deleted pages reusable."""
+        with self._temporary_directory() as root:
+            database = root / "opencode.db"
+            self._create_database(database)
+            self._insert_session(database, "old", "a", 1, b"x" * (512 * 1024))
+            self._insert_session(database, "new", "a", 2, b"new")
+            before = database.stat().st_size
+
+            outcome = prune_sessions(database, oldest="1", vacuum=True)
+
+            self.assertEqual(outcome.deleted_sessions, 1)
+            self.assertEqual(outcome.physical_database_bytes, database.stat().st_size)
+            self.assertLess(database.stat().st_size, before)
 
     def test_post_commit_vacuum_failure_reports_the_committed_prune(self) -> None:
         """Expose committed deletion and direct recovery to vacuum-only mode."""
