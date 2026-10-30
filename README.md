@@ -10,6 +10,40 @@ The tool is an operator-run recovery aid for the supported normal SQLite WAL
 path. It is not an OpenCode integration, a service manager, or a general SQLite
 salvage tool.
 
+## WAL repair quick start
+
+**WAL repair is the two-step `cleanup preview` → `cleanup install` workflow.**
+Running `opencode-db cleanup` alone prints these instructions; it does not repair
+or replace the database.
+
+Stop OpenCode and arrange concurrent-use safety, then run:
+
+```bash
+opencode-db cleanup preview
+```
+
+Preview retains the original database and sidecars, rebuilds SQLite's WAL index
+on a working copy, replays/checkpoints the WAL, and validates a sidecar-free
+candidate. **It does not change the active database.** Run the exact `next:`
+`opencode-db cleanup install ...` command it prints to install that candidate.
+For `uncertain` candidates, review the classification before using the printed
+report-digest approval. Invalid candidates cannot be installed. Start OpenCode
+separately after a successful install.
+
+To perform the space-heavy work elsewhere, create a private work directory on a
+local filesystem with enough room:
+
+```bash
+mkdir -m 700 /absolute/spacious/opencode-db-work
+opencode-db cleanup preview --work-dir /absolute/spacious/opencode-db-work
+# Run the printed install command, which includes the same --work-dir.
+```
+
+Add `--database /absolute/path/opencode.db` to select a non-default cleanup
+database. `--work-dir` changes work placement, not database selection. See
+[Work location and capacity diagnostics](#work-location-and-capacity-diagnostics)
+for placement details, including the space still required beside the database.
+
 ## Scope and requirements
 
 - Linux only; Python 3.11 or newer.
@@ -273,7 +307,8 @@ First arrange OpenCode shutdown if it is needed. Then preview the bounded
 default database or provide an explicit absolute path. Preview immediately
 captures the main file and any present
 `-wal`, `-shm`, and `-journal` sidecars, works only on a separate scratch copy,
-and retains the source snapshot privately beside the target.
+and retains the source snapshot privately beside the target by default. With
+`--work-dir`, retained evidence goes under that explicit directory instead.
 
 ```bash
 opencode-db cleanup preview --json
@@ -341,7 +376,8 @@ opencode-db cleanup abort --operation operation-YYYYMMDDTHHMMSSZ-HEX
 ## Retained artifacts and pruning
 
 Private target-scoped evidence is retained under
-`<database-parent>/.opencode-db/<target-id>/`. It includes source manifests and
+`<database-parent>/.opencode-db/<target-id>/`, or
+`<work-dir>/.opencode-db/<target-id>/` when `--work-dir` was selected. It includes source manifests and
 snapshots, candidates, reports, and installation intent/recovery state. There
 is no age- or count-based deletion.
 
@@ -462,9 +498,68 @@ seconds from 1 through 86400. SQLite busy waits are finite. The tool requires
 private retained storage, admitted local scratch storage, and sufficient space
 and inodes before sensitive writes. Recovery can temporarily multiply disk use:
 plan capacity for the original source set, retained snapshot, scratch copy,
-candidate, staging, and rollback files. Set `--scratch-dir` to an explicit
-absolute local path when the default `$TMPDIR/opencode-db` location is not the
-right local filesystem.
+candidate, staging, and rollback files. Set `--work-dir` or `--scratch-dir` as
+described below when the defaults do not have sufficient capacity.
+
+### Work location and capacity diagnostics
+
+All commands accept `--work-dir /absolute/private/directory`. The directory must
+already exist with mode `0700`; the tool never silently falls back to another
+location. Cleanup uses it for durable recovery evidence, so **keep it until you
+have finished installation/recovery and explicitly pruned the retained backup**.
+
+| Storage | Default | With `--work-dir` |
+| --- | --- | --- |
+| Cleanup snapshots, candidates, reports, catalog, install intent | `<database-parent>/.opencode-db/<target-id>/` | `<work-dir>/.opencode-db/<target-id>/` |
+| Cleanup SQLite working copies and verification scratch | `$TMPDIR/opencode-db` (or `/tmp/opencode-db`) | `<work-dir>/scratch` |
+| SQLite temporary files for other commands, including prune/vacuum | SQLite's normal environment defaults | `<work-dir>` |
+| Final install staging, quarantined originals, rollback staging | Beside the database in its `.opencode-db` tree | Still beside the database |
+| Active database and SQLite WAL/journal | Selected database location | Same selected database location |
+| Export archive | `--export-dir` | Same `--export-dir` |
+
+Use the **same `--work-dir` on every later cleanup command** (`install`, `status`,
+`abort`, `resume`, `rollback`, `prune-backup`). Generated follow-up commands
+preserve it, along with an explicit `--scratch-dir` for installation. Artifact
+selection uses only the specified store; it does not search or migrate previous
+stores. Existing adjacent artifacts remain usable by omitting `--work-dir`.
+
+`--scratch-dir` remains available for cleanup preview/install and overrides only
+their local scratch location. For example, retained evidence may live on a large
+network filesystem while SQLite work uses a local disk:
+
+```bash
+opencode-db cleanup preview \
+  --work-dir /absolute/private/retained-evidence \
+  --scratch-dir /absolute/local/private/scratch
+```
+
+Writable SQLite scratch must be on an admitted local filesystem. For other
+commands, `--work-dir` itself must be local; for cleanup, only its selected
+scratch must be local. The CLI selects SQLite temporary storage through
+`SQLITE_TMPDIR` and `TMPDIR` before command execution. This is a per-invocation
+CLI setting; Python API callers manage their own SQLite temporary environment.
+
+For compaction without deleting sessions:
+
+```bash
+opencode-db prune --vacuum-only --work-dir /absolute/private/local-work
+```
+
+Relocating work reduces additional copies on a full database filesystem, but
+cannot eliminate its write-space requirement. Installation stages a complete
+candidate there before replacing files, retains quarantined originals there,
+and rollback stages original copies there. SQLite's active WAL/journal writes
+also stay with the database. Free enough capacity on that filesystem before
+installing or compacting; these commands do not move the active database.
+
+Capacity preflight failures identify **disk space**, **inodes**, or **both**,
+the checked location, and required/available byte and inode counts. Cleanup
+human and JSON diagnostics carry the same information. An unmeasurable
+filesystem is reported as a measurement failure rather than as a proven shortage.
+Runtime `ENOSPC`, quota, and SQLite `SQLITE_FULL` failures report relevant paths
+and current capacity. If current counts cannot establish the cause, the tool
+explicitly reports an undetermined resource (quota or temporary exhaustion may
+be responsible); it does not guess that bytes or inodes were exhausted.
 
 See [`docs/protocol.md`](docs/protocol.md) for the retained protocol, result
 schema, compatibility rules, and exact recovery/pruning eligibility.

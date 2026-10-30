@@ -44,7 +44,8 @@ from .target import (
     ensure_private_directory,
     resolve_recorded_target,
     resolve_target,
-    storage_space,
+    require_capacity,
+    storage_failure,
 )
 
 _SUFFIXES = {"main": "", "wal": "-wal", "shm": "-shm", "journal": "-journal"}
@@ -94,6 +95,7 @@ def install_candidate(
     *,
     approve_uncertain_report: str | None = None,
     scratch_dir: str,
+    work_dir: str | None = None,
     deadline_seconds: int = 1_800,
     environment: TargetEnvironment | None = None,
     hooks: InstallHooks | None = None,
@@ -102,7 +104,8 @@ def install_candidate(
 
     ``database`` and ``candidate`` must have been selected by
     :func:`opencode_db.artifacts.select_candidate`; ``scratch_dir`` is an
-    admitted local root, ``approve_uncertain_report`` must equal the report
+    admitted local root, ``work_dir`` selects the retained capture store,
+    ``approve_uncertain_report`` must equal the report
     digest for uncertain evidence, and the deadline is finite. Returns a
     terminal or incomplete :class:`InstallOutcome`. Before active mutation it
     refuses on changed evidence; after mutation it leaves durable recovery
@@ -116,11 +119,12 @@ def install_candidate(
             database,
             candidate.candidate_id,
             approve_uncertain_report,
+            work_dir=work_dir,
         )
         if selected != candidate:
             raise InstallError("candidate_changed")
         target = resolve_target(database)
-        snapshot = _load_snapshot_for_candidate(database, selected)
+        snapshot = _load_snapshot_for_candidate(database, selected, work_dir=work_dir)
         _require_manifest_matches(
             target.path, snapshot.manifest.files, started, deadline_seconds
         )
@@ -139,7 +143,7 @@ def install_candidate(
         )
         _fsync_directory(target.path.parent)
         operation_id = new_artifact_id("install")
-        snapshot = register_install_operation(database, selected, operation_id)
+        snapshot = register_install_operation(database, selected, operation_id, work_dir=work_dir)
         state = _new_state(
             target.path, target.target_id, snapshot, selected, operation_id, staged
         )
@@ -149,9 +153,15 @@ def install_candidate(
         )
     except (CaptureError, TargetError, InstallError) as error:
         code = error.code
-        return _failure_outcome("unknown", "unknown", "unknown", code)
-    except (OSError, sqlite3.Error):
-        return _failure_outcome("unknown", "unknown", "unknown", "install_failed")
+        return _failure_outcome(
+            "unknown", "unknown", "unknown", code,
+            storage_failure(error, Path(database).parent, Path(scratch_dir)),
+        )
+    except (OSError, sqlite3.Error) as error:
+        return _failure_outcome(
+            "unknown", "unknown", "unknown", "install_failed",
+            storage_failure(error, Path(database).parent, Path(scratch_dir)),
+        )
 
 
 def install_from_selection(
@@ -160,18 +170,20 @@ def install_from_selection(
     approve_uncertain_report: str | None,
     *,
     scratch_dir: str,
+    work_dir: str | None = None,
     deadline_seconds: int = 1_800,
     environment: TargetEnvironment | None = None,
 ) -> InstallOutcome:
     """Select and install one exact candidate through the public CLI boundary.
 
     Parameters are explicit operator values; uncertain evidence requires its
-    exact report digest.  Returns the same outcomes as :func:`install_candidate`
+    exact report digest. ``work_dir`` selects the capture store. Returns the
+    same outcomes as :func:`install_candidate`
     and raises no raw filesystem or SQLite errors.  This helper does not inspect
     processes or invoke OpenCode.
     """
     try:
-        candidate = select_candidate(database, candidate_id, approve_uncertain_report)
+        candidate = select_candidate(database, candidate_id, approve_uncertain_report, work_dir=work_dir)
     except CaptureError as error:
         return _failure_outcome("unknown", "unknown", candidate_id, error.code)
     return install_candidate(
@@ -179,19 +191,23 @@ def install_from_selection(
         candidate,
         approve_uncertain_report=approve_uncertain_report,
         scratch_dir=scratch_dir,
+        work_dir=work_dir,
         deadline_seconds=deadline_seconds,
         environment=environment,
     )
 
 
-def install_status(database: str, operation_id: str) -> InstallOutcome:
+def install_status(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> InstallOutcome:
     """Read one installation intent even when the active main path is absent.
 
-    Returns the exact persisted phase and identifiers without changing files or
+    ``work_dir`` selects the capture store. Returns the exact persisted phase
+    and identifiers without changing files or
     opening SQLite.  Raises :class:`InstallError` for malformed, foreign, or
     future state, which callers must treat as a read-only recovery refusal.
     """
-    snapshot = load_install_operation(database, operation_id)
+    snapshot = load_install_operation(database, operation_id, work_dir=work_dir)
     state = _read_state(
         _state_path(snapshot.snapshot_dir, operation_id), database, operation_id
     )
@@ -202,20 +218,22 @@ def resume_install(
     database: str,
     operation_id: str,
     *,
+    work_dir: str | None = None,
     deadline_seconds: int = 1_800,
     environment: TargetEnvironment | None = None,
     hooks: InstallHooks | None = None,
 ) -> InstallOutcome:
     """Continue one unambiguous persisted installation mutation.
 
-    The function accepts only exact recorded before/after bytes.  Ambiguous,
+    ``work_dir`` selects the capture store. The function accepts only exact
+    recorded before/after bytes. Ambiguous,
     changed, or missing artifacts become ``manual_recovery_required`` without
     deletion.  It uses the original staged candidate and retained snapshot, and
     never starts OpenCode or prompts for service state.
     """
     started = time.monotonic()
     try:
-        snapshot = load_install_operation(database, operation_id)
+        snapshot = load_install_operation(database, operation_id, work_dir=work_dir)
         state = _read_state(
             _state_path(snapshot.snapshot_dir, operation_id), database, operation_id
         )
@@ -225,29 +243,37 @@ def resume_install(
             database, state, started, deadline_seconds, hooks, environment
         )
     except (CaptureError, TargetError, InstallError) as error:
-        return _manual_or_failure(database, operation_id, error.code)
-    except (OSError, sqlite3.Error):
-        return _manual_or_failure(database, operation_id, "install_failed")
+        return _manual_or_failure(
+            database, operation_id, error.code, work_dir=work_dir,
+            diagnostic=storage_failure(error, Path(database).parent),
+        )
+    except (OSError, sqlite3.Error) as error:
+        return _manual_or_failure(
+            database, operation_id, "install_failed", work_dir=work_dir,
+            diagnostic=storage_failure(error, Path(database).parent),
+        )
 
 
 def rollback_install(
     database: str,
     operation_id: str,
     *,
+    work_dir: str | None = None,
     deadline_seconds: int = 1_800,
     environment: TargetEnvironment | None = None,
     hooks: InstallHooks | None = None,
 ) -> InstallOutcome:
     """Restore immutable accepted source bytes for one incomplete installation.
 
-    The explicit rollback first stages copies of the immutable snapshot and then
+    ``work_dir`` selects the capture store. The explicit rollback first stages
+    copies of the immutable snapshot and then
     records per-file replacement intents.  Quarantined originals are accepted
     only when hash-identical to the snapshot.  Unknown active bytes produce
     ``manual_recovery_required`` and leave every unmatched artifact intact.
     """
     started = time.monotonic()
     try:
-        snapshot = load_install_operation(database, operation_id)
+        snapshot = load_install_operation(database, operation_id, work_dir=work_dir)
         path = _state_path(snapshot.snapshot_dir, operation_id)
         state = _read_state(path, database, operation_id)
         if state["state"] == "rolled_back":
@@ -261,14 +287,20 @@ def rollback_install(
         state["index"] = 0
         state["actions"] = _rollback_actions(snapshot.snapshot_dir, state)
         _write_state(path, state)
-        set_install_operation_state(database, operation_id, "rolling_back")
+        set_install_operation_state(database, operation_id, "rolling_back", work_dir=work_dir)
         return _advance_install(
             database, state, started, deadline_seconds, hooks, environment
         )
     except (CaptureError, TargetError, InstallError) as error:
-        return _manual_or_failure(database, operation_id, error.code)
-    except (OSError, sqlite3.Error):
-        return _manual_or_failure(database, operation_id, "install_failed")
+        return _manual_or_failure(
+            database, operation_id, error.code, work_dir=work_dir,
+            diagnostic=storage_failure(error, Path(database).parent),
+        )
+    except (OSError, sqlite3.Error) as error:
+        return _manual_or_failure(
+            database, operation_id, "install_failed", work_dir=work_dir,
+            diagnostic=storage_failure(error, Path(database).parent),
+        )
 
 
 def _advance_install(
@@ -284,6 +316,7 @@ def _advance_install(
     operation_id = _string(state, "operation_id")
     snapshot_dir = Path(_string(state, "snapshot_dir"))
     path = _state_path(snapshot_dir, operation_id)
+    work_dir = _work_dir(state)
     active_mutated = _int(state, "index") > 0
     try:
         while _int(state, "index") < len(_actions(state)):
@@ -305,7 +338,7 @@ def _advance_install(
             )
             state["state"] = phase
             _write_state(path, state)  # durable intent before the active move
-            set_install_operation_state(database, operation_id, phase)
+            set_install_operation_state(database, operation_id, phase, work_dir=work_dir)
             # From this point recovery must assume replacement may have occurred,
             # including when a post-replace directory fsync raises.
             active_mutated = True
@@ -343,11 +376,11 @@ def _advance_install(
             )
             state["state"] = "rolled_back"
             _write_state(path, state)
-            set_install_operation_state(database, operation_id, "rolled_back")
+            set_install_operation_state(database, operation_id, "rolled_back", work_dir=work_dir)
             return _outcome_from_state(state)
         state["state"] = "validating"
         _write_state(path, state)
-        set_install_operation_state(database, operation_id, "validating")
+        set_install_operation_state(database, operation_id, "validating", work_dir=work_dir)
         validation = _validate_active(
             Path(_string(state, "target")), started, deadline_seconds
         )
@@ -355,7 +388,7 @@ def _advance_install(
             raise InstallError("validation_failed")
         state["state"] = "installed"
         _write_state(path, state)
-        set_install_operation_state(database, operation_id, "installed")
+        set_install_operation_state(database, operation_id, "installed", work_dir=work_dir)
         return _outcome_from_state(state, validation)
     except (OSError, sqlite3.Error, InstallError) as error:
         code = error.code if isinstance(error, InstallError) else "install_failed"
@@ -366,8 +399,8 @@ def _advance_install(
                 else "install_incomplete"
             )
             _write_state(path, state)
-            set_install_operation_state(database, operation_id, _string(state, "state"))
-            return _outcome_from_state(state)
+            set_install_operation_state(database, operation_id, _string(state, "state"), work_dir=work_dir)
+            return _outcome_from_state(state, diagnostic=storage_failure(error, Path(database).parent, snapshot_dir))
         raise InstallError(code) from error
 
 
@@ -401,12 +434,11 @@ def _stage_candidate(
             raise InstallError("validation_failed")
     finally:
         shutil.rmtree(local, ignore_errors=True)
-    stage_dir = snapshot_dir / "staging"
-    ensure_private_directory(stage_dir)
     required = candidate_size + 65536
-    capacity = storage_space(target.parent, environment)
-    if capacity.available_bytes < required or capacity.available_inodes < 3:
-        raise InstallError("storage_capacity")
+    require_capacity(target.parent, required, 8, environment=environment)
+    mutation_dir = _mutation_directory(target, snapshot_dir)
+    stage_dir = mutation_dir / "staging"
+    ensure_private_directory(stage_dir)
     if stage_dir.stat().st_dev != target.parent.stat().st_dev:
         raise InstallError("staging_not_local")
     staged = stage_dir / f"{candidate.candidate_id}.sqlite"
@@ -424,14 +456,32 @@ def _stage_candidate(
     return staged
 
 
-def _load_snapshot_for_candidate(database: str, candidate: CandidateEvidence):
+def _load_snapshot_for_candidate(
+    database: str, candidate: CandidateEvidence, *, work_dir: str | None = None
+):
     """Load the exact snapshot bound to a candidate without accepting path replay."""
-    target = resolve_target(database)
+    target = resolve_target(database, work_dir=work_dir)
     from .artifacts import load_accepted_snapshot
 
     return load_accepted_snapshot(
         target.control_dir / "snapshots" / candidate.snapshot_id
     )
+
+
+def _mutation_directory(target: Path, snapshot_dir: Path) -> Path:
+    """Create the adjacent namespace required for same-filesystem active moves."""
+    control = resolve_recorded_target(str(target)).control_dir
+    directory = control / "snapshots" / snapshot_dir.name
+    for path in (control.parent, control, control / "snapshots", directory):
+        ensure_private_directory(path)
+    return directory
+
+
+def _work_dir(state: dict[str, object]) -> str | None:
+    """Derive the explicit retained-store root from a validated intent record."""
+    snapshot = Path(_string(state, "snapshot_dir"))
+    root = snapshot.parents[3]
+    return None if root == Path(_string(state, "target")).parent else str(root)
 
 
 def _new_state(
@@ -445,8 +495,9 @@ def _new_state(
     """Create a closed durable state with one initial intent per active file."""
     snapshot_dir = snapshot.snapshot_dir
     manifest = snapshot.manifest
-    quarantine = snapshot_dir / "quarantine" / operation_id
-    ensure_private_directory(snapshot_dir / "quarantine")
+    mutation_dir = _mutation_directory(target, snapshot_dir)
+    quarantine = mutation_dir / "quarantine" / operation_id
+    ensure_private_directory(mutation_dir / "quarantine")
     ensure_private_directory(quarantine)
     actions: list[dict[str, str | None]] = []
     for source in manifest.files:
@@ -510,9 +561,10 @@ def _prepare_rollback(
 ) -> None:
     """Stage immutable originals for rollback without changing any active path."""
     target = Path(_string(state, "target"))
-    snapshot = load_install_operation(str(target), _string(state, "operation_id"))
-    rollback = snapshot_dir / "rollback" / _string(state, "operation_id")
-    ensure_private_directory(snapshot_dir / "rollback")
+    snapshot = load_install_operation(str(target), _string(state, "operation_id"), work_dir=_work_dir(state))
+    mutation_dir = _mutation_directory(target, snapshot_dir)
+    rollback = mutation_dir / "rollback" / _string(state, "operation_id")
+    ensure_private_directory(mutation_dir / "rollback")
     ensure_private_directory(rollback)
     for source in snapshot.manifest.files:
         active = Path(f"{target}{_SUFFIXES[source.name]}")
@@ -542,9 +594,10 @@ def _rollback_actions(
 ) -> list[dict[str, str | None]]:
     """Return restoration intents from staged immutable bytes to active names."""
     snapshot = load_install_operation(
-        _string(state, "target"), _string(state, "operation_id")
+        _string(state, "target"), _string(state, "operation_id"), work_dir=_work_dir(state)
     )
-    rollback = snapshot_dir / "rollback" / _string(state, "operation_id")
+    mutation_dir = _mutation_directory(Path(_string(state, "target")), snapshot_dir)
+    rollback = mutation_dir / "rollback" / _string(state, "operation_id")
     actions: list[dict[str, str | None]] = []
     for source in snapshot.manifest.files:
         if not source.present:
@@ -552,7 +605,10 @@ def _rollback_actions(
         assert source.sha256 is not None
         destination = Path(f"{_string(state, 'target')}{_SUFFIXES[source.name]}")
         observed = _digest_if_regular(destination)
-        if observed is not None and observed != _string(state, "candidate_sha256"):
+        allowed = {source.sha256}
+        if source.name == "main":
+            allowed.add(_string(state, "candidate_sha256"))
+        if observed is not None and observed not in allowed:
             raise InstallError("manual_recovery_required")
         actions.append(
             _action(
@@ -639,7 +695,9 @@ def _validate_active(path: Path, started: float, deadline_seconds: int) -> Valid
             )
             else Check.FAIL
         )
-    except (OSError, sqlite3.Error, InstallError):
+    except (OSError, sqlite3.Error, InstallError) as error:
+        if storage_failure(error, path.parent):
+            raise
         pass
     return Validation(integrity, foreign_keys, Check.PASS, clean_reopen, sidecars)
 
@@ -726,6 +784,7 @@ def _read_state(path: Path, database: str, operation_id: str) -> dict[str, objec
         value["operation_id"] != operation_id
         or value["target"] != str(target.path)
         or value["target_id"] != target.target_id
+        or path != _state_path(Path(_string(value, "snapshot_dir")), operation_id)
     ):
         raise InstallError("manual_recovery_required")
     return value
@@ -815,13 +874,13 @@ def _validate_action_paths(state: dict[str, object], actions: list[object]) -> N
     operation_id = _string(state, "operation_id")
     candidate_id = _string(state, "candidate_id")
     snapshot_dir = Path(_string(state, "snapshot_dir"))
-    expected_snapshot = (
+    mutation_dir = (
         target.parent / ".opencode-db" / target_id / "snapshots" / snapshot_id
     )
     if (
         not target.is_absolute()
         or not snapshot_dir.is_absolute()
-        or snapshot_dir != expected_snapshot
+        or snapshot_dir.parts[-4:] != (".opencode-db", target_id, "snapshots", snapshot_id)
     ):
         raise InstallError("manual_recovery_required")
     active = {
@@ -836,16 +895,16 @@ def _validate_action_paths(state: dict[str, object], actions: list[object]) -> N
         destination = Path(_action_string(action, "destination"))
         if kind == "retain":
             name = active.get(str(source))
-            expected = snapshot_dir / "quarantine" / operation_id / str(name)
+            expected = mutation_dir / "quarantine" / operation_id / str(name)
             valid = name is not None and destination == expected
         elif kind == "promote":
             valid = (
-                source == snapshot_dir / "staging" / f"{candidate_id}.sqlite"
+                source == mutation_dir / "staging" / f"{candidate_id}.sqlite"
                 and destination == target
             )
         else:
             name = active.get(str(destination))
-            expected = snapshot_dir / "rollback" / operation_id / str(name)
+            expected = mutation_dir / "rollback" / operation_id / str(name)
             valid = name is not None and source == expected
         if not valid:
             raise InstallError("manual_recovery_required")
@@ -866,7 +925,9 @@ def _state_path(snapshot_dir: Path, operation_id: str) -> Path:
 
 
 def _outcome_from_state(
-    state: dict[str, object], validation: Validation | None = None
+    state: dict[str, object],
+    validation: Validation | None = None,
+    diagnostic: str | None = None,
 ) -> InstallOutcome:
     """Convert closed persisted state to a public typed recovery observation."""
     return InstallOutcome(
@@ -875,22 +936,30 @@ def _outcome_from_state(
         _string(state, "candidate_id"),
         _string(state, "state"),
         validation or Validation(),
+        diagnostic_message=diagnostic,
     )
 
 
 def _failure_outcome(
-    operation: str, snapshot: str, candidate: str, code: str
+    operation: str, snapshot: str, candidate: str, code: str, diagnostic: str | None = None
 ) -> InstallOutcome:
     """Return a bounded non-mutating failure observation for CLI conversion."""
     return InstallOutcome(
-        operation, snapshot, candidate, "install_incomplete", Validation(), code
+        operation, snapshot, candidate, "install_incomplete", Validation(), code, diagnostic
     )
 
 
-def _manual_or_failure(database: str, operation_id: str, code: str) -> InstallOutcome:
+def _manual_or_failure(
+    database: str,
+    operation_id: str,
+    code: str,
+    *,
+    work_dir: str | None = None,
+    diagnostic: str | None = None,
+) -> InstallOutcome:
     """Persist manual recovery only when the exact state file remains locatable."""
     try:
-        snapshot = load_install_operation(database, operation_id)
+        snapshot = load_install_operation(database, operation_id, work_dir=work_dir)
         state_path = _state_path(snapshot.snapshot_dir, operation_id)
         state = _read_state(state_path, database, operation_id)
         state["state"] = (
@@ -900,11 +969,11 @@ def _manual_or_failure(database: str, operation_id: str, code: str) -> InstallOu
             else "install_incomplete"
         )
         _write_state(state_path, state)
-        set_install_operation_state(database, operation_id, _string(state, "state"))
-        return _outcome_from_state(state)
+        set_install_operation_state(database, operation_id, _string(state, "state"), work_dir=work_dir)
+        return _outcome_from_state(state, diagnostic=diagnostic)
     except (CaptureError, InstallError, TargetError):
         return InstallOutcome(
-            operation_id, "unknown", "unknown", "manual_recovery_required"
+            operation_id, "unknown", "unknown", "manual_recovery_required", diagnostic_message=diagnostic
         )
 
 

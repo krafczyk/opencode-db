@@ -100,7 +100,8 @@ class CommandRequest:
 
     Parameters record only parsed operator input. The request does not resolve
     paths, access stdin, open SQLite, or mutate artifacts; later units supply
-    that execution behavior.
+    that execution behavior. ``work_dir`` optionally selects the private retained
+    store and default scratch root; it must be reused for follow-up commands.
     """
 
     command: str
@@ -112,6 +113,7 @@ class CommandRequest:
     operation_id: str | None = None
     snapshot_id: str | None = None
     approve_uncertain_report: str | None = None
+    work_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -256,7 +258,8 @@ class CaptureOutcome:
     Parameters identify the canonical ``target`` when it resolved and opaque
     target-scoped IDs, state whether the snapshot was ``accepted``, classify the
     bounded ``status``, and name the private ``snapshot_dir`` when capture
-    reached artifact creation.
+    reached artifact creation. ``diagnostic_message`` is an optional tool-generated
+    storage diagnostic containing only paths and capacity counts.
     The artifact layer returns this type without opening SQLite or producing a
     candidate; callers must not treat an unaccepted outcome as installable.
     """
@@ -268,6 +271,7 @@ class CaptureOutcome:
     snapshot_dir: Path | None
     accepted: bool
     status: str
+    diagnostic_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -297,7 +301,8 @@ class CleanupOutcome:
     ``candidate_path`` and ``report_path`` remain ``None`` for invalid or
     operational outcomes, while a readable invalid candidate can still retain
     its safe preview. This value does not itself write files or authorize
-    installation.
+    installation. ``diagnostic_message`` optionally explains storage failures
+    with tool-generated paths and capacity counts, never raw exception text.
     """
 
     snapshot_id: str
@@ -312,6 +317,7 @@ class CleanupOutcome:
     report_sha256: str | None = None
     preview: dict[str, Any] | None = None
     diagnostic_code: str | None = None
+    diagnostic_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -342,6 +348,7 @@ class InstallOutcome:
     recorded installation phase, and ``validation`` contains only non-migrating
     SQLite checks performed at the active target.  Construction is read-only;
     :mod:`opencode_db.install` performs the associated filesystem work.
+    ``diagnostic_message`` optionally carries a tool-generated storage diagnostic.
     """
 
     operation_id: str
@@ -350,6 +357,7 @@ class InstallOutcome:
     state: str
     validation: Validation = field(default_factory=Validation)
     code: str | None = None
+    diagnostic_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +462,8 @@ class Result:
             "artifact_not_private": "Private artifact storage cannot be established.",
             "artifact_schema_unsupported": "Retained artifact state is not a supported schema.",
             "scratch_invalid": "Scratch storage must be an absolute filesystem path.",
+            "work_invalid": "--work-dir requires an absolute filesystem path.",
+            "work_not_private": "--work-dir must be an existing mode-0700 directory.",
             "deadline_exceeded": "The operation deadline expired before capture completed.",
             "copy_failed": "Source capture could not complete safely.",
             "snapshot_invalid": "The retained source snapshot is not accepted or has changed.",

@@ -1,8 +1,9 @@
 """Parse and render the closed OpenCode database cleanup command contract.
 
-The module freezes the version-1 grammar and result encoding. Preview composes
-immutable capture with normal SQLite cleanup; it never inspects processes,
-reads stdin, or opens an active or retained database through SQLite.
+Cleanup preserves version-1 result encoding while exposing WAL recovery,
+explicit work placement, and bounded storage diagnostics. Other commands use
+their human-only interfaces. Execution delegates database mutations to their
+command modules and never inspects processes or invokes OpenCode.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import sys
 import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from pathlib import Path
 
 from .artifacts import (
     CaptureError,
@@ -81,7 +84,13 @@ from .transfer import (
     import_sessions,
     parse_transfer_command,
 )
-from .target import TargetError, select_default_database
+from .target import (
+    TargetError,
+    select_default_database,
+    sqlite_temporary_directory,
+    storage_failure,
+    validate_work_directory,
+)
 
 MAX_JSON_BYTES = 64 * 1024
 """Maximum UTF-8 byte length for a machine-mode result, including its newline."""
@@ -121,6 +130,8 @@ _REQUIRED_OPTIONS = {
     "rollback": {"operation"},
     "prune-backup": {"snapshot"},
 }
+for _options in _COMMAND_OPTIONS.values():
+    _options.add("work-dir")
 
 
 class CliUsageError(ValueError):
@@ -147,13 +158,24 @@ def parse_command(
     :class:`InspectionRequest`, :class:`MoveCommandRequest`,
     :class:`MoveRepairCommandRequest`, or :class:`PruneRequest` with validated
     fields; cleanup requests use a concrete environment-selected database string
-    when their option is omitted.
+    when their option is omitted. Every request accepts an absolute ``work_dir``
+    for CLI work placement; execution validates its privacy and local scratch.
     Raises :class:`CliUsageError` or
     :class:`TransferUsageError` for unknown commands, missing options, invalid
     absolute paths, ambiguous IDs, duplicate options, and non-finite deadlines.
     The function never reads stdin, creates a database, or mutates a file.
     """
     values = list(arguments)
+    if values and values[0] != "cleanup" and "--work-dir" in values:
+        command = values[0]
+        if values.count("--work-dir") != 1:
+            raise CliUsageError(command, "Command options may not be repeated.")
+        position = values.index("--work-dir")
+        if position + 1 >= len(values) or values[position + 1].startswith("--"):
+            raise CliUsageError(command, "--work-dir is missing its value.")
+        work_dir = _absolute_path(values[position + 1], command, "work-dir")
+        del values[position:position + 2]
+        return replace(parse_command(values), work_dir=work_dir)
     if values and values[0] in {"list-projects", "show-project", "show-session", "list-sessions"}:
         return _parse_inspection_command(values)
     if values and values[0] == "prune":
@@ -228,6 +250,7 @@ def parse_command(
         operation_id=operation_id,
         snapshot_id=snapshot_id,
         approve_uncertain_report=report,
+        work_dir=_optional_path(options, "work-dir", command),
     )
 
 
@@ -436,9 +459,13 @@ def render_human(result: Result) -> str:
                 if isinstance(session, dict)
             )
         lines.extend(f"next: {action}" for action in result.next_actions)
+        lines.extend(f"diagnostic: {item.message}" for item in result.diagnostics)
         return "\n".join(lines) + "\n"
     if result.diagnostics:
-        return f"opencode-db: {result.diagnostics[0].message}\n"
+        return "\n".join([
+            *(f"opencode-db: {item.message}" for item in result.diagnostics),
+            *(f"next: {action}" for action in result.next_actions),
+        ]) + "\n"
     return f"opencode-db: {result.status.value}\n"
 
 
@@ -448,8 +475,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     Parameters: ``arguments`` optionally replaces ``sys.argv[1:]``. Returns the
     documented exit class. Machine-mode parse errors emit one JSON result on
     stdout and no diagnostics there. ``cleanup preview`` captures an explicit
-    target and cleans only a fresh scratch copy; other commands safely refuse
-    execution until later units implement their artifact operations. ``mv`` and
+    target and cleans only a fresh scratch copy. Work-root selection preserves
+    retained evidence across cleanup commands and sets the CLI temporary
+    environment before SQLite work. ``mv`` and
     ``prune`` and ``repair-move`` read one terminal confirmation unless
     ``--yes`` is explicit.
     """
@@ -477,6 +505,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
             sys.stderr.write(render_human(result))
         return EXIT_USAGE
 
+    try:
+        if isinstance(request, CommandRequest):
+            if request.work_dir is not None:
+                validate_work_directory(request.work_dir)
+            temporary = _scratch_dir(request)
+        else:
+            temporary = request.work_dir
+        with sqlite_temporary_directory(
+            temporary,
+            validate=not isinstance(request, CommandRequest),
+            update_tmpdir=not isinstance(request, CommandRequest),
+        ):
+            return _dispatch_request(request)
+    except TargetError as error:
+        failure = Result.failure(
+            command=request.command,
+            status=Status.PRECONDITION_REFUSED,
+            exit_code=EXIT_PRECONDITION_REFUSED,
+            diagnostic_code=error.code,
+            diagnostic_message="",
+        )
+        failure = _with_storage_diagnostic(failure, error.diagnostic)
+        if isinstance(request, CommandRequest) and request.json:
+            sys.stdout.write(render_json(failure))
+        else:
+            sys.stderr.write(render_human(failure))
+        return EXIT_PRECONDITION_REFUSED
+
+
+def _dispatch_request(request: CommandRequest | TransferRequest | InspectionRequest | PruneRequest | MoveCommandRequest | MoveRepairCommandRequest) -> int:
+    """Execute a parsed request within its selected CLI temporary environment."""
     if isinstance(request, TransferRequest):
         return _execute_transfer(request)
     if isinstance(request, InspectionRequest):
@@ -517,7 +576,7 @@ def _execute_inspection(request: InspectionRequest) -> int:
         )
         return 0
     except InspectionOperationalError as error:
-        sys.stderr.write(f"opencode-db: {error}\n")
+        sys.stderr.write(f"opencode-db: {_command_error(error, request.database, request.work_dir)}\n")
         return EXIT_OPERATIONAL_FAILURE
     except InspectionError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
@@ -565,10 +624,11 @@ def _execute_prune(request: PruneRequest) -> int:
         return 0
     except PruneCommittedError as error:
         sys.stdout.write(_render_prune_outcome(request, error.outcome))
-        sys.stderr.write(f"opencode-db: {error}\n")
+        detail = _command_error(error, request.database, request.work_dir)
+        sys.stderr.write(f"opencode-db: {error}" + (f"; {detail}" if detail != str(error) else "") + "\n")
         return EXIT_OPERATIONAL_FAILURE
     except PruneOperationalError as error:
-        sys.stderr.write(f"opencode-db: {error}\n")
+        sys.stderr.write(f"opencode-db: {_command_error(error, request.database, request.work_dir)}\n")
         return EXIT_OPERATIONAL_FAILURE
     except PruneError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
@@ -759,7 +819,7 @@ def _execute_transfer(request: TransferRequest) -> int:
         )
         return 0
     except TransferOperationalError as error:
-        sys.stderr.write(f"opencode-db: {error}\n")
+        sys.stderr.write(f"opencode-db: {_command_error(error, request.database, request.export_dir)}\n")
         return EXIT_OPERATIONAL_FAILURE
     except TransferError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
@@ -800,7 +860,8 @@ def _execute(request: CommandRequest) -> Result:
     started = time.monotonic()
     capture = capture_source_set(
         request.database,
-        scratch_dir=request.scratch_dir,
+        scratch_dir=_scratch_dir(request),
+        work_dir=request.work_dir,
         deadline_seconds=deadline,
     )
     if not capture.accepted or capture.snapshot_dir is None:
@@ -819,13 +880,15 @@ def _execute(request: CommandRequest) -> Result:
             "artifact_not_private",
             "artifact_schema_unsupported",
             "scratch_invalid",
+            "work_invalid",
+            "work_not_private",
         }:
             status = Status.PRECONDITION_REFUSED
             exit_code = EXIT_PRECONDITION_REFUSED
         else:
             status = Status.OPERATIONAL_FAILURE
             exit_code = EXIT_OPERATIONAL_FAILURE
-        return Result.failure(
+        failure = Result.failure(
             command=request.command,
             status=status,
             exit_code=exit_code,
@@ -835,9 +898,8 @@ def _execute(request: CommandRequest) -> Result:
             snapshot_id=capture.snapshot_id,
             operation_id=capture.operation_id,
         )
-    scratch = request.scratch_dir or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "opencode-db"
-    )
+        return _with_storage_diagnostic(failure, capture.diagnostic_message)
+    scratch = _scratch_dir(request)
     remaining = max(0, deadline - math.ceil(time.monotonic() - started))
     outcome = clean_snapshot(
         capture.snapshot_dir,
@@ -861,6 +923,8 @@ def _execute(request: CommandRequest) -> Result:
             diagnostic_code=outcome.diagnostic_code,
             diagnostic_message=outcome.diagnostic_code,
         ).diagnostics
+        if outcome.diagnostic_message:
+            diagnostics = (Diagnostic(outcome.diagnostic_code, outcome.diagnostic_message),)
     return Result(
         command=request.command,
         ok=outcome.completeness == "complete",
@@ -897,12 +961,12 @@ def _status_result(request: CommandRequest) -> Result:
         )
     if request.operation_id.startswith("install-"):
         try:
-            outcome = install_status(request.database, request.operation_id)
+            outcome = install_status(request.database, request.operation_id, work_dir=request.work_dir)
         except Exception:
             return _artifact_failure(request, "candidate_changed")
         return _install_outcome_result(request, outcome)
     try:
-        evidence = operation_status(request.database, request.operation_id)
+        evidence = operation_status(request.database, request.operation_id, work_dir=request.work_dir)
     except CaptureError as error:
         return _artifact_failure(request, error.code)
     location = evidence.scratch_path or "none"
@@ -922,7 +986,7 @@ def _status_result(request: CommandRequest) -> Result:
             ),
         ),
         next_actions=_status_actions(
-            request.database, evidence.operation_id, evidence.state
+            request.database, evidence.operation_id, evidence.state, request.work_dir
         ),
     )
 
@@ -936,7 +1000,7 @@ def _abort_result(request: CommandRequest) -> Result:
     """
     assert request.operation_id is not None
     try:
-        evidence = abort_preview_operation(request.database, request.operation_id)
+        evidence = abort_preview_operation(request.database, request.operation_id, work_dir=request.work_dir)
     except CaptureError as error:
         return _artifact_failure(request, error.code)
     if evidence.state == "scratch_cleanup_required":
@@ -981,8 +1045,8 @@ def _install_result(request: CommandRequest) -> Result:
         request.database,
         request.candidate_id,
         request.approve_uncertain_report,
-        scratch_dir=request.scratch_dir
-        or os.path.join(os.environ.get("TMPDIR", "/tmp"), "opencode-db"),
+        scratch_dir=_scratch_dir(request),
+        work_dir=request.work_dir,
         deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
     )
     return _install_outcome_result(request, outcome)
@@ -996,6 +1060,7 @@ def _resume_result(request: CommandRequest) -> Result:
         resume_install(
             request.database,
             request.operation_id,
+            work_dir=request.work_dir,
             deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
         ),
     )
@@ -1009,6 +1074,7 @@ def _rollback_result(request: CommandRequest) -> Result:
         rollback_install(
             request.database,
             request.operation_id,
+            work_dir=request.work_dir,
             deadline_seconds=request.deadline_seconds or DEFAULT_DEADLINE_SECONDS,
         ),
     )
@@ -1025,7 +1091,7 @@ def _prune_backup_result(request: CommandRequest) -> Result:
     """
     assert request.snapshot_id is not None
     try:
-        prune_backup(request.database, request.snapshot_id)
+        prune_backup(request.database, request.snapshot_id, work_dir=request.work_dir)
     except CaptureError as error:
         return _artifact_failure(request, error.code)
     return Result(
@@ -1077,6 +1143,18 @@ def _install_outcome_result(request: CommandRequest, outcome: object) -> Result:
     candidate_id = getattr(outcome, "candidate_id", request.candidate_id)
     snapshot_id = getattr(outcome, "snapshot_id", None)
     validation = getattr(outcome, "validation", None)
+    diagnostic = getattr(outcome, "diagnostic_message", None)
+    if diagnostic is None:
+        diagnostic = (
+            Result.failure(
+                command=request.command,
+                status=status,
+                exit_code=exit_code,
+                diagnostic_code=code_name,
+                diagnostic_message="",
+            ).diagnostics[0].message
+            if code_name else f"installation is {state_name}"
+        )
     return Result(
         command=request.command,
         ok=status in {Status.INSTALLED, Status.ROLLED_BACK, Status.STATUS_OK},
@@ -1089,13 +1167,13 @@ def _install_outcome_result(request: CommandRequest, outcome: object) -> Result:
         if operation_id != "unknown"
         else request.operation_id,
         validation=validation if validation is not None else Result().validation,
-        next_actions=_install_actions(request.database, operation_id, state_name),
-        diagnostics=(Diagnostic("install_state", f"installation is {state_name}"),),
+        next_actions=_install_actions(request.database, operation_id, state_name, request.work_dir),
+        diagnostics=(Diagnostic(code_name or "install_state", diagnostic),),
     )
 
 
 def _install_actions(
-    database: str, operation_id: object, state: object
+    database: str, operation_id: object, state: object, work_dir: str | None = None
 ) -> tuple[str, ...]:
     """Return exact recovery actions only for an incomplete persisted install."""
     if (
@@ -1104,7 +1182,7 @@ def _install_actions(
         or state not in {"install_incomplete", "rolling_back"}
     ):
         return ()
-    target = shlex.quote(database)
+    target = shlex.quote(database) + _work_option(work_dir)
     return (
         f"opencode-db cleanup resume --database {target} --operation {operation_id}",
         f"opencode-db cleanup rollback --database {target} --operation {operation_id}",
@@ -1126,12 +1204,12 @@ def _artifact_failure(request: CommandRequest, code: str) -> Result:
     )
 
 
-def _status_actions(database: str, operation_id: str, state: str) -> tuple[str, ...]:
+def _status_actions(database: str, operation_id: str, state: str, work_dir: str | None = None) -> tuple[str, ...]:
     """Return valid bounded next actions for one read-only operation status."""
     if state == "previewing":
         return (
             "opencode-db cleanup abort "
-            f"--database {shlex.quote(database)} --operation {operation_id}",
+            f"--database {shlex.quote(database)}{_work_option(work_dir)} --operation {operation_id}",
         )
     return ()
 
@@ -1152,12 +1230,43 @@ def _preview_actions(request: CommandRequest, outcome: object) -> tuple[str, ...
     base = (
         "opencode-db cleanup install "
         f"--database {shlex.quote(request.database)} --candidate {candidate_id}"
+        + _work_option(request.work_dir)
+        + (f" --scratch-dir {shlex.quote(request.scratch_dir)}" if request.scratch_dir else "")
     )
     if completeness == "complete":
         return (base,)
     if completeness == "uncertain" and isinstance(report_sha256, str):
         return (f"{base} --approve-uncertain-report {report_sha256}",)
     return ()
+
+
+def _scratch_dir(request: CommandRequest) -> str:
+    """Select explicit scratch, work-root scratch, or the existing TMPDIR default."""
+    return request.scratch_dir or os.path.join(
+        request.work_dir or os.environ.get("TMPDIR", "/tmp"),
+        "scratch" if request.work_dir else "opencode-db",
+    )
+
+
+def _work_option(work_dir: str | None) -> str:
+    """Preserve the explicit retained-store selection in copyable follow-ups."""
+    return f" --work-dir {shlex.quote(work_dir)}" if work_dir else ""
+
+
+def _with_storage_diagnostic(result: Result, message: str | None) -> Result:
+    """Attach only a tool-generated capacity diagnostic, never raw exceptions."""
+    if message is None:
+        return result
+    return replace(result, diagnostics=(Diagnostic(result.diagnostics[0].code, message),))
+
+
+def _command_error(error: BaseException, database: str | None, work: str | None = None) -> str:
+    """Report storage error causes with known paths and safe current counts."""
+    paths = [Path(database).parent] if database else []
+    if work:
+        paths.append(Path(work))
+    paths.append(Path(os.environ.get("SQLITE_TMPDIR", os.environ.get("TMPDIR", "/tmp"))))
+    return storage_failure(error, *paths) or str(error)
 
 
 def _option(options: dict[str, str | bool], name: str) -> str:
@@ -1251,7 +1360,7 @@ def _optional_deadline(options: dict[str, str | bool], command: str) -> int | No
 
 
 def _wants_help(values: Sequence[str]) -> bool:
-    return "--help" in values or "-h" in values
+    return values == ["cleanup"] or "--help" in values or "-h" in values
 
 
 def _help_text(values: Sequence[str]) -> str:
@@ -1284,15 +1393,36 @@ def _help_text(values: Sequence[str]) -> str:
             "stale previews refuse with instructions to rerun."
         )
     }
+    wal_help = (
+        "WAL repair (stop OpenCode first):\n"
+        "  1. opencode-db cleanup preview [--database ABSOLUTE_PATH] [--work-dir ABSOLUTE_PATH]\n"
+        "     Replays/checkpoints WAL on a copy and validates a sidecar-free candidate.\n"
+        "  2. Run the exact 'next' cleanup install command printed by preview.\n"
+        "     Only install replaces the active database; snapshots are retained.\n"
+        "--work-dir selects an existing mode-0700 directory for snapshots, candidates,\n"
+        "reports and default scratch (WORK_DIR/scratch). Reuse it for later cleanup commands.\n"
+        "--scratch-dir overrides only local SQLite scratch; final install staging stays beside the database.\n"
+    )
+    synopses = {
+        name: synopsis + " [--work-dir ABSOLUTE_PATH]"
+        for name, synopsis in synopses.items()
+    }
     if values and values[0] in top_level:
         selected = values[0]
-        detail = f"\n{details[selected]}" if selected in details else ""
+        detail = (f"\n{details[selected]}" if selected in details else "") + (
+            "\n--work-dir selects an existing private local directory for SQLite temporary files.\n"
+            "The active database, WAL/journal and export archives keep their selected locations."
+        )
         return synopses[selected] + detail + "\n"
     if command in synopses:
-        return synopses[command] + "\n"
+        return synopses[command] + "\n" + wal_help
+    if values and values[0] == "cleanup":
+        return wal_help + "\n" + "\n".join(
+            synopsis for name, synopsis in synopses.items() if name.startswith("cleanup ")
+        ) + "\n"
     return (
         "\n".join(
-            ["usage: opencode-db (cleanup COMMAND | mv | repair-move | export | import | list-projects | show-project | show-session | list-sessions | prune) [OPTIONS]", *synopses.values()]
+            ["usage: opencode-db (cleanup COMMAND | mv | repair-move | export | import | list-projects | show-project | show-session | list-sessions | prune) [OPTIONS]", wal_help, *synopses.values()]
         )
         + "\n"
     )

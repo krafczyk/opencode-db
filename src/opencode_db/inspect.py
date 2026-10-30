@@ -60,7 +60,7 @@ class InspectionRequest:
     per-session logical-size estimates only for ``show-session`` and
     ``list-sessions``. Both flags default to ``False``. Any enabled estimate
     requires the complete known session schema. The value has no filesystem or
-    SQLite side effects.
+    SQLite side effects. ``work_dir`` selects CLI SQLite temporary storage.
     """
 
     command: str
@@ -69,6 +69,7 @@ class InspectionRequest:
     session_id: str | None = None
     estimate_project_size: bool = False
     estimate_session_size: bool = False
+    work_dir: str | None = None
 
 
 @dataclass(frozen=True)

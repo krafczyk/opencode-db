@@ -37,6 +37,7 @@ from .target import (
     TargetError,
     admit_scratch,
     ensure_private_directory,
+    storage_failure,
 )
 
 WAL_HEADER_BYTES = 32
@@ -222,7 +223,10 @@ def clean_snapshot(
             if isinstance(error, (CaptureError, CleanupError, TargetError))
             else "cleanup_invalid"
         )
-        return _invalid(snapshot_id, target, validation, code)
+        return _invalid(
+            snapshot_id, target, validation, code,
+            diagnostic=storage_failure(error, Path(scratch_dir), snapshot_dir),
+        )
     except Exception:
         return _invalid(snapshot_id, target, validation, "cleanup_invalid")
     finally:
@@ -443,7 +447,9 @@ def _validate_candidate(
             )
             else Check.FAIL
         )
-    except (CleanupError, sqlite3.Error, OSError):
+    except (CleanupError, sqlite3.Error, OSError) as error:
+        if storage_failure(error, candidate.parent):
+            raise
         _check_deadline(started, deadline_seconds)
     return (
         Validation(integrity, foreign_keys, checkpoint, clean_reopen, sidecars),
@@ -706,6 +712,7 @@ def _invalid(
     validation: Validation,
     code: str,
     preview: dict[str, object] | None = None,
+    diagnostic: str | None = None,
 ) -> CleanupOutcome:
     """Return one non-installable outcome with preview only when SQLite read it."""
     return CleanupOutcome(
@@ -717,6 +724,7 @@ def _invalid(
         installable=False,
         preview=preview,
         diagnostic_code=code,
+        diagnostic_message=diagnostic,
     )
 
 

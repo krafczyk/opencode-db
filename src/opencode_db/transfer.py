@@ -104,7 +104,8 @@ class TransferRequest:
     documented environment default; ``project_dir`` is the export source project
     for ``export`` or target project for ``import``; ``export_dir`` and
     ``import_file`` are present only for their matching operation. The value
-    neither opens SQLite nor changes filesystem state.
+    neither opens SQLite nor changes filesystem state. ``work_dir`` selects CLI
+    SQLite temporary storage; export archives still use ``export_dir``.
     """
 
     command: str
@@ -112,6 +113,7 @@ class TransferRequest:
     project_dir: str
     export_dir: str | None = None
     import_file: str | None = None
+    work_dir: str | None = None
 
 
 @dataclass(frozen=True)

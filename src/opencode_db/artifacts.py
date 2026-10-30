@@ -38,7 +38,8 @@ from .target import (
     ensure_private_directory,
     resolve_recorded_target,
     resolve_target,
-    storage_space,
+    require_capacity,
+    storage_failure,
 )
 
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -100,6 +101,7 @@ def capture_source_set(
     database: str,
     *,
     scratch_dir: str | None = None,
+    work_dir: str | None = None,
     deadline_seconds: int = 1_800,
     environment: TargetEnvironment | None = None,
     after_copy: Callable[[Path], None] | None = None,
@@ -108,7 +110,9 @@ def capture_source_set(
     """Capture a stable exact source set into a private target-scoped snapshot.
 
     Parameters: ``database`` is one explicit path, ``scratch_dir`` optionally
-    selects a local scratch root to preflight, ``deadline_seconds`` is a finite
+    selects a local scratch root to preflight, ``work_dir`` selects an existing
+    private retained-store parent instead of the database parent, and
+    ``deadline_seconds`` is a finite
     positive operation limit, ``environment`` supplies testable system probes,
     and ``after_copy`` / ``after_chunk`` are narrow test seams called after each
     copied source file or stream chunk. Returns a :class:`CaptureOutcome`; only
@@ -123,7 +127,7 @@ def capture_source_set(
         return _outcome(None, None, None, None, False, "deadline_exceeded")
     started = time.monotonic()
     try:
-        target = resolve_target(database)
+        target = resolve_target(database, work_dir=work_dir)
         _check_deadline(started, deadline_seconds)
         pre_manifest = _source_manifest(
             target.path, target.target_id, started, deadline_seconds
@@ -131,7 +135,10 @@ def capture_source_set(
         _preflight(target.control_dir, pre_manifest, scratch_dir, environment)
         catalog = _read_catalog(target.control_dir, target.path, target.target_id)
     except TargetError as error:
-        return _outcome(database, None, None, None, False, error.code)
+        return _outcome(
+            database, None, None, None, False, error.code,
+            diagnostic=error.diagnostic,
+        )
     except CaptureError as error:
         return _outcome(
             str(target.path), target.target_id, None, None, False, error.code
@@ -229,9 +236,9 @@ def capture_source_set(
             "captured",
             snapshot_dir,
         )
-    except (CaptureError, InterruptedError, OSError) as error:
+    except (CaptureError, TargetError, InterruptedError, OSError) as error:
         reason = (
-            error.code if isinstance(error, CaptureError) else "operational_failure"
+            error.code if isinstance(error, (CaptureError, TargetError)) else "operational_failure"
         )
         if snapshot_dir is not None:
             _best_effort_diagnostic_manifest(
@@ -251,6 +258,7 @@ def capture_source_set(
             False,
             reason,
             snapshot_dir,
+            diagnostic=storage_failure(error, target.control_dir),
         )
 
 
@@ -572,17 +580,20 @@ def finish_preview_operation(snapshot: AcceptedSnapshot, state: str) -> None:
     )
 
 
-def operation_status(database: str, operation_id: str) -> OperationEvidence:
+def operation_status(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> OperationEvidence:
     """Read one exact target-scoped operation without touching SQLite or processes.
 
     Parameters: ``database`` is an exact previously recorded target path and
     ``operation_id`` is an exact opaque ID. Returns the recorded
-    :class:`OperationEvidence`. Raises :class:`CaptureError` when the target,
+    :class:`OperationEvidence`. ``work_dir`` selects the capture store. Raises
+    :class:`CaptureError` when the target,
     catalog, or operation reference is unavailable or foreign. This read-only
     operation has no source, scratch, process, or SQLite side effects.
     """
     try:
-        target = resolve_recorded_target(database)
+        target = resolve_recorded_target(database, work_dir=work_dir)
         _, _, operations = _read_catalog(
             target.control_dir, target.path, target.target_id
         )
@@ -601,19 +612,24 @@ def operation_status(database: str, operation_id: str) -> OperationEvidence:
 
 
 def register_install_operation(
-    database: str, candidate: CandidateEvidence, operation_id: str
+    database: str,
+    candidate: CandidateEvidence,
+    operation_id: str,
+    *,
+    work_dir: str | None = None,
 ) -> AcceptedSnapshot:
     """Register one exact candidate installation in its target catalog.
 
     Parameters bind the explicit ``database``, rehashed target-scoped
     ``candidate``, and newly allocated ``operation_id``.  Returns the accepted
-    snapshot only after it and the candidate record are revalidated.  Raises
+    snapshot only after it and the candidate record are revalidated. ``work_dir``
+    selects the capture store. Raises
     :class:`CaptureError` for cross-target, changed, or incompatible evidence.
     The function changes only the private catalog; it never opens SQLite or an
     active source file.
     """
     try:
-        target = resolve_target(database)
+        target = resolve_target(database, work_dir=work_dir)
         snapshots, candidates, operations = _read_catalog(
             target.control_dir, target.path, target.target_id
         )
@@ -658,19 +674,22 @@ def register_install_operation(
     return snapshot
 
 
-def load_install_operation(database: str, operation_id: str) -> AcceptedSnapshot:
+def load_install_operation(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> AcceptedSnapshot:
     """Load the accepted source snapshot bound to one installation operation.
 
     Parameters select an explicit recorded target and exact ``operation_id``.
-    Returns the immutable accepted snapshot.  Raises :class:`CaptureError` for
+    ``work_dir`` selects the capture store. Returns the immutable accepted
+    snapshot. Raises :class:`CaptureError` for
     foreign, malformed, future, or changed evidence without modifying state or
     opening SQLite.
     """
-    evidence = operation_status(database, operation_id)
+    evidence = operation_status(database, operation_id, work_dir=work_dir)
     if not operation_id.startswith("install-"):
         raise CaptureError("candidate_changed")
     try:
-        target = resolve_recorded_target(database)
+        target = resolve_recorded_target(database, work_dir=work_dir)
     except TargetError as error:
         raise CaptureError(error.code) from error
     return load_accepted_snapshot(
@@ -678,11 +697,14 @@ def load_install_operation(database: str, operation_id: str) -> AcceptedSnapshot
     )
 
 
-def set_install_operation_state(database: str, operation_id: str, state: str) -> None:
+def set_install_operation_state(
+    database: str, operation_id: str, state: str, *, work_dir: str | None = None
+) -> None:
     """Persist one allowed installation state in the target catalog.
 
     ``database`` and ``operation_id`` select an existing installation record;
-    ``state`` is a closed install lifecycle value.  Raises :class:`CaptureError`
+    ``state`` is a closed install lifecycle value; ``work_dir`` selects its store.
+    Raises :class:`CaptureError`
     for incompatible catalog data.  This updates only catalog metadata and never
     opens SQLite or mutates active database files.
     """
@@ -700,7 +722,7 @@ def set_install_operation_state(database: str, operation_id: str, state: str) ->
     if state not in allowed:
         raise CaptureError("artifact_schema_unsupported")
     try:
-        target = resolve_recorded_target(database)
+        target = resolve_recorded_target(database, work_dir=work_dir)
         snapshots, candidates, operations = _read_catalog(
             target.control_dir, target.path, target.target_id
         )
@@ -728,18 +750,21 @@ def set_install_operation_state(database: str, operation_id: str, state: str) ->
     )
 
 
-def abort_preview_operation(database: str, operation_id: str) -> OperationEvidence:
+def abort_preview_operation(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> OperationEvidence:
     """Remove only same-host registered preview scratch and then record abort.
 
     Parameters: ``database`` and ``operation_id`` select exact catalog evidence.
-    Returns the post-operation evidence. Raises :class:`CaptureError` if the
+    ``work_dir`` selects the capture store. Returns the post-operation evidence.
+    Raises :class:`CaptureError` if the
     operation is not a nonterminal preview or if exact safe scratch removal
     fails. A foreign-host operation returns ``scratch_cleanup_required`` without
     deletion. The function never inspects processes or alters SQLite/source data.
     """
-    evidence = operation_status(database, operation_id)
+    evidence = operation_status(database, operation_id, work_dir=work_dir)
     try:
-        target = resolve_recorded_target(database)
+        target = resolve_recorded_target(database, work_dir=work_dir)
     except TargetError as error:
         raise CaptureError(error.code) from error
     if evidence.state != "previewing" or evidence.scratch_path is None:
@@ -816,20 +841,25 @@ def _validate_scratch_marker(
 
 
 def select_candidate(
-    database: str, candidate_id: str, approve_uncertain_report: str | None = None
+    database: str,
+    candidate_id: str,
+    approve_uncertain_report: str | None = None,
+    *,
+    work_dir: str | None = None,
 ) -> CandidateEvidence:
     """Rehash and validate one exact candidate/report pair before later install work.
 
     Parameters: ``database`` is the explicit target, ``candidate_id`` is an exact
     catalog ID, and ``approve_uncertain_report`` optionally supplies the required
     report SHA-256 for uncertain evidence. Returns verified
-    :class:`CandidateEvidence`. Raises :class:`CaptureError` with
+    :class:`CandidateEvidence`. ``work_dir`` selects the capture store. Raises
+    :class:`CaptureError` with
     ``candidate_changed`` or ``report_changed`` for altered or cross-target
     evidence, and ``approval_required`` when uncertainty lacks its exact report
     digest. It is read-only and performs no active-database mutation.
     """
     try:
-        target = resolve_target(database)
+        target = resolve_target(database, work_dir=work_dir)
         snapshots, candidates, _ = _read_catalog(
             target.control_dir, target.path, target.target_id
         )
@@ -894,12 +924,14 @@ def prune_backup(
     database: str,
     snapshot_id: str,
     *,
+    work_dir: str | None = None,
     after_unlink: Callable[[Path], None] | None = None,
 ) -> None:
     """Delete one exact eligible retained snapshot group and its catalog records.
 
     Parameters: ``database`` is an explicit recorded target and ``snapshot_id``
-    is one complete catalog-selected snapshot ID. ``after_unlink`` is a
+    is one complete catalog-selected snapshot ID. ``work_dir`` selects the
+    capture store. ``after_unlink`` is a
     test-only interruption seam called after each exact file removal. Returns
     ``None`` after every listed file and tool-owned empty directory is gone and
     the catalog update is durable. Raises :class:`CaptureError` when selection,
@@ -911,7 +943,7 @@ def prune_backup(
     if _SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id) is None:
         raise CaptureError("snapshot_invalid")
     try:
-        target = resolve_recorded_target(database)
+        target = resolve_recorded_target(database, work_dir=work_dir)
         snapshots, candidates, operations = _read_catalog(
             target.control_dir, target.path, target.target_id
         )
@@ -1025,6 +1057,7 @@ def _prune_group_plan(
                 source.sha256,
             )
     directories = {snapshot_dir}
+    mutation_dir = target.parent / ".opencode-db" / target_id / "snapshots" / snapshot_id
     for record in candidates:
         if record["snapshot_id"] != snapshot_id:
             continue
@@ -1057,9 +1090,9 @@ def _prune_group_plan(
         if state["state"] != operation["state"]:
             raise CaptureError("snapshot_invalid")
         files[state_path] = _canonical_json_bytes(state)
-        quarantine = snapshot_dir / "quarantine" / operation_id
+        quarantine = mutation_dir / "quarantine" / operation_id
         directories.update(
-            {snapshot_dir / "quarantine", quarantine, snapshot_dir / "staging"}
+            {mutation_dir, mutation_dir / "quarantine", quarantine, mutation_dir / "staging"}
         )
         for source in manifest.files:
             if source.present:
@@ -1067,7 +1100,10 @@ def _prune_group_plan(
                 files[quarantine / source.name] = (source.size, source.sha256)
         if state["state"] == "rolled_back":
             directories.update(
-                {snapshot_dir / "rollback", snapshot_dir / "rollback" / operation_id}
+                {mutation_dir / "rollback", mutation_dir / "rollback" / operation_id}
+            )
+            files[mutation_dir / "staging" / f"{state['candidate_id']}.sqlite"] = (
+                -1, cast(str, state["candidate_sha256"])
             )
     return files, directories
 
@@ -1298,14 +1334,10 @@ def _preflight(
     environment: TargetEnvironment | None,
 ) -> None:
     """Verify privacy, retained capacity, and admitted scratch before copying."""
-    required_bytes = sum(item.size or 0 for item in manifest.files) + 64 * 1024
+    source_bytes = sum(item.size or 0 for item in manifest.files)
+    required_bytes = source_bytes * 2 + 64 * 1024
     required_inodes = len(manifest.files) + 8
-    retained = storage_space(control_dir.parent, environment)
-    if (
-        retained.available_bytes < required_bytes
-        or retained.available_inodes < required_inodes
-    ):
-        raise TargetError("storage_capacity")
+    require_capacity(control_dir, required_bytes, required_inodes, environment=environment)
     scratch_root = Path(
         scratch_dir
         if scratch_dir is not None
@@ -1313,7 +1345,7 @@ def _preflight(
     )
     admit_scratch(
         scratch_root,
-        required_bytes=max(required_bytes * 2, COPY_CHUNK_BYTES),
+        required_bytes=max(source_bytes * 3 + 64 * 1024, COPY_CHUNK_BYTES),
         required_inodes=required_inodes,
         environment=environment,
     )
@@ -1823,6 +1855,7 @@ def _outcome(
     accepted: bool,
     status: str,
     snapshot_dir: Path | None = None,
+    diagnostic: str | None = None,
 ) -> CaptureOutcome:
     """Construct a capture result without evaluating filesystem or source state."""
     return CaptureOutcome(
@@ -1833,4 +1866,5 @@ def _outcome(
         snapshot_dir=snapshot_dir,
         accepted=accepted,
         status=status,
+        diagnostic_message=diagnostic,
     )

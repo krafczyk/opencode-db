@@ -12,6 +12,8 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
 
 from .model import EXIT_OPERATIONAL_FAILURE, EXIT_PRECONDITION_REFUSED
 from .move import (
@@ -24,6 +26,7 @@ from .move import (
     apply_sibling_move,
     plan_sibling_move,
 )
+from .target import storage_failure
 
 MoveOptions = dict[str, str | bool]
 """Parsed move option values before shared validation is applied."""
@@ -38,7 +41,8 @@ class MoveCommandRequest:
     main worktree. ``method`` is presently always ``sibling``; ``yes`` bypasses
     only terminal confirmation; ``progress`` enables stderr-only progress; and
     ``application_timeout_seconds`` sets the finite writer transaction deadline.
-    Constructing this value has no SQLite, Git, filesystem, or stream effects.
+    ``work_dir`` selects CLI SQLite temporary storage. Constructing this value
+    has no SQLite, Git, filesystem, or stream effects.
     """
 
     database: str
@@ -48,6 +52,7 @@ class MoveCommandRequest:
     yes: bool
     progress: bool
     application_timeout_seconds: float
+    work_dir: str | None = None
 
     @property
     def command(self) -> str:
@@ -191,7 +196,11 @@ def execute_move(request: MoveCommandRequest, *, stdin: object, stdout: object, 
     except MoveOperationalError as error:
         if reporter is not None:
             reporter.fail()
-        stderr.write(f"opencode-db: {error}\n")
+        temporary = os.environ.get("SQLITE_TMPDIR", os.environ.get("TMPDIR", "/tmp"))
+        diagnostic = storage_failure(
+            error, Path(request.database).parent, Path(temporary)
+        ) or str(error)
+        stderr.write(f"opencode-db: {diagnostic}\n")
         return EXIT_OPERATIONAL_FAILURE
     except MoveError as error:
         if reporter is not None:

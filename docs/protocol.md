@@ -308,7 +308,8 @@ can resolve a recorded target while an incomplete installation has moved the
 active main file. Relative paths, `:memory:`, missing preview targets, paths
 used as IDs, prefixes, and globs are refused.
 
-The control store is `<database-parent>/.opencode-db/<target-id>/`. The
+The control store is `<database-parent>/.opencode-db/<target-id>/` by default,
+or `<work-dir>/.opencode-db/<target-id>/` with explicit `--work-dir`. The
 `target-id` is derived from the canonical absolute target path and is used to
 bind every retained record to one target. The catalog maps that target to exact
 opaque IDs; IDs are sortable UTC timestamps with random hexadecimal bytes and
@@ -324,6 +325,46 @@ are not filesystem paths.
 
 Snapshot and candidate IDs must resolve through the selected target catalog.
 Cross-target replay is refused before mutation.
+
+### Work-root selection and storage diagnostics
+
+Every CLI command accepts `--work-dir ABSOLUTE_PATH`. It must name an existing
+mode-0700 directory; relative, absent, symlink, non-directory and non-private
+roots refuse without falling back. Cleanup uses that root for retained
+snapshots, candidates, reports, catalogs and intent logs. Every later cleanup
+selection must supply the same root, including read-only status and recovery
+while the active main file is absent. Generated next actions shell-quote and
+preserve the work root; preview's install action also preserves explicit scratch.
+The tool never searches or migrates other retained stores.
+
+Cleanup scratch defaults to `<work-dir>/scratch` with a work root, otherwise
+`$TMPDIR/opencode-db` (falling back to `/tmp/opencode-db`). Preview/install's
+`--scratch-dir` overrides only scratch. Scratch must pass existing local mount
+admission; the retained work root may be remote when separate local scratch is
+selected. Final install staging, quarantine and rollback staging remain in the
+target-adjacent `.opencode-db/<target-id>/snapshots/<snapshot-id>/` namespace so
+active-path moves remain same-filesystem. The selected retained snapshot and
+intent log may reside on another filesystem. State readers validate the exact
+selected snapshot/log path and constrain all move paths to the adjacent mutation
+namespace. Terminal backup pruning validates and removes the exact known files
+in both namespaces; it never recursively removes an unlisted tree.
+
+Other commands use `--work-dir` as SQLite's local temporary directory and apply
+the same private/local admission before execution. The CLI sets SQLITE_TMPDIR
+and TMPDIR before SQLite's first temporary allocation and restores the environment
+when returning. This per-process setting does not relocate active databases,
+WAL/journals, or export archives. Python API callers own their SQLite temporary
+environment. A work root cannot remove the free-space requirement of final
+same-filesystem candidate installation, rollback copies, or active SQLite writes.
+
+Capacity refusal codes remain `storage_capacity` and `scratch_capacity` for
+compatibility. Their human/JSON diagnostic messages name the checked path, disk
+space versus inodes (or both), and required/available counts. A probe failure
+explicitly reports that capacity could not be measured. Runtime ENOSPC, EDQUOT
+and SQLite FULL errors are identified by numeric error codes through wrapped
+causes, never by parsing or publishing raw OS/SQLite text. Current capacity at
+known work locations is included. Positive current counts do not prove which
+resource caused a previous failure; those cases are explicitly undetermined.
 
 ## Source snapshots and candidates
 

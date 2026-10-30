@@ -95,7 +95,8 @@ class PruneRequest:
     and optional flags control reporting, physical compaction, or explicit
     confirmation bypass. ``vacuum_only`` selects compaction without a retention
     selector or deletion. ``timeout_seconds`` independently bounds planning,
-    application, and vacuum. The value has no SQLite or filesystem side effects.
+    application, and vacuum. ``work_dir`` selects CLI SQLite temporary storage.
+    The value has no SQLite or filesystem side effects.
     """
 
     database: str
@@ -109,6 +110,7 @@ class PruneRequest:
     command: str = "prune"
     timeout_seconds: float = PRUNE_TIMEOUT_SECONDS
     vacuum_only: bool = False
+    work_dir: str | None = None
 
 
 @dataclass(frozen=True)

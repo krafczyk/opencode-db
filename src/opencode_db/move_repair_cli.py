@@ -6,6 +6,8 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
 
 from .model import EXIT_OPERATIONAL_FAILURE, EXIT_PRECONDITION_REFUSED
 from .move import (
@@ -21,6 +23,7 @@ from .move_repair import (
     apply_move_repair,
     plan_move_repair,
 )
+from .target import storage_failure
 
 
 RepairOptions = dict[str, str | bool]
@@ -34,7 +37,8 @@ class MoveRepairCommandRequest:
     ``database`` and path fields are absolute grammar-validated values,
     ``project_id`` selects one project, ``yes`` bypasses only confirmation, and
     ``application_timeout_seconds`` bounds the complete writer transaction.
-    Constructing this value performs no I/O.
+    ``work_dir`` selects CLI SQLite temporary storage. Constructing this value
+    performs no I/O.
     """
 
     database: str
@@ -43,6 +47,7 @@ class MoveRepairCommandRequest:
     target_project_dir: str
     yes: bool
     application_timeout_seconds: float
+    work_dir: str | None = None
 
     @property
     def command(self) -> str:
@@ -178,7 +183,11 @@ def execute_move_repair(
         _write(stdout, "opencode-db: move repair committed\n")
         return 0
     except MoveOperationalError as error:
-        _safe_diagnostic(stderr, str(error))
+        temporary = os.environ.get("SQLITE_TMPDIR", os.environ.get("TMPDIR", "/tmp"))
+        diagnostic = storage_failure(
+            error, Path(request.database).parent, Path(temporary)
+        ) or str(error)
+        _safe_diagnostic(stderr, diagnostic)
         return EXIT_OPERATIONAL_FAILURE
     except MoveError as error:
         _safe_diagnostic(stderr, str(error))

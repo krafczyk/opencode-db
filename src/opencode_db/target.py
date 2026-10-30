@@ -8,9 +8,13 @@ source snapshots.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import json
 import os
-from collections.abc import Callable, Mapping
+import sqlite3
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,14 +29,15 @@ class TargetError(RuntimeError):
     """Report one safe target or preflight refusal without exposing OS errors.
 
     Parameters: ``code`` is a stable diagnostic code. The exception is raised
-    before SQLite is opened or source content is changed; callers render only
-    the code's fixed public message.
+    before SQLite is opened or source content is changed. ``diagnostic`` is an
+    optional trusted tool-generated storage message, never raw exception text.
     """
 
-    def __init__(self, code: str) -> None:
-        """Store the stable refusal ``code`` without retaining exception details."""
+    def __init__(self, code: str, diagnostic: str | None = None) -> None:
+        """Store a stable code and optional tool-generated storage diagnostic."""
         super().__init__(code)
         self.code = code
+        self.diagnostic = diagnostic
 
 
 def select_default_database(environment: Mapping[str, str] | None = None) -> str:
@@ -92,9 +97,9 @@ class ResolvedTarget:
     """Identify one canonical regular-file target and its private control root.
 
     ``path`` is the canonical existing source path, ``target_id`` is a
-    path-derived opaque identifier, and ``control_dir`` is the adjacent private
-    artifact directory to be created only after preflight. This value does not
-    create paths or access SQLite.
+    path-derived opaque identifier, and ``control_dir`` is the selected private
+    artifact directory (adjacent by default) created only after preflight. This
+    value does not create paths or access SQLite.
     """
 
     path: Path
@@ -117,13 +122,15 @@ def default_environment() -> TargetEnvironment:
     )
 
 
-def resolve_target(database: str) -> ResolvedTarget:
+def resolve_target(database: str, *, work_dir: str | None = None) -> ResolvedTarget:
     """Resolve one explicit database argument to a canonical regular file.
 
-    Parameters: ``database`` is the operator-supplied absolute path. Returns a
+    Parameters: ``database`` is the operator-supplied absolute path; ``work_dir``
+    optionally selects the retained store's absolute parent. Returns a
     :class:`ResolvedTarget` only for an existing regular file. Raises
     :class:`TargetError` with ``target_invalid`` for relative, in-memory,
-    missing, dangling, directory, or non-regular paths. It never creates files,
+    missing, dangling, directory, or non-regular paths, or for an invalid private
+    work root. It never creates files,
     invokes OpenCode, opens SQLite, or changes source permissions.
     """
     if not database or database == ":memory:" or "\x00" in database:
@@ -142,18 +149,22 @@ def resolve_target(database: str) -> ResolvedTarget:
     return ResolvedTarget(
         path=canonical,
         target_id=target_id,
-        control_dir=canonical.parent / ".opencode-db" / target_id,
+        control_dir=_control_dir(canonical, target_id, work_dir),
     )
 
 
-def resolve_recorded_target(database: str) -> ResolvedTarget:
+def resolve_recorded_target(
+    database: str, *, work_dir: str | None = None
+) -> ResolvedTarget:
     """Resolve an absolute target identity without requiring its main file.
 
     Parameters: ``database`` is the exact absolute path previously used for a
-    target catalog. Returns its canonical lexical identity and adjacent control
+    target catalog; ``work_dir`` selects the same store used at capture. Returns
+    its canonical lexical identity and selected control
     directory so status and recovery can work while installation has moved the
     main file. Raises :class:`TargetError` for relative, in-memory, or malformed
-    paths. It creates nothing and never opens SQLite or source files.
+    paths or an invalid private work root. It creates nothing and never opens
+    SQLite or source files.
     """
     if not database or database == ":memory:" or "\x00" in database:
         raise TargetError("target_invalid")
@@ -165,8 +176,157 @@ def resolve_recorded_target(database: str) -> ResolvedTarget:
     return ResolvedTarget(
         path=canonical,
         target_id=target_id,
-        control_dir=canonical.parent / ".opencode-db" / target_id,
+        control_dir=_control_dir(canonical, target_id, work_dir),
     )
+
+
+def _control_dir(database: Path, target_id: str, work_dir: str | None) -> Path:
+    """Select an explicit store without searching other roots or creating it."""
+    if work_dir is None:
+        return database.parent / ".opencode-db" / target_id
+    root = validate_work_directory(work_dir)
+    return root / ".opencode-db" / target_id
+
+
+def validate_work_directory(work_dir: str) -> Path:
+    """Return an existing absolute mode-0700 work root without modifying it.
+
+    ``work_dir`` is operator input. Raises :class:`TargetError` for a malformed,
+    unavailable, symlink, non-directory, or non-private root. Performs no writes.
+    """
+    if "\x00" in work_dir or not Path(work_dir).is_absolute():
+        raise TargetError("work_invalid")
+    supplied = Path(work_dir)
+    try:
+        if supplied.is_symlink():
+            raise TargetError("work_not_private")
+        root = supplied.resolve(strict=True)
+        if not root.is_dir() or root.stat().st_mode & 0o777 != 0o700:
+            raise TargetError("work_not_private")
+    except OSError as error:
+        raise TargetError("work_not_private") from error
+    return root
+
+
+@contextmanager
+def sqlite_temporary_directory(
+    directory: str | None, *, validate: bool = True, update_tmpdir: bool = True
+) -> Iterator[None]:
+    """Select SQLite temporary storage for a CLI invocation and restore the env.
+
+    ``directory`` is an explicit existing private local root, or ``None`` to
+    preserve the caller environment. Raises :class:`TargetError` before command
+    execution when admission fails. Sets SQLITE_TMPDIR and TMPDIR temporarily;
+    SQLite reads these on its first temporary-file allocation in the process.
+    ``validate=False`` lets cleanup perform its own scratch admission and
+    creation before opening SQLite. ``update_tmpdir=False`` preserves cleanup's
+    TMPDIR-based scratch default while setting SQLITE_TMPDIR. Does not relocate
+    database journals, WAL, or final installation staging. Yields ``None`` while
+    the environment is selected and restores it even when command execution fails.
+    """
+    if directory is None:
+        yield
+        return
+    root = Path(directory)
+    if validate:
+        root = validate_work_directory(directory)
+        admit_scratch(root, 0, 0)
+    keys = ("SQLITE_TMPDIR", "TMPDIR") if update_tmpdir else ("SQLITE_TMPDIR",)
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ.update({key: str(root) for key in previous})
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def require_capacity(
+    path: Path,
+    required_bytes: int,
+    required_inodes: int,
+    *,
+    code: str = "storage_capacity",
+    environment: TargetEnvironment | None = None,
+) -> None:
+    """Require free bytes and inodes at ``path`` before writing.
+
+    Returns ``None`` on success; raises :class:`TargetError` with a bounded,
+    tool-generated path, deficient resource, and required/available counts on
+    refusal. ``environment`` injects probes for tests. Creates no files.
+    """
+    try:
+        available = storage_space(path, environment)
+    except TargetError as error:
+        raise TargetError(
+            code, f"Cannot measure storage capacity at {_display_path(path)}."
+        ) from error
+    lacking = []
+    if available.available_bytes < required_bytes:
+        lacking.append("disk space")
+    if available.available_inodes < required_inodes:
+        lacking.append("inodes")
+    if lacking:
+        raise TargetError(
+            code,
+            f"Insufficient {' and '.join(lacking)} at {_display_path(path)}; "
+            f"bytes required={required_bytes} available={available.available_bytes}; "
+            f"inodes required={required_inodes} available={available.available_inodes}.",
+        )
+
+
+def storage_failure(error: BaseException, *paths: Path) -> str | None:
+    """Describe ENOSPC, quota, or SQLite FULL errors without exposing raw text.
+
+    ``error`` may wrap the OS/SQLite failure through exception causes. ``paths``
+    are known working locations, not paths parsed from exception messages.
+    Returns a bounded diagnostic with current capacity, or ``None`` for other
+    failures. ENOSPC cannot distinguish quotas, bytes, and inodes on its own;
+    positive current counts are reported as inconclusive. Only reads statvfs.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    quota = False
+    full = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TargetError) and current.diagnostic:
+            return current.diagnostic
+        if isinstance(current, OSError):
+            quota |= current.errno == errno.EDQUOT
+            full |= current.errno in (errno.ENOSPC, errno.EDQUOT)
+        sqlite_code = getattr(current, "sqlite_errorcode", 0)
+        full |= isinstance(sqlite_code, int) and sqlite_code & 255 == sqlite3.SQLITE_FULL
+        current = current.__cause__
+    if not full:
+        return None
+    observations = []
+    for path in list(dict.fromkeys(paths))[:3]:
+        try:
+            available = storage_space(path)
+            lacking = []
+            if available.available_bytes == 0:
+                lacking.append("disk space")
+            if available.available_inodes == 0:
+                lacking.append("inodes")
+            resource = " and ".join(lacking) or "resource undetermined (quota or temporary exhaustion possible)"
+            observations.append(
+                f"{_display_path(path)}: {resource}; bytes available={available.available_bytes}; "
+                f"inodes available={available.available_inodes}"
+            )
+        except TargetError:
+            observations.append(f"{_display_path(path)}: capacity unavailable")
+    summary = "Storage quota exceeded" if quota else "Storage exhausted"
+    return summary + ". " + "; ".join(observations)
+
+
+def _display_path(path: Path) -> str:
+    """Quote a bounded operator-selected path without terminal control bytes."""
+    value = str(path)
+    return json.dumps(value if len(value) <= 160 else value[:157] + "...", ensure_ascii=True)
 
 
 def admit_scratch(
@@ -199,15 +359,10 @@ def admit_scratch(
         not canonical.is_dir() or canonical.is_symlink() or _mode(canonical) != 0o700
     ):
         raise TargetError("scratch_not_private")
-    try:
-        available = probes.storage_probe(existing)
-    except OSError as error:
-        raise TargetError("scratch_capacity") from error
-    if (
-        available.available_bytes < required_bytes
-        or available.available_inodes < required_inodes
-    ):
-        raise TargetError("scratch_capacity")
+    require_capacity(
+        canonical, required_bytes, required_inodes,
+        code="scratch_capacity", environment=probes,
+    )
     return canonical
 
 
