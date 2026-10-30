@@ -380,7 +380,7 @@ private retained evidence. Directories are created `0700`, files `0600`, and
 sensitive writes use process umask `077`. They persist until exact eligible
 `prune-backup`; there is no automatic retention expiry.
 
-Cleanup opens only a disposable admitted-local scratch copy in SQLite `mode=rw`.
+Cleanup opens only an admitted-local scratch copy in SQLite `mode=rw`.
 It preserves captured SHM as evidence but does not reuse it as SQLite's scratch
 SHM. Normal recovery obtains passive and truncate checkpoint evidence, backs up
 the recovered view into a fresh candidate, closes it, reopens it, and checks
@@ -410,6 +410,73 @@ The optional preview contains only `projects`, `recent_sessions`,
 updated non-archived sessions. Missing OpenCode tables/columns make the affected
 domain summary `unavailable`, not a generic cleanup failure.
 
+## Durable preview checkpoints
+
+`cleanup resume --operation operation-…` resumes preview work;
+`cleanup resume --operation install-…` retains the installation protocol below.
+The same target/store selection is required. Preview/resume accept `--progress`:
+stage names and elapsed time go only to stderr. Human terminal sessions enable
+these updates automatically; JSON sessions enable them only with `--progress`.
+Operation/snapshot IDs are announced after catalog registration and before source
+copying. Successful and paused JSON preview results carry `operation_id`.
+
+Source capture remains an indivisible acceptance boundary. Only a complete
+pre/copy/post hash match can be reused; incomplete/diagnostic captures refuse
+resume. Once accepted, resumption never recaptures active source bytes. Legacy
+accepted snapshots, including an old preview marked invalid after timeout, can
+be reused even without checkpoint metadata. This does not recover deleted old
+scratch and does not bypass installation's current-source comparison.
+
+The existing catalog records the creating host and exact scratch path. Resume
+uses that path rather than a new default scratch selection, refuses another
+host, and validates the private operation marker before reading or changing
+scratch. Missing scratch can be recreated from the accepted source; changed,
+foreign, or malformed markers/checkpoints refuse without deleting saved work.
+
+The private scratch file `.opencode-db-preview.json` uses closed schema version
+1 with fields `schema_version`, `snapshot_id`, `operation_id`, `target_id`,
+`manifest_sha256`, `stage`, `candidate_id`, `files`, `passive_checkpoint`,
+`truncate_checkpoint`, and `preview`. It binds exact IDs and the canonical
+source-manifest digest. File identities are fixed local filenames with size and
+SHA-256; arbitrary paths are forbidden. Only bounded approved preview fields
+are stored. Unknown versions, invalid stage/file combinations, or changed file
+hashes refuse. Saved data is rehashed before any prior validation gate is reused.
+
+Durable stage order is `captured`, `copied`, `recovering`, `recovered`,
+`candidate`, `integrity`, `foreign_keys`, `validated`, `published`.
+`captured` and `recovering` have no reusable mutable scratch input. `copied`
+binds main and optional WAL; `recovered` binds the closed checkpointed main;
+later stages bind the standalone candidate. A `recovering` intent is synced
+before SQLite can modify scratch input, so an interrupted recovery restages
+that input. Candidate backup subsequently reads the fully checkpointed source
+through read-only immutable SQLite access, never through the retained snapshot.
+Candidate/recovered files and atomic metadata replacements are fsynced before
+a completed stage can be reused. Passed integrity and foreign-key scans are
+saved separately; incomplete scans or backups restart their individual stage.
+
+Deadline expiry, Ctrl-C, recoverable I/O failures and abrupt process death leave
+completed scratch work available. Handled operational interruptions return exit
+5, `status: operational_failure`, the operation ID, bounded diagnostics, and a
+copyable resume action. Every resume has a fresh finite budget. Preview and
+preview-resume default to 14400 seconds; other cleanup execution defaults remain
+1800 seconds. Explicit deadlines remain whole seconds in [1, 86400]. A resumed
+hash verification, scan or backup still must fit within that attempt's budget.
+
+The target-scoped `.preview.lock` is a private stable empty file. A nonblocking
+advisory lock serializes preview/resume and abort for the operation and is
+released by process death; no PID probing or cross-node lease is introduced.
+Status reads checkpoint metadata without SQLite or full-file hashing and reports
+the last saved stage. It does not assert whether the operation is still running.
+
+Publication uses the checkpoint's stable candidate ID. A registered receipt is
+rehashed and returned idempotently, including after death between publication
+and scratch cleanup. Exact unpublished partial candidate/report paths can be
+replaced on retry. Resumable report publication uses an exact checkpoint-bound
+temporary name; abort can remove those unpublished paths before dropping scratch.
+Registered candidate/report evidence is preserved. Completed previews remove
+their scratch. Explicit abort discards paused work; exact eligible backup pruning
+also recognizes the empty preview lock file.
+
 ## Installation and recovery
 
 Installation selects one exact candidate. The catalog rechecks target binding,
@@ -438,7 +505,8 @@ It does not start or validate through OpenCode; the operator starts OpenCode
 separately afterward.
 
 Scratch state records operation ID, creating host, and scratch path in the
-catalog before sensitive work. Terminal previews remove their own scratch.
+catalog before sensitive work. Completed previews remove their own scratch;
+interrupted resumable previews retain their stage checkpoints.
 `abort` removes only an exact operation's same-host scratch; a different host is
 reported as `scratch_cleanup_required` and is not removed remotely.
 
@@ -478,7 +546,8 @@ Stable status values are `complete`, `uncertain`, `source_changed`, `invalid`,
 `target_invalid`, `precondition_refused`, `syntax_error`, and
 `operational_failure`.
 
-Operations have a default 1800-second deadline and accept only finite whole
+Preview and preview-resume have a default 14400-second deadline; installation
+and installation recovery default to 1800 seconds. Deadlines accept finite whole
 seconds from 1 to 86400. Retained storage, scratch, staging, and rollback need
 free-byte/inode preflight. Local scratch admission is limited to documented
 Linux local filesystems; remote or unclassified scratch fails closed.

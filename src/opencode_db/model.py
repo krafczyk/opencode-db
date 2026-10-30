@@ -102,6 +102,7 @@ class CommandRequest:
     paths, access stdin, open SQLite, or mutate artifacts; later units supply
     that execution behavior. ``work_dir`` optionally selects the private retained
     store and default scratch root; it must be reused for follow-up commands.
+    ``progress`` opts into stderr-only preview/resume stage announcements.
     """
 
     command: str
@@ -114,6 +115,7 @@ class CommandRequest:
     snapshot_id: str | None = None
     approve_uncertain_report: str | None = None
     work_dir: str | None = None
+    progress: bool = False
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,8 @@ class CleanupOutcome:
     its safe preview. This value does not itself write files or authorize
     installation. ``diagnostic_message`` optionally explains storage failures
     with tool-generated paths and capacity counts, never raw exception text.
+    ``resumable`` identifies an interrupted/expired operational attempt whose
+    accepted snapshot and completed scratch checkpoints can be explicitly resumed.
     """
 
     snapshot_id: str
@@ -318,6 +322,7 @@ class CleanupOutcome:
     preview: dict[str, Any] | None = None
     diagnostic_code: str | None = None
     diagnostic_message: str | None = None
+    resumable: bool = False
 
 
 @dataclass(frozen=True)
@@ -464,7 +469,13 @@ class Result:
             "scratch_invalid": "Scratch storage must be an absolute filesystem path.",
             "work_invalid": "--work-dir requires an absolute filesystem path.",
             "work_not_private": "--work-dir must be an existing mode-0700 directory.",
-            "deadline_exceeded": "The operation deadline expired before capture completed.",
+            "preview_busy": "This preview is already running; resume or abort only after it stops.",
+            "preview_not_resumable": "The selected operation is not a resumable preview.",
+            "preview_checkpoint_invalid": "Saved preview evidence is malformed or has changed; it was preserved.",
+            "scratch_wrong_host": "Preview scratch belongs to another host; resume on the recorded host.",
+            "preview_interrupted": "Preview was interrupted; completed work was retained for resume.",
+            "preview_failed": "Preview could not finish; saved work was retained for explicit resume.",
+            "deadline_exceeded": "The operation deadline expired.",
             "copy_failed": "Source capture could not complete safely.",
             "snapshot_invalid": "The retained source snapshot is not accepted or has changed.",
             "cleanup_invalid": "Normal SQLite recovery could not produce a valid candidate.",

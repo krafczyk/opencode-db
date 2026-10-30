@@ -7,7 +7,7 @@ file is intentionally absent, allowing SQLite to rebuild its WAL index.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -26,12 +26,15 @@ from .artifacts import (
     bind_preview_scratch,
     finish_preview_operation,
     load_accepted_snapshot,
-    new_artifact_id,
+    load_preview_candidate,
     persist_candidate,
     register_preview_scratch,
+    preview_operation_lock,
+    validate_preview_scratch,
     snapshot_source_path,
 )
 from .model import AcceptedSnapshot, Check, CleanupOutcome, Validation
+from .preview_state import checkpoint_files, open_checkpoint
 from .target import (
     TargetEnvironment,
     TargetError,
@@ -51,6 +54,9 @@ MAX_PREVIEW_ROWS = 4
 
 MAX_PREVIEW_TEXT = 512
 """Maximum UTF-8 character count exposed for one recognizable field."""
+
+DEFAULT_PREVIEW_DEADLINE_SECONDS = 14_400
+"""Four-hour default preview/resume budget; explicit deadlines remain bounded."""
 
 
 class CleanupError(RuntimeError):
@@ -105,22 +111,56 @@ def clean_snapshot(
     snapshot_dir: Path,
     *,
     scratch_dir: str,
-    deadline_seconds: int = 1_800,
+    deadline_seconds: int = DEFAULT_PREVIEW_DEADLINE_SECONDS,
     environment: TargetEnvironment | None = None,
     hooks: CleanupHooks | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> CleanupOutcome:
     """Recover, validate, and retain one candidate from an accepted snapshot.
 
     Parameters: ``snapshot_dir`` names an exact retained source group,
     ``scratch_dir`` is an admitted local writable root, ``deadline_seconds`` is
     a finite overall bound, ``environment`` provides testable scratch probes,
-    and ``hooks`` supplies narrow scratch-only interruption seams. Returns a
+    and ``hooks`` supplies narrow scratch-only interruption seams. ``progress``
+    receives bounded stage names, including completed checkpoint notifications.
+    Returns a
     :class:`CleanupOutcome` classified ``complete``, ``uncertain``, or invalid.
     Raises no SQLite error to callers: malformed inputs and recovery failures
     become non-installable outcomes. The function rehashes retained inputs,
     writes SQLite only in scratch, and persists a private candidate/report only
-    after all validation and digest checks pass.
+    after all validation and digest checks pass. Completed stages are fsynced in
+    registered scratch and rehashed before resumption. Timeout, interruption and
+    recoverable I/O failures retain scratch and return a resumable operational
+    outcome. Invalid evidence is refused; simultaneous resume/abort is excluded
+    by a nonblocking operation lock. Active source paths are never opened.
     """
+    try:
+        with preview_operation_lock(snapshot_dir):
+            return _clean_snapshot(
+                snapshot_dir, scratch_dir=scratch_dir, deadline_seconds=deadline_seconds,
+                environment=environment, hooks=hooks, progress=progress,
+            )
+    except CaptureError as error:
+        return _invalid(
+            snapshot_dir.name, "unknown", Validation(),
+            error.code,
+        )
+    except OSError as error:
+        return replace(
+            _invalid(
+                snapshot_dir.name, "unknown", Validation(), "preview_failed",
+                diagnostic=storage_failure(error, snapshot_dir, Path(scratch_dir)),
+            ),
+            status="operational_failure", resumable=True,
+        )
+
+
+def _clean_snapshot(
+    snapshot_dir: Path, *, scratch_dir: str, deadline_seconds: int,
+    environment: TargetEnvironment | None, hooks: CleanupHooks | None,
+    progress: Callable[[str], None] | None,
+) -> CleanupOutcome:
+    """Run or resume one preview while holding its durable operation lock."""
     started = time.monotonic()
     validation = Validation()
     snapshot_id = "unknown"
@@ -128,7 +168,14 @@ def clean_snapshot(
     snapshot: AcceptedSnapshot | None = None
     workdir: Path | None = None
     operation_finished = False
+    retain_work = False
+
+    def announce(stage: str) -> None:
+        if progress is not None:
+            progress(stage)
+
     try:
+        announce("verifying snapshot")
         if deadline_seconds < 1:
             raise CleanupError("deadline_exceeded")
         snapshot = load_accepted_snapshot(
@@ -137,6 +184,25 @@ def clean_snapshot(
         snapshot_id = snapshot.snapshot_id
         target = snapshot.manifest.target
         _check_deadline(started, deadline_seconds)
+        existing = load_preview_candidate(snapshot, started=started, deadline_seconds=deadline_seconds)
+        if existing is not None:
+            retained, report_path, report, report_digest = existing
+            validation = Validation(**{key: Check(value) for key, value in report["validation"].items()})
+            if validation != Validation(Check.PASS, Check.PASS, Check.PASS, Check.PASS, Check.PASS):
+                raise CleanupError("preview_checkpoint_invalid")
+            completeness = str(report["completeness"])
+            operation_dir = Path(scratch_dir) / snapshot.operation_id
+            if operation_dir.exists():
+                validate_preview_scratch(snapshot, operation_dir)
+                shutil.rmtree(operation_dir)
+            finish_preview_operation(snapshot, completeness)
+            operation_finished = True
+            return CleanupOutcome(
+                snapshot.snapshot_id, snapshot.manifest.target, completeness, completeness,
+                validation, True, candidate_id=str(report["candidate_id"]),
+                candidate_path=retained, report_path=report_path, report_sha256=report_digest,
+                preview=report["preview"],
+            )
         _refuse_journal(snapshot)
         evidence = _inspect_wal(snapshot)
         if evidence.malformed:
@@ -145,28 +211,76 @@ def clean_snapshot(
             Path(scratch_dir), snapshot, environment, started, deadline_seconds
         )
         scratch_main = workdir / "source.sqlite"
-        _copy_inputs(snapshot, scratch_main, started, deadline_seconds)
-        checkpoint = Check.NOT_RUN
-        source = _connect_rw(scratch_main)
-        try:
-            _set_deadline_handler(source, started, deadline_seconds)
-            _check_deadline(started, deadline_seconds)
-            passive_checkpoint = _checkpoint(source, "PASSIVE", hooks)
-            _check_deadline(started, deadline_seconds)
-            truncate_checkpoint = _checkpoint(source, "TRUNCATE", hooks)
-            if truncate_checkpoint not in ((0, 0, 0), (0, -1, -1)):
-                validation = Validation(checkpoint=Check.FAIL)
-                raise CleanupError("checkpoint_incomplete")
-            checkpoint = Check.PASS
-            candidate = workdir / "candidate.sqlite"
-            if hooks and hooks.before_backup:
-                hooks.before_backup(candidate)
-            _backup(source, candidate, started, deadline_seconds)
-        finally:
-            source.close()
-        validation, preview = _validate_candidate(
-            candidate, started, deadline_seconds, hooks, checkpoint
+        checkpoint_state = open_checkpoint(snapshot, workdir)
+        announce("verifying saved work")
+        checkpoint_state.verify(started, deadline_seconds)
+        if checkpoint_state.stage in {"captured", "recovering"}:
+            announce("copying snapshot to scratch")
+            _remove_scratch_files(workdir, "source.sqlite", "candidate.sqlite")
+            _copy_inputs(snapshot, scratch_main, started, deadline_seconds)
+            copied = [scratch_main]
+            if Path(f"{scratch_main}-wal").exists():
+                copied.append(Path(f"{scratch_main}-wal"))
+            checkpoint_state.save(
+                "copied", files=checkpoint_files(copied, started, deadline_seconds),
+                passive_checkpoint=None, truncate_checkpoint=None,
+            )
+            announce("saved copied")
+        if not checkpoint_state.reached("recovered"):
+            checkpoint_state.save("recovering", files={})
+            announce("recovering WAL")
+            source = _connect_rw(scratch_main)
+            try:
+                _set_deadline_handler(source, started, deadline_seconds)
+                _check_deadline(started, deadline_seconds)
+                passive_checkpoint = _checkpoint(source, "PASSIVE", hooks)
+                _check_deadline(started, deadline_seconds)
+                truncate_checkpoint = _checkpoint(source, "TRUNCATE", hooks)
+                if truncate_checkpoint not in ((0, 0, 0), (0, -1, -1)):
+                    validation = Validation(checkpoint=Check.FAIL)
+                    raise CleanupError("checkpoint_incomplete")
+            finally:
+                source.close()
+            _sync_file(scratch_main)
+            checkpoint_state.save(
+                "recovered", files=checkpoint_files([scratch_main], started, deadline_seconds),
+                passive_checkpoint=list(passive_checkpoint), truncate_checkpoint=list(truncate_checkpoint),
+            )
+            announce("saved recovered")
+        passive_checkpoint = tuple(checkpoint_state.value["passive_checkpoint"])
+        truncate_checkpoint = tuple(checkpoint_state.value["truncate_checkpoint"])
+        candidate = workdir / "candidate.sqlite"
+        if not checkpoint_state.reached("candidate"):
+            announce("creating candidate")
+            _remove_scratch_files(workdir, "candidate.sqlite")
+            source = sqlite3.connect(f"{scratch_main.as_uri()}?mode=ro&immutable=1", uri=True)
+            try:
+                if hooks and hooks.before_backup:
+                    hooks.before_backup(candidate)
+                _backup(source, candidate, started, deadline_seconds)
+            finally:
+                source.close()
+            _sync_file(candidate)
+            checkpoint_state.save("candidate", files=checkpoint_files([candidate], started, deadline_seconds))
+            announce("saved candidate")
+        completed = Validation(
+            integrity=Check.PASS if checkpoint_state.reached("integrity") else Check.NOT_RUN,
+            foreign_keys=Check.PASS if checkpoint_state.reached("foreign_keys") else Check.NOT_RUN,
+            checkpoint=Check.PASS,
         )
+
+        def checked(stage: str) -> None:
+            checkpoint_state.save(stage)
+            announce(f"saved {stage}")
+
+        if not checkpoint_state.reached("validated"):
+            validation, preview = _validate_candidate(
+                candidate, started, deadline_seconds, hooks, Check.PASS,
+                completed=completed, checked=checked, progress=announce,
+            )
+        else:
+            validation = Validation(Check.PASS, Check.PASS, Check.PASS, Check.PASS, Check.PASS)
+            preview = checkpoint_state.value["preview"]
         if validation != Validation(
             integrity=Check.PASS,
             foreign_keys=Check.PASS,
@@ -175,15 +289,13 @@ def clean_snapshot(
             sidecars_absent=Check.PASS,
         ):
             return _invalid(snapshot_id, target, validation, "cleanup_invalid", preview)
+        if not checkpoint_state.reached("validated"):
+            checkpoint_state.save("validated", preview=preview)
+            announce("saved validated")
         _check_deadline(started, deadline_seconds)
-        # Catch retained-input tampering between initial staging and publication.
-        snapshot = load_accepted_snapshot(
-            snapshot.snapshot_dir,
-            started=started,
-            deadline_seconds=deadline_seconds,
-        )
         completeness = _classify(snapshot, evidence)
-        candidate_id = new_artifact_id("candidate")
+        candidate_id = checkpoint_state.value["candidate_id"]
+        announce("publishing candidate")
         retained, report_path, report_digest = persist_candidate(
             snapshot,
             candidate,
@@ -199,11 +311,14 @@ def clean_snapshot(
             ),
             started=started,
             deadline_seconds=deadline_seconds,
+            retry=True,
         )
-        shutil.rmtree(workdir)
-        workdir = None
+        checkpoint_state.save("published")
+        announce("saved published")
         finish_preview_operation(snapshot, completeness)
         operation_finished = True
+        shutil.rmtree(workdir)
+        workdir = None
         return CleanupOutcome(
             snapshot_id=snapshot.snapshot_id,
             target=snapshot.manifest.target,
@@ -217,26 +332,60 @@ def clean_snapshot(
             report_sha256=report_digest,
             preview=preview,
         )
-    except (CaptureError, CleanupError, TargetError, OSError, sqlite3.Error) as error:
+    except (CaptureError, CleanupError, TargetError, OSError, sqlite3.Error, KeyboardInterrupt) as error:
         code = (
             error.code
             if isinstance(error, (CaptureError, CleanupError, TargetError))
+            else "preview_interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt))
             else "cleanup_invalid"
         )
-        return _invalid(
+        if time.monotonic() - started >= deadline_seconds:
+            code = "deadline_exceeded"
+        retain_work = code in {"deadline_exceeded", "preview_interrupted"} or isinstance(error, OSError) or storage_failure(error, Path(scratch_dir), snapshot_dir) is not None
+        # Invalid or foreign checkpoint evidence is preserved for inspection,
+        # never treated as a reusable validation receipt or deleted automatically.
+        preserve_invalid = code in {
+            "preview_checkpoint_invalid", "snapshot_invalid", "preview_not_resumable",
+            "candidate_changed", "report_changed", "artifact_schema_unsupported", "artifact_not_private",
+        }
+        retain_work |= preserve_invalid
+        outcome = _invalid(
             snapshot_id, target, validation, code,
             diagnostic=storage_failure(error, Path(scratch_dir), snapshot_dir),
         )
+        if retain_work and not preserve_invalid:
+            return replace(outcome, status="operational_failure", resumable=True)
+        return outcome
     except Exception:
-        return _invalid(snapshot_id, target, validation, "cleanup_invalid")
+        retain_work = True
+        return replace(
+            _invalid(snapshot_id, target, validation, "preview_failed"),
+            status="operational_failure", resumable=True,
+        )
     finally:
-        if workdir is not None:
+        if workdir is not None and not retain_work:
             shutil.rmtree(workdir, ignore_errors=True)
-        if snapshot is not None and not operation_finished:
+        if snapshot is not None and not operation_finished and not retain_work:
             try:
                 finish_preview_operation(snapshot, "invalid")
             except CaptureError:
                 pass
+
+
+def _remove_scratch_files(directory: Path, *names: str) -> None:
+    """Remove only fixed partial SQLite outputs inside marker-authorized scratch."""
+    for name in names:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            path = directory / f"{name}{suffix}"
+            if path.is_symlink() or path.exists() and not path.is_file():
+                raise CleanupError("preview_checkpoint_invalid")
+            path.unlink(missing_ok=True)
+
+
+def _sync_file(path: Path) -> None:
+    """Make a closed SQLite stage durable before writing its checkpoint receipt."""
+    with path.open("rb") as reader:
+        os.fsync(reader.fileno())
 
 
 def _create_scratch(
@@ -248,6 +397,11 @@ def _create_scratch(
 ) -> Path:
     """Create one private admitted scratch workspace for a copied source set."""
     required = sum(item.size or 0 for item in snapshot.manifest.files) * 3 + 65536
+    workdir = root.resolve() / snapshot.operation_id
+    if workdir.exists() or workdir.is_symlink():
+        validate_preview_scratch(snapshot, workdir)
+        admit_scratch(root, 0, 0, environment)
+        return workdir
     admitted = admit_scratch(root, required, 8, environment)
     ensure_private_directory(admitted)
     _check_deadline(started, deadline_seconds)
@@ -391,6 +545,7 @@ def _backup(
             ),
         )
     except sqlite3.Error as error:
+        _check_deadline(started, deadline_seconds)
         raise CleanupError("backup_failed") from error
     finally:
         destination.close()
@@ -403,6 +558,10 @@ def _validate_candidate(
     deadline_seconds: int,
     hooks: CleanupHooks | None,
     checkpoint: Check,
+    *,
+    completed: Validation | None = None,
+    checked: Callable[[str], None] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[Validation, dict[str, object] | None]:
     """Run validation and collect only the bounded recognizable preview fields.
 
@@ -410,7 +569,9 @@ def _validate_candidate(
     scratch-only hooks, and the prior checkpoint outcome. Returns validation plus
     a preview for readable databases, or ``None`` when SQLite cannot read the
     candidate. The function opens only the scratch candidate and never returns
-    arbitrary table rows, SQL text, or SQLite integrity messages.
+    arbitrary table rows, SQL text, or SQLite integrity messages. ``completed``
+    supplies hash-bound saved gates; ``checked`` durably records each newly
+    passed expensive gate, and ``progress`` announces a gate before running it.
     """
     integrity = Check.FAIL
     foreign_keys = Check.FAIL
@@ -422,10 +583,18 @@ def _validate_candidate(
         try:
             _set_deadline_handler(connection, started, deadline_seconds)
             _check_deadline(started, deadline_seconds)
-            integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+            if progress:
+                progress("reusing integrity check" if completed and completed.integrity == Check.PASS else "checking integrity")
+            integrity_rows = [("ok",)] if completed and completed.integrity == Check.PASS else connection.execute("PRAGMA integrity_check").fetchall()
             integrity = Check.PASS if integrity_rows == [("ok",)] else Check.FAIL
-            foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if integrity == Check.PASS and checked and not (completed and completed.integrity == Check.PASS):
+                checked("integrity")
+            if progress:
+                progress("reusing foreign-key check" if completed and completed.foreign_keys == Check.PASS else "checking foreign keys")
+            foreign_key_rows = [] if completed and completed.foreign_keys == Check.PASS else connection.execute("PRAGMA foreign_key_check").fetchall()
             foreign_keys = Check.PASS if foreign_key_rows == [] else Check.FAIL
+            if integrity == Check.PASS and foreign_keys == Check.PASS and checked and not (completed and completed.foreign_keys == Check.PASS):
+                checked("foreign_keys")
             preview = _preview(connection, integrity_rows, foreign_key_rows)
         finally:
             connection.close()
@@ -448,7 +617,7 @@ def _validate_candidate(
             else Check.FAIL
         )
     except (CleanupError, sqlite3.Error, OSError) as error:
-        if storage_failure(error, candidate.parent):
+        if isinstance(error, OSError) or isinstance(error, CleanupError) and error.code == "deadline_exceeded" or storage_failure(error, candidate.parent):
             raise
         _check_deadline(started, deadline_seconds)
     return (

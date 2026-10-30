@@ -15,7 +15,7 @@ import re
 import shlex
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
@@ -24,10 +24,12 @@ from .artifacts import (
     CaptureError,
     abort_preview_operation,
     capture_source_set,
+    load_preview_operation,
     operation_status,
+    preview_checkpoint_status,
     prune_backup,
 )
-from .cleanup import clean_snapshot
+from .cleanup import DEFAULT_PREVIEW_DEADLINE_SECONDS, clean_snapshot
 from .install import (
     install_from_selection,
     install_status,
@@ -102,11 +104,11 @@ MAX_DEADLINE_SECONDS = 86_400
 """Largest supported finite whole-second deadline."""
 
 DEFAULT_DEADLINE_SECONDS = 1_800
-"""Default overall operation deadline in seconds for later execution units."""
+"""Default installation/recovery deadline; preview uses its four-hour default."""
 
 _ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _COMMAND_OPTIONS = {
-    "preview": {"database", "scratch-dir", "deadline-seconds", "json"},
+    "preview": {"database", "scratch-dir", "deadline-seconds", "json", "progress"},
     "install": {
         "database",
         "candidate",
@@ -117,7 +119,7 @@ _COMMAND_OPTIONS = {
     },
     "status": {"database", "operation", "json"},
     "abort": {"database", "operation", "json"},
-    "resume": {"database", "operation", "deadline-seconds", "json"},
+    "resume": {"database", "operation", "deadline-seconds", "json", "progress"},
     "rollback": {"database", "operation", "deadline-seconds", "json"},
     "prune-backup": {"database", "snapshot", "json"},
 }
@@ -218,7 +220,7 @@ def parse_command(
             raise CliUsageError(command, "Unsupported command option.")
         if option in options:
             raise CliUsageError(command, "Command options may not be repeated.")
-        if option == "json":
+        if option in {"json", "progress"}:
             options[option] = True
             position += 1
             continue
@@ -251,6 +253,7 @@ def parse_command(
         snapshot_id=snapshot_id,
         approve_uncertain_report=report,
         work_dir=_optional_path(options, "work-dir", command),
+        progress=bool(options.get("progress", False)),
     )
 
 
@@ -436,6 +439,8 @@ def render_human(result: Result) -> str:
             f"candidate: {result.candidate_id}",
             f"report: {result.report_sha256}",
         ]
+        if result.operation_id:
+            lines.insert(3, f"operation: {result.operation_id}")
         projects = result.preview.get("projects")
         if isinstance(projects, list):
             lines.extend(
@@ -856,13 +861,18 @@ def _execute(request: CommandRequest) -> Result:
             diagnostic_message="execution is deferred",
             target=request.database,
         )
-    deadline = request.deadline_seconds or DEFAULT_DEADLINE_SECONDS
+    deadline = request.deadline_seconds or DEFAULT_PREVIEW_DEADLINE_SECONDS
+    progress = _preview_progress(request)
+    progress("hashing and capturing source")
     started = time.monotonic()
     capture = capture_source_set(
         request.database,
         scratch_dir=_scratch_dir(request),
         work_dir=request.work_dir,
         deadline_seconds=deadline,
+        on_operation=lambda snapshot, operation: progress(
+            f"operation {operation}; snapshot {snapshot}\nnext: {_preview_resume_action(request, operation)}"
+        ),
     )
     if not capture.accepted or capture.snapshot_dir is None:
         if capture.status == "source_changed":
@@ -905,7 +915,13 @@ def _execute(request: CommandRequest) -> Result:
         capture.snapshot_dir,
         scratch_dir=scratch,
         deadline_seconds=remaining,
+        progress=progress,
     )
+    return _preview_outcome_result(request, outcome, capture.operation_id, capture.snapshot_id)
+
+
+def _preview_outcome_result(request: CommandRequest, outcome: object, operation_id: str | None, snapshot_id: str | None) -> Result:
+    """Render completed candidates or paused work with the exact resume selector."""
     status = Status(outcome.status)
     exit_code = (
         0
@@ -925,19 +941,28 @@ def _execute(request: CommandRequest) -> Result:
         ).diagnostics
         if outcome.diagnostic_message:
             diagnostics = (Diagnostic(outcome.diagnostic_code, outcome.diagnostic_message),)
+    if outcome.resumable:
+        diagnostics += (Diagnostic("preview_paused", "Preview paused; completed stages were retained. Resume with a fresh deadline."),)
+    if outcome.diagnostic_code in {"preview_busy", "preview_checkpoint_invalid", "preview_not_resumable", "scratch_wrong_host", "snapshot_invalid", "artifact_schema_unsupported", "candidate_changed", "report_changed", "artifact_not_private"}:
+        status = Status.PRECONDITION_REFUSED
+        exit_code = EXIT_PRECONDITION_REFUSED
     return Result(
         command=request.command,
         ok=outcome.completeness == "complete",
         status=status,
         exit_code=exit_code,
-        target=outcome.target,
-        snapshot_id=outcome.snapshot_id,
+        target=outcome.target if outcome.target != "unknown" else request.database,
+        snapshot_id=snapshot_id,
+        operation_id=operation_id,
         candidate_id=outcome.candidate_id,
         report_sha256=outcome.report_sha256,
         completeness=outcome.completeness,
         validation=outcome.validation,
         preview=outcome.preview,
-        next_actions=_preview_actions(request, outcome),
+        next_actions=(
+            (_preview_resume_action(request, operation_id),)
+            if outcome.resumable and operation_id else _preview_actions(request, outcome)
+        ),
         diagnostics=diagnostics,
     )
 
@@ -967,6 +992,7 @@ def _status_result(request: CommandRequest) -> Result:
         return _install_outcome_result(request, outcome)
     try:
         evidence = operation_status(request.database, request.operation_id, work_dir=request.work_dir)
+        stage = preview_checkpoint_status(request.database, request.operation_id, work_dir=request.work_dir)
     except CaptureError as error:
         return _artifact_failure(request, error.code)
     location = evidence.scratch_path or "none"
@@ -982,7 +1008,7 @@ def _status_result(request: CommandRequest) -> Result:
             Diagnostic(
                 "operation_status",
                 f"operation {evidence.operation_id} is {evidence.state} on host "
-                f"{evidence.host or 'unknown'}; scratch {location}"[:1024],
+                f"{evidence.host or 'unknown'}; scratch {location}; saved stage {stage or 'none'}"[:1024],
             ),
         ),
         next_actions=_status_actions(
@@ -1053,8 +1079,24 @@ def _install_result(request: CommandRequest) -> Result:
 
 
 def _resume_result(request: CommandRequest) -> Result:
-    """Resume only the exact durable installation operation selected by the CLI."""
+    """Resume the exact selected preview checkpoint or installation intent log."""
     assert request.operation_id is not None
+    if request.operation_id.startswith("operation-"):
+        try:
+            snapshot_dir, evidence = load_preview_operation(
+                request.database, request.operation_id, work_dir=request.work_dir,
+            )
+        except (CaptureError, TargetError) as error:
+            return _artifact_failure(request, error.code)
+        scratch = str(Path(evidence.scratch_path).parent) if evidence.scratch_path else _scratch_dir(request)
+        resumed = replace(request, scratch_dir=scratch)
+        with sqlite_temporary_directory(scratch, validate=False, update_tmpdir=False):
+            outcome = clean_snapshot(
+                snapshot_dir, scratch_dir=scratch,
+                deadline_seconds=request.deadline_seconds or DEFAULT_PREVIEW_DEADLINE_SECONDS,
+                progress=_preview_progress(request),
+            )
+        return _preview_outcome_result(resumed, outcome, evidence.operation_id, evidence.snapshot_id)
     return _install_outcome_result(
         request,
         resume_install(
@@ -1206,12 +1248,42 @@ def _artifact_failure(request: CommandRequest, code: str) -> Result:
 
 def _status_actions(database: str, operation_id: str, state: str, work_dir: str | None = None) -> tuple[str, ...]:
     """Return valid bounded next actions for one read-only operation status."""
-    if state == "previewing":
-        return (
-            "opencode-db cleanup abort "
-            f"--database {shlex.quote(database)}{_work_option(work_dir)} --operation {operation_id}",
+    if operation_id.startswith("operation-") and state in {"capturing", "captured", "previewing", "invalid", "complete", "uncertain"}:
+        actions = (
+            f"opencode-db cleanup resume --database {shlex.quote(database)}{_work_option(work_dir)} --operation {operation_id} --deadline-seconds {DEFAULT_PREVIEW_DEADLINE_SECONDS}",
         )
+        if state == "previewing":
+            actions += (
+                "opencode-db cleanup abort "
+                f"--database {shlex.quote(database)}{_work_option(work_dir)} --operation {operation_id}",
+            )
+        return actions
     return ()
+
+
+def _preview_resume_action(request: CommandRequest, operation_id: str) -> str:
+    """Build a copyable selector with a fresh caller-selected attempt budget."""
+    return (
+        f"opencode-db cleanup resume --database {shlex.quote(request.database)}"
+        f"{_work_option(request.work_dir)} --operation {operation_id}"
+        + f" --deadline-seconds {request.deadline_seconds or DEFAULT_PREVIEW_DEADLINE_SECONDS}"
+        + (" --progress" if request.progress else "")
+    )
+
+
+def _preview_progress(request: CommandRequest) -> Callable[[str], None]:
+    """Emit bounded stage/elapsed updates on stderr, automatically on a human TTY."""
+    started = time.monotonic()
+    enabled = request.progress or (not request.json and bool(getattr(sys.stderr, "isatty", lambda: False)()))
+
+    def announce(stage: str) -> None:
+        if enabled:
+            try:
+                sys.stderr.write(f"opencode-db [{time.monotonic() - started:.0f}s]: {stage}\n")
+                sys.stderr.flush()
+            except OSError:
+                pass
+    return announce
 
 
 def _preview_actions(request: CommandRequest, outcome: object) -> tuple[str, ...]:
@@ -1404,9 +1476,17 @@ def _help_text(values: Sequence[str]) -> str:
         "--scratch-dir overrides only local SQLite scratch; final install staging stays beside the database.\n"
     )
     synopses = {
-        name: synopsis + " [--work-dir ABSOLUTE_PATH]"
+        name: synopsis + " [--work-dir ABSOLUTE_PATH]" + (" [--progress]" if name in {"cleanup preview", "cleanup resume"} else "")
         for name, synopsis in synopses.items()
     }
+    wal_help += (
+        "Preview saves completed stages. If interrupted or timed out, use cleanup resume\n"
+        "with its operation ID and the same --work-dir; registered local scratch is reused.\n"
+        "--progress prints stage/elapsed updates on stderr (automatic on a human terminal).\n"
+        "A single SQLite backup or integrity scan restarts if interrupted mid-stage; use\n"
+        "--deadline-seconds to adjust the four-hour preview/resume default (max 86400).\n"
+        "Initial source capture must finish first; partial capture is not resumable.\n"
+    )
     if values and values[0] in top_level:
         selected = values[0]
         detail = (f"\n{details[selected]}" if selected in details else "") + (

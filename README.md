@@ -363,15 +363,76 @@ opencode-db cleanup resume --operation install-YYYYMMDDTHHMMSSZ-HEX
 opencode-db cleanup rollback --operation install-YYYYMMDDTHHMMSSZ-HEX
 ```
 
-`status` is read-only. `resume` accepts only the durable recorded before/after
-states. `rollback` is always explicit and restores only hash-verified retained
-source bytes. For an incomplete preview scratch operation, use its exact
-operation ID with `cleanup abort`; cross-host scratch is reported as requiring
-manual cleanup rather than removed remotely.
+`status` is read-only. For `install-…` operations, `resume` accepts only the
+durable recorded before/after states. `rollback` is always explicit and restores
+only hash-verified retained source bytes. For `operation-…` preview IDs, `resume`
+uses the completed stages described below. To explicitly discard an incomplete
+preview, use its exact operation ID with `cleanup abort`; cross-host scratch is
+reported as requiring manual cleanup rather than removed remotely.
 
 ```bash
 opencode-db cleanup abort --operation operation-YYYYMMDDTHHMMSSZ-HEX
 ```
+
+### Resuming long previews
+
+Preview and preview-resume default to a **four-hour** attempt budget instead of
+30 minutes. `--deadline-seconds` can select a different finite budget up to 24
+hours. Each resume gets a fresh budget; it does not inherit elapsed time from
+the previous invocation.
+
+```bash
+opencode-db cleanup preview --work-dir /absolute/private/local-work --progress
+# After interruption, use the exact operation ID printed by preview:
+opencode-db cleanup status --work-dir /absolute/private/local-work \
+  --operation operation-YYYYMMDDTHHMMSSZ-HEX
+opencode-db cleanup resume --work-dir /absolute/private/local-work \
+  --operation operation-YYYYMMDDTHHMMSSZ-HEX --progress
+```
+
+Use the same `--database` selection if it was supplied initially. Resume uses
+the **recorded scratch path**, including a separate `--scratch-dir` from preview;
+it does not redirect or migrate existing work to another scratch root.
+
+Once the original source snapshot has been accepted, completed stages survive
+timeouts, Ctrl-C, and abrupt process termination:
+
+| Completed checkpoint | Work reused after restart |
+| --- | --- |
+| Accepted retained source snapshot | No new capture of the active database |
+| Scratch inputs copied | No repeat of the completed scratch copy |
+| WAL recovery completed | No repeat of completed WAL recovery |
+| Standalone candidate created | No repeat of SQLite backup |
+| Integrity check passed | No repeat of the completed integrity scan |
+| Foreign-key check passed | No repeat of that completed check |
+| Candidate validated | Validation receipt and bounded preview reused |
+| Candidate/report published | Same verified candidate returned; no duplicate publication |
+
+The operation ID is announced after registration, before the source copy.
+Progress reports the current stage and elapsed time on stderr, automatically
+on an interactive human terminal or explicitly with `--progress`. With `--json`,
+stdout remains exactly one result; stderr progress requires `--progress`.
+Timeout/interruption results include the operation ID and a copyable resume
+command. Status reports the last saved checkpoint without scanning the database.
+
+Initial source capture must finish and pass its pre/copy/post hash comparison
+before it is reusable. **Partial source capture is not resumable.** An interrupted
+scratch copy, SQLite backup, integrity scan or foreign-key scan restarts that
+individual stage. An interrupted WAL recovery restages scratch inputs because
+SQLite may have modified them. Resume also rehashes retained inputs and saved
+outputs before trusting their receipts; verification I/O is not skipped.
+
+Keep both the retained work store and registered scratch. Scratch now contains
+recovery checkpoints, not just disposable intermediate files. Missing scratch
+requires rebuilding from the accepted snapshot; malformed or changed checkpoint
+evidence is preserved and refused. Resume must run on the recorded scratch host.
+Cooperative simultaneous resume/abort attempts refuse while the operation lock
+is held; a killed process releases that lock automatically.
+
+The accepted snapshot from an older failed preview can also be reused with its
+`operation-…` ID. Already deleted old scratch cannot be recovered. If the active
+database has changed since capture, preview still describes the original
+snapshot and installation will refuse to replace the changed active source.
 
 ## Retained artifacts and pruning
 
@@ -493,8 +554,9 @@ safety-precondition refusal (including move validation and destructive-command
 detached-stream refusal or cancellation),
 `5` bounded operational SQLite or Git failure, and `6` manual recovery required.
 
-The default deadline is 30 minutes. `--deadline-seconds` accepts finite whole
-seconds from 1 through 86400. SQLite busy waits are finite. The tool requires
+Preview and preview-resume default to four hours; installation and installation
+recovery default to 30 minutes. `--deadline-seconds` accepts finite whole seconds
+from 1 through 86400. SQLite busy waits are finite. The tool requires
 private retained storage, admitted local scratch storage, and sufficient space
 and inodes before sensitive writes. Recovery can temporarily multiply disk use:
 plan capacity for the original source set, retained snapshot, scratch copy,

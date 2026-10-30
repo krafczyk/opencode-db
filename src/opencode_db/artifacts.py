@@ -9,6 +9,7 @@ candidates/reports before allowing a selected action to proceed.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -16,9 +17,10 @@ import secrets
 import shutil
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from functools import wraps
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
@@ -106,6 +108,7 @@ def capture_source_set(
     environment: TargetEnvironment | None = None,
     after_copy: Callable[[Path], None] | None = None,
     after_chunk: Callable[[Path, int], None] | None = None,
+    on_operation: Callable[[str, str], None] | None = None,
 ) -> CaptureOutcome:
     """Capture a stable exact source set into a private target-scoped snapshot.
 
@@ -115,7 +118,8 @@ def capture_source_set(
     ``deadline_seconds`` is a finite
     positive operation limit, ``environment`` supplies testable system probes,
     and ``after_copy`` / ``after_chunk`` are narrow test seams called after each
-    copied source file or stream chunk. Returns a :class:`CaptureOutcome`; only
+    copied source file or stream chunk. ``on_operation`` receives snapshot and
+    operation IDs after registration, before copying. Returns a :class:`CaptureOutcome`; only
     ``accepted=True`` is eligible for future recovery. Invalid targets and
     storage preconditions return a refusal without artifact capture; source
     mutation, interruption, I/O, and rollback-journal evidence retain
@@ -157,6 +161,8 @@ def capture_source_set(
             operation_id,
             catalog,
         )
+        if on_operation is not None:
+            on_operation(snapshot_id, operation_id)
         _write_json(snapshot_dir / "pre-manifest.json", pre_manifest.to_dict())
         copied_manifest = _copy_manifest(
             target.path,
@@ -369,6 +375,8 @@ def load_accepted_snapshot(
                     deadline_seconds,
                 )
             except CaptureError as error:
+                if error.code == "deadline_exceeded":
+                    raise
                 raise CaptureError("snapshot_invalid") from error
             if size != source_file.size or digest != source_file.sha256:
                 raise CaptureError("snapshot_invalid")
@@ -417,6 +425,7 @@ def persist_candidate(
     *,
     started: float,
     deadline_seconds: int,
+    retry: bool = False,
 ) -> tuple[Path, Path, str]:
     """Persist one closed, validated candidate and immutable report privately.
 
@@ -427,7 +436,9 @@ def persist_candidate(
     Returns the retained candidate path, report path, and report SHA-256 digest.
     Raises :class:`CaptureError` if source revalidation, private writes, digest
     verification, or the deadline fails. It writes only inside the bound
-    snapshot directory and never writable-opens any retained input.
+    snapshot directory and never writable-opens any retained input. ``retry``
+    permits replacement of an unpublished candidate with this exact checkpoint-
+    bound ID; a registered candidate is reused only after full verification.
     """
     snapshot = load_accepted_snapshot(
         snapshot.snapshot_dir, started=started, deadline_seconds=deadline_seconds
@@ -439,8 +450,23 @@ def persist_candidate(
     expected_size, expected_digest = _hash_file(candidate, started, deadline_seconds)
     destination = snapshot.snapshot_dir / f"{candidate_id}.sqlite"
     report_path = snapshot.snapshot_dir / f"{candidate_id}.report.json"
+    temporary_report = report_path.with_name(f".{candidate_id}.report.json.preview.tmp") if retry else None
+    if temporary_report is not None:
+        if temporary_report.is_symlink() or temporary_report.exists() and not temporary_report.is_file():
+            raise CaptureError("candidate_persist_failed")
+        temporary_report.unlink(missing_ok=True)
     if destination.exists() or report_path.exists():
-        raise CaptureError("candidate_persist_failed")
+        if not retry:
+            raise CaptureError("candidate_persist_failed")
+        existing = load_preview_candidate(snapshot, started=started, deadline_seconds=deadline_seconds)
+        if existing is not None:
+            if existing[0] != destination:
+                raise CaptureError("candidate_persist_failed")
+            return existing[0], existing[1], existing[3]
+        for path in (destination, report_path):
+            if path.is_symlink() or path.exists() and not path.is_file():
+                raise CaptureError("candidate_persist_failed")
+            path.unlink(missing_ok=True)
     try:
         _copy_file(candidate, destination, started, deadline_seconds, None)
         size, digest = _hash_file(destination, started, deadline_seconds)
@@ -450,7 +476,7 @@ def persist_candidate(
         value["candidate_id"] = candidate_id
         value["candidate_sha256"] = digest
         value["candidate_size"] = size
-        _write_json(report_path, value)
+        _write_json(report_path, value, temporary=temporary_report)
         _, report_digest = _hash_file(report_path, started, deadline_seconds)
         _register_candidate(
             snapshot,
@@ -466,6 +492,165 @@ def persist_candidate(
             raise
         raise CaptureError("candidate_persist_failed") from error
     return destination, report_path, report_digest
+
+
+@contextmanager
+def preview_operation_lock(snapshot_dir: Path) -> Iterator[None]:
+    """Exclusively hold one snapshot's preview/abort authority on this host.
+
+    ``snapshot_dir`` must be a selected private snapshot directory. Yields
+    ``None``; raises :class:`CaptureError` with ``preview_busy`` if another
+    cooperative invocation holds the lock, or on invalid paths. The private
+    lock file persists for stable locking and exact pruning; process death
+    releases the advisory lock without PID-based recovery or process inspection.
+    """
+    _require_private_directory(snapshot_dir, snapshot_dir.name)
+    lock = snapshot_dir / ".preview.lock"
+    if lock.is_symlink():
+        raise CaptureError("snapshot_invalid")
+    descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CaptureError("preview_busy") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def load_preview_operation(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> tuple[Path, OperationEvidence]:
+    """Locate an exact preview snapshot without reading active database bytes.
+
+    Parameters select the recorded target, operation and optional store. Returns
+    its directory and catalog evidence; raises :class:`CaptureError` for unknown,
+    aborted, foreign-host or non-preview selections. Source acceptance and
+    digests must still be verified by cleanup before reuse. Performs only reads.
+    """
+    evidence = operation_status(database, operation_id, work_dir=work_dir)
+    if not operation_id.startswith("operation-") or evidence.state not in {
+        "capturing", "captured", "previewing", "invalid", "complete", "uncertain",
+    }:
+        raise CaptureError("preview_not_resumable")
+    if evidence.host is not None and evidence.host != socket.gethostname():
+        raise CaptureError("scratch_wrong_host")
+    try:
+        target = resolve_recorded_target(database, work_dir=work_dir)
+    except TargetError as error:
+        raise CaptureError(error.code) from error
+    snapshot_dir = target.control_dir / "snapshots" / evidence.snapshot_id
+    value, _ = _read_canonical_json(snapshot_dir / "manifest.json")
+    if not isinstance(value, dict) or (
+        value.get("operation_id"), value.get("snapshot_id"), value.get("target_id"), value.get("state")
+    ) != (operation_id, evidence.snapshot_id, target.target_id, "accepted"):
+        raise CaptureError("snapshot_invalid")
+    return snapshot_dir, evidence
+
+
+def preview_checkpoint_status(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> str | None:
+    """Read a preview's last saved stage without SQLite or full-file hashing.
+
+    Parameters select an exact recorded operation/store. Returns ``None`` for
+    absent/legacy or foreign-host scratch, otherwise its verified checkpoint
+    stage. Raises :class:`CaptureError` for malformed marker/state authority.
+    Performs only bounded metadata reads and never modifies scratch.
+    """
+    from .preview_state import checkpoint_stage
+
+    evidence = operation_status(database, operation_id, work_dir=work_dir)
+    if evidence.host != socket.gethostname() or evidence.scratch_path is None:
+        return None
+    scratch = Path(evidence.scratch_path)
+    if not scratch.exists() and not scratch.is_symlink():
+        return None
+    target = resolve_recorded_target(database, work_dir=work_dir)
+    if not scratch.is_absolute() or scratch.name != operation_id or scratch.is_symlink():
+        raise CaptureError("preview_checkpoint_invalid")
+    _validate_scratch_marker(scratch, evidence, target.target_id)
+    return checkpoint_stage(scratch, operation_id, evidence.snapshot_id, target.target_id)
+
+
+def validate_preview_scratch(snapshot: AcceptedSnapshot, scratch: Path) -> None:
+    """Require catalog and marker authority before reusing preview scratch.
+
+    ``snapshot`` is revalidated accepted evidence and ``scratch`` is its exact
+    local workspace. Returns ``None`` or raises :class:`CaptureError` for any
+    mismatch, aborted/foreign-host record, or malformed private marker. Reads
+    metadata only, never opens SQLite or modifies files.
+    """
+    if scratch.is_symlink():
+        raise CaptureError("preview_not_resumable")
+    _, _, operations = _read_catalog(
+        snapshot.snapshot_dir.parent.parent, Path(snapshot.manifest.target), snapshot.manifest.target_id
+    )
+    entry = next((item for item in operations if item["operation_id"] == snapshot.operation_id), None)
+    if entry is None or entry["snapshot_id"] != snapshot.snapshot_id or entry["state"] == "aborted" or entry["scratch_path"] != str(scratch) or entry["host"] != socket.gethostname():
+        raise CaptureError("preview_not_resumable")
+    _validate_scratch_marker(scratch, OperationEvidence(
+        snapshot.operation_id, snapshot.snapshot_id, str(entry["state"]), entry["host"], entry["scratch_path"],
+    ), snapshot.manifest.target_id)
+
+
+def load_preview_candidate(
+    snapshot: AcceptedSnapshot, *, started: float, deadline_seconds: int
+) -> tuple[Path, Path, dict[str, object], str] | None:
+    """Revalidate a published preview receipt without requiring install approval.
+
+    ``snapshot`` binds target identity; deadline parameters bound hashing.
+    Returns candidate/report paths, the report and its digest, or ``None`` if
+    nothing is registered. Raises :class:`CaptureError` for altered evidence.
+    Reads retained files only and never authorizes installation.
+    """
+    _, candidates, _ = _read_catalog(
+        snapshot.snapshot_dir.parent.parent, Path(snapshot.manifest.target), snapshot.manifest.target_id
+    )
+    records = [item for item in candidates if item["snapshot_id"] == snapshot.snapshot_id]
+    if not records:
+        return None
+    record = records[-1]
+    candidate_id = record["candidate_id"]
+    if not isinstance(candidate_id, str) or re.fullmatch(r"candidate-[A-Za-z0-9-]{1,80}", candidate_id) is None:
+        raise CaptureError("candidate_changed")
+    candidate = snapshot.snapshot_dir / f"{candidate_id}.sqlite"
+    report = snapshot.snapshot_dir / f"{candidate_id}.report.json"
+    for path in (candidate, report):
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
+            raise CaptureError("candidate_changed")
+    if _hash_file(candidate, started, deadline_seconds) != (record["candidate_size"], record["candidate_sha256"]):
+        raise CaptureError("candidate_changed")
+    _, digest = _hash_file(report, started, deadline_seconds)
+    value, _ = _read_canonical_json(report)
+    if digest != record["report_sha256"] or not _valid_report(
+        value, Path(snapshot.manifest.target), snapshot.manifest.target_id, record, snapshot.manifest,
+    ):
+        raise CaptureError("report_changed")
+    return candidate, report, cast(dict[str, object], value), digest
+
+
+def _discard_unpublished_preview(snapshot_dir: Path, candidate_id: str, target: Path, target_id: str) -> None:
+    """Remove only checkpoint-bound publication outputs absent from the catalog."""
+    if re.fullmatch(r"candidate-\d{8}T\d{6}Z-[0-9a-f]{24}", candidate_id) is None:
+        raise CaptureError("preview_checkpoint_invalid")
+    root = snapshot_dir.parent.parent
+    _, candidates, _ = _read_catalog(root, target, target_id)
+    if any(item["candidate_id"] == candidate_id for item in candidates):
+        return
+    paths = [
+        snapshot_dir / f"{candidate_id}.sqlite",
+        snapshot_dir / f"{candidate_id}.report.json",
+        snapshot_dir / f".{candidate_id}.report.json.preview.tmp",
+    ]
+    for path in paths:
+        if path.is_symlink() or path.exists() and not path.is_file():
+            raise CaptureError("preview_checkpoint_invalid")
+    for path in paths:
+        path.unlink(missing_ok=True)
+    _fsync_directory(snapshot_dir)
 
 
 def register_preview_scratch(
@@ -492,6 +677,14 @@ def register_preview_scratch(
         for entry in snapshots
     ):
         raise CaptureError("snapshot_invalid")
+    previous = next((item for item in operations if item["operation_id"] == snapshot.operation_id), None)
+    if previous is not None and (
+        previous["state"] == "aborted"
+        or previous["scratch_path"] is not None and (
+            previous["scratch_path"] != str(scratch_path) or previous["host"] != socket.gethostname()
+        )
+    ):
+        raise CaptureError("preview_not_resumable")
     evidence = OperationEvidence(
         operation_id=snapshot.operation_id,
         snapshot_id=snapshot.snapshot_id,
@@ -763,6 +956,16 @@ def abort_preview_operation(
     deletion. The function never inspects processes or alters SQLite/source data.
     """
     evidence = operation_status(database, operation_id, work_dir=work_dir)
+    target = resolve_recorded_target(database, work_dir=work_dir)
+    with preview_operation_lock(target.control_dir / "snapshots" / evidence.snapshot_id):
+        return _abort_preview_operation(database, operation_id, work_dir=work_dir)
+
+
+def _abort_preview_operation(
+    database: str, operation_id: str, *, work_dir: str | None = None
+) -> OperationEvidence:
+    """Apply abort while the preview lock excludes cleanup and resumption."""
+    evidence = operation_status(database, operation_id, work_dir=work_dir)
     try:
         target = resolve_recorded_target(database, work_dir=work_dir)
     except TargetError as error:
@@ -785,6 +988,16 @@ def abort_preview_operation(
             raise CaptureError("candidate_changed")
         if scratch.exists():
             _validate_scratch_marker(scratch, evidence, target.target_id)
+            from .preview_state import checkpoint_candidate
+
+            candidate_id = checkpoint_candidate(
+                scratch, evidence.operation_id, evidence.snapshot_id, target.target_id,
+            )
+            if candidate_id is not None:
+                _discard_unpublished_preview(
+                    target.control_dir / "snapshots" / evidence.snapshot_id, candidate_id,
+                    target.path, target.target_id,
+                )
             shutil.rmtree(scratch)
     except OSError as error:
         raise CaptureError("copy_failed") from error
@@ -1046,6 +1259,7 @@ def _prune_group_plan(
         manifest_value, target, target_id, snapshot_id, snapshot_dir
     )
     files: dict[Path, tuple[int, str] | bytes] = {manifest_path: manifest_bytes}
+    files[snapshot_dir / ".preview.lock"] = b""
     files[snapshot_dir / "pre-manifest.json"] = _canonical_json_bytes(
         manifest.to_dict()
     )
@@ -1794,9 +2008,9 @@ def _best_effort_diagnostic_manifest(
         pass
 
 
-def _write_json(path: Path, value: dict[str, object]) -> None:
+def _write_json(path: Path, value: dict[str, object], *, temporary: Path | None = None) -> None:
     """Atomically write one private canonical JSON artifact and fsync its parent."""
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    temporary = temporary or path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     encoded = (
         json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
     ).encode("ascii")
