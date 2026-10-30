@@ -152,6 +152,39 @@ accepts no selector, project scope, estimate, or `--vacuum`; it emits a dedicate
 preview, requires the normal authorization, revalidates without selecting or
 deleting sessions, and bounds compaction with its own timeout window.
 
+### Prune operational failure detail
+
+Operational error messages retain the original tool-owned classification first,
+including every post-commit retry warning. Stderr then includes fixed phase/step
+identifiers, the resolved database and configured temporary directory, configured
+timeout when available, and a safe cause/hint. Known deletion table names may be
+shown; SQL and persisted values are never shown. The diagnostic is capped at
+8192 characters. Exit codes and success output do not change.
+
+Numeric `sqlite_errorcode` values are resolved through standard-library primary
+and extended SQLite constants. Numeric OS errno values are resolved through
+standard-library errno names. Wrapped explicit causes are traversed with a fixed
+bound and cycle detection. Raw exception messages, `sqlite_errorname` strings,
+OS exception filenames and raw integrity/foreign-key messages are not rendered.
+Tool-owned health/schema/bounds reasons are accepted only from an exact allowlist.
+An unavailable structured cause is explicitly reported, not inferred from text.
+
+Capacity is observed with statvfs for full-storage and filesystem/access errors
+at the actual resolved database's parent and selected temporary directory.
+Observed bytes/inodes and quota uncertainty supplement numeric error categories;
+positive current counts do not prove why an earlier I/O failure occurred, nor
+does SQLite necessarily identify the failing file. Output delivery failures
+instead direct attention to the output pipe/log/terminal.
+
+The configured writer busy wait remains 10000 ms, independent of the application
+timeout that begins after `BEGIN IMMEDIATE`. COMMIT installs the remaining
+application budget as a whole-millisecond busy timeout. A numeric SQLITE_BUSY
+from that COMMIT is classified as application timeout even if millisecond
+rounding allows it to arrive slightly before the float deadline. Prune still
+rolls back uncommitted work; reporting never changes the deletion boundary.
+Secondary cleanup errors retain their numeric detail without replacing primary
+vacuum failures or an already committed outcome.
+
 ## Session transfer
 
 Top-level transfer commands have separate, human-only output from the closed

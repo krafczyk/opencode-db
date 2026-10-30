@@ -511,7 +511,7 @@ opencode-db prune [--db /absolute/path/opencode.db] \
   ([--project-id ID] \
     (--oldest N|TIME | --keep-newest N|TIME | --target-size SIZE) \
     [--estimate-size] [--vacuum] | --vacuum-only) \
-  [--timeout-seconds SECONDS] [--yes]
+  [--timeout-seconds SECONDS] [--work-dir /absolute/private/local-work] [--yes]
 ```
 
 Exactly one selector is required unless `--vacuum-only` is used. Positive `N`
@@ -541,6 +541,38 @@ no selector, project scope, estimate, or `--vacuum`; it validates and confirms t
 selected database, changes no session rows, and uses its own `--timeout-seconds`
 window. SQLite vacuum can still fail for reasons such as insufficient temporary
 storage even when its timeout is long enough.
+
+### Prune failure diagnostics
+
+Prune failures include their execution **phase**, a more specific **step** when
+available, and the underlying numeric SQLite or OS error code. For example, a
+vacuum failure can now distinguish `SQLITE_BUSY` (lock contention),
+`SQLITE_READONLY`, `SQLITE_CANTOPEN`, `SQLITE_FULL`, and extended I/O codes such
+as `SQLITE_IOERR_FSYNC`. Failed integrity/foreign-key checks retain their safe
+check reason rather than collapsing into just "vacuum failed". Deletion errors
+can identify the fixed known table being processed, without SQL or row values.
+
+Diagnostics also show the canonical selected database, configured SQLite
+temporary directory, the configured phase timeout, and a targeted next-step
+hint. Initial SQLite writer-lock acquisition has a separate **10-second busy
+wait**; increasing `--timeout-seconds` does not extend that initial wait. A COMMIT
+lock wait consumes only the remaining application budget and is classified as
+a timeout even when SQLite's whole-millisecond wait expires just before the
+wall-clock deadline.
+
+Storage exhaustion reports byte/inode availability and quota uncertainty at
+the selected locations. I/O/open/permission failures also show current
+capacity observations where available, without assuming that every I/O failure
+means the disk is full. These are observations at selected/configured locations;
+SQLite does not always identify the exact file that failed.
+
+If deletions already committed, the committed count and **do not repeat the
+prune request; use `--vacuum-only`** warning remain intact. A secondary cleanup
+failure is reported separately without masking the original reason. Raw SQLite
+messages, OS exception filenames, SQL, session IDs, and row contents are not
+printed. If no structured cause is available, the diagnostic explicitly says
+so instead of guessing. Additional detail is automatic on stderr and bounded
+to 8192 characters; success output and exit classes are unchanged.
 
 ## Results, deadlines, and storage
 

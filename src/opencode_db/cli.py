@@ -77,6 +77,7 @@ from .prune import (
     parse_target_size,
     plan_prune,
 )
+from .prune_diagnostics import describe_prune_failure
 from .transfer import (
     TransferError,
     TransferOperationalError,
@@ -599,7 +600,9 @@ def _execute_prune(request: PruneRequest) -> int:
     calculates, renders, and flushes aggregate preview evidence from a read-only
     snapshot before terminal checks, input, or writable application. Unless
     ``request.yes`` is set, only an exact lowercase terminal response authorizes
-    a remaining mutation. Output never contains session identifiers or content.
+    a remaining mutation. Operational failures include bounded phase, numeric
+    SQLite/OS cause, location and recovery details. Output never contains session
+    identifiers, raw SQLite messages, SQL, or content.
     """
     try:
         reviewed = plan_prune(request)
@@ -629,11 +632,10 @@ def _execute_prune(request: PruneRequest) -> int:
         return 0
     except PruneCommittedError as error:
         sys.stdout.write(_render_prune_outcome(request, error.outcome))
-        detail = _command_error(error, request.database, request.work_dir)
-        sys.stderr.write(f"opencode-db: {error}" + (f"; {detail}" if detail != str(error) else "") + "\n")
+        sys.stderr.write(f"opencode-db: {describe_prune_failure(error, request.database, request.work_dir)}\n")
         return EXIT_OPERATIONAL_FAILURE
     except PruneOperationalError as error:
-        sys.stderr.write(f"opencode-db: {_command_error(error, request.database, request.work_dir)}\n")
+        sys.stderr.write(f"opencode-db: {describe_prune_failure(error, request.database, request.work_dir)}\n")
         return EXIT_OPERATIONAL_FAILURE
     except PruneError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
@@ -675,12 +677,12 @@ def _render_prune_preview(reviewed: ReviewedPrunePlan, stdout: object) -> None:
                 )
         rendered = "\n".join(lines) + "\n"
         if stdout.write(rendered) != len(rendered):
-            raise PruneOperationalError("could not write prune preview")
+            raise PruneOperationalError("could not write prune preview", phase="preview_output")
         stdout.flush()
     except PruneError:
         raise
     except (AttributeError, OSError, ValueError, TypeError) as error:
-        raise PruneOperationalError("could not write prune preview") from error
+        raise PruneOperationalError("could not write prune preview", phase="preview_output") from error
 
 
 def _render_prune_preview_timestamp(value: int | None) -> str:
@@ -734,13 +736,13 @@ def _write_prune_confirmation_prompt(
     prompt = _prune_confirmation_prompt(reviewed)
     try:
         if stdout.write(prompt) != len(prompt):
-            raise PruneOperationalError("could not write prune confirmation prompt")
+            raise PruneOperationalError("could not write prune confirmation prompt", phase="confirmation_output")
         stdout.flush()
     except PruneError:
         raise
     except (AttributeError, OSError, ValueError, TypeError) as error:
         raise PruneOperationalError(
-            "could not write prune confirmation prompt"
+            "could not write prune confirmation prompt", phase="confirmation_output"
         ) from error
 
 

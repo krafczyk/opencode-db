@@ -70,7 +70,26 @@ class PruneOperationalError(PruneError):
     This subtype distinguishes an unavailable writer, validation failure, or
     vacuum failure from a schema or selector safety refusal. A successful delete
     commit is instead reported by :class:`PruneCommittedError` if later work fails.
+    ``phase`` and ``step`` are tool-generated diagnostic identifiers;
+    ``timeout_seconds`` records the configured phase budget. ``cleanup_error``
+    optionally retains an additional cleanup failure without masking the primary
+    cause. ``database_path`` is the canonical selected path once resolved.
+    These attributes never contain database rows or SQL text.
     """
+
+    def __init__(self, message: str, *, phase: str | None = None, step: str | None = None) -> None:
+        """Store bounded public text and optional fixed phase/step identifiers.
+
+        ``message`` is a tool-owned classification, not a raw SQLite/OS message.
+        The operation boundary fills ``timeout_seconds`` when applicable. Raising
+        this error performs no I/O and does not itself commit or roll back data.
+        """
+        super().__init__(message)
+        self.phase = phase
+        self.step = step
+        self.timeout_seconds: float | None = None
+        self.cleanup_error: BaseException | None = None
+        self.database_path: str | None = None
 
 
 class PruneCommittedError(PruneOperationalError):
@@ -496,11 +515,13 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
     path = _prune_database_path(request.database)
     connection: sqlite3.Connection | None = None
     deadline: float | None = None
+    phase = "planning_open"
     try:
         connection = _open_prune_read_connection(path)
         deadline = time.monotonic() + timeout_seconds
         _install_prune_deadline(connection, deadline)
         connection.execute("BEGIN")
+        phase = "planning"
         evidence = _evaluate_prune(
             connection, request, selector, captured_now_ms, deadline
         )
@@ -522,7 +543,13 @@ def plan_prune(request: PruneRequest, *, now_ms: int | None = None) -> ReviewedP
             raise PruneOperationalError("prune planning timed out") from error
         raise PruneOperationalError("prune planning could not read the database") from error
     finally:
-        _cleanup_prune_connection(connection, "planning", sys.exception())
+        original = sys.exception()
+        _failure_context(original, phase, timeout_seconds, database_path=path)
+        try:
+            _cleanup_prune_connection(connection, "planning", original)
+        except PruneOperationalError as error:
+            _failure_context(error, "planning_cleanup", timeout_seconds, database_path=path)
+            raise
 
 
 def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
@@ -562,12 +589,15 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
     committed = False
     application_finished = False
     outcome: PruneOutcome | None = None
+    phase = "application_open"
     try:
         connection = _open_prune_connection(path)
+        phase = "writer_lock"
         connection.execute("BEGIN IMMEDIATE")
         deadline = time.monotonic() + timeout_seconds
         _install_prune_deadline(connection, deadline)
         connection.execute("PRAGMA defer_foreign_keys = ON")
+        phase = "revalidation"
         current = _evaluate_prune(
             connection,
             reviewed.request,
@@ -579,12 +609,14 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
             raise PruneError("prune preview is stale: rerun the command")
         deleted_ids = current.selected_session_ids
         if deleted_ids:
+            phase = "selection"
             _prepare_selection(connection, deleted_ids, deadline)
             _refuse_retained_session_children(connection)
             _check_prune_deadline(deadline)
             _refuse_cross_boundary_session_foreign_keys(connection)
             _check_prune_deadline(deadline)
             for table in CHILD_SESSION_TABLES:
+                phase = "deleting_children"
                 _check_prune_deadline(deadline)
                 selector = SESSION_SELECTOR_COLUMNS[table]
                 connection.execute(
@@ -592,14 +624,17 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                     f"IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
                 )
             _check_prune_deadline(deadline)
+            phase = "deleting_sessions"
             deleted_sessions = connection.execute(
                 f"DELETE FROM session WHERE id IN (SELECT id FROM temp.{_quote(_SELECTION_TABLE)})"
             ).rowcount
             if deleted_sessions != len(deleted_ids):
                 raise PruneError("session deletion did not match selected sessions")
             _check_prune_deadline(deadline)
+            phase = "post_delete_validation"
             _validate_for_prune(connection)
             _check_prune_deadline(deadline)
+            phase = "size_estimation"
             logical_database_bytes = (
                 database_logical_bytes(connection, deadline=deadline)
                 if reviewed.request.estimate_size
@@ -613,6 +648,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 None,
             )
             remaining_commit_timeout_ms = int((deadline - time.monotonic()) * 1000)
+            phase = "commit"
             if remaining_commit_timeout_ms <= 0:
                 raise PruneOperationalError("prune operation timed out")
             connection.execute(f"PRAGMA busy_timeout = {remaining_commit_timeout_ms}")
@@ -620,6 +656,7 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
             committed = True
             _check_prune_deadline(deadline)
         else:
+            phase = "empty_selection"
             logical_database_bytes = current.preview.projected_logical_database_bytes_after_prune
             connection.rollback()
             outcome = PruneOutcome(
@@ -629,9 +666,11 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 None,
             )
         assert outcome is not None
+        phase = "application_cleanup"
         connection.set_progress_handler(None, 0)
         application_finished = True
         if _vacuum_requested(reviewed.request):
+            phase = "vacuum"
             vacuum_deadline = time.monotonic() + timeout_seconds
             try:
                 _install_prune_deadline(connection, vacuum_deadline)
@@ -681,13 +720,40 @@ def apply_prune_plan(reviewed: ReviewedPrunePlan) -> PruneOutcome:
                 "sessions were pruned but post-commit work failed; do not repeat the prune request",
                 outcome,
             ) from error
-        if deadline is not None and time.monotonic() >= deadline:
+        sqlite_code = getattr(error, "sqlite_errorcode", None)
+        # COMMIT's busy timeout is the remaining budget rounded down to whole
+        # milliseconds, so exhaustion can precede the wall-clock deadline slightly.
+        commit_wait_expired = phase == "commit" and type(sqlite_code) is int and sqlite_code & 255 == sqlite3.SQLITE_BUSY
+        if deadline is not None and (time.monotonic() >= deadline or commit_wait_expired):
             raise PruneOperationalError("prune application timed out") from error
         raise PruneOperationalError("session prune failed") from error
     finally:
-        _cleanup_prune_connection(
-            connection, "application", sys.exception(), outcome if committed else None
+        original = sys.exception()
+        _failure_context(
+            original, phase, timeout_seconds,
+            step=f"delete:{table}" if phase == "deleting_children" else None,
+            database_path=path,
         )
+        try:
+            _cleanup_prune_connection(
+                connection, "application", original, outcome if committed else None
+            )
+        except PruneOperationalError as error:
+            _failure_context(error, "application_cleanup", timeout_seconds, database_path=path)
+            raise
+
+
+def _failure_context(error: BaseException | None, phase: str, timeout_seconds: float, *, step: str | None = None, database_path: Path | None = None) -> None:
+    """Attach fixed execution context without changing exception text or causes."""
+    if isinstance(error, PruneOperationalError):
+        if error.phase is None:
+            error.phase = phase
+        if error.timeout_seconds is None:
+            error.timeout_seconds = timeout_seconds
+        if error.step is None:
+            error.step = step
+        if error.database_path is None and database_path is not None:
+            error.database_path = str(database_path)
 
 
 def database_logical_bytes(
@@ -764,11 +830,11 @@ def _prune_database_path(database: str | Path) -> Path:
     try:
         return _existing_regular_path(database, "database")
     except TransferOperationalError as error:
-        raise PruneOperationalError(str(error)) from error
+        raise PruneOperationalError(str(error), phase="path") from error
     except TransferError as error:
         raise PruneError(str(error)) from error
     except OSError as error:
-        raise PruneOperationalError("database could not be inspected") from error
+        raise PruneOperationalError("database could not be inspected", phase="path") from error
 
 
 def _evaluate_prune(
@@ -917,6 +983,7 @@ def _cleanup_prune_connection(
     if failure is None:
         return
     if isinstance(original, PruneCommittedError):
+        original.cleanup_error = failure
         raise original
     message = (
         f"prune {phase} rollback could not be confirmed"
@@ -928,10 +995,12 @@ def _cleanup_prune_connection(
             "sessions were pruned but application cleanup failed; do not repeat the prune request",
             committed_outcome,
         )
+        committed.cleanup_error = failure
         if original is not None:
             raise committed from original
         raise committed from failure
     operational = PruneOperationalError(message)
+    operational.cleanup_error = failure
     if original is not None:
         raise operational from original
     raise operational from failure
@@ -971,13 +1040,15 @@ def _validate_for_prune(connection: sqlite3.Connection) -> None:
 
 def _validate_prune_database_health(connection: sqlite3.Connection) -> None:
     """Require bounded SQLite page and foreign-key checks before pruning."""
+    step = "quick_check"
     try:
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-            raise PruneOperationalError("database integrity check failed")
+            raise PruneOperationalError("database integrity check failed", step=step)
+        step = "foreign_key_check"
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise PruneOperationalError("database foreign key check failed")
+            raise PruneOperationalError("database foreign key check failed", step=step)
     except sqlite3.Error as error:
-        raise PruneOperationalError("database integrity validation failed") from error
+        raise PruneOperationalError("database integrity validation failed", step=step) from error
 
 
 def _require_project_table(connection: sqlite3.Connection) -> None:
@@ -1218,9 +1289,12 @@ def _vacuum(connection: sqlite3.Connection) -> int:
     :class:`PruneOperationalError` without reopening the target, preserving the
     post-commit boundary that produced a possible :class:`PruneCommittedError`.
     """
+    step = "vacuum_rebuild"
     try:
         connection.execute("VACUUM")
+        step = "vacuum_validation"
         _validate_for_prune(connection)
+        step = "vacuum_geometry"
         page_count = connection.execute("PRAGMA page_count").fetchone()
         page_size = connection.execute("PRAGMA page_size").fetchone()
         if (
@@ -1234,4 +1308,4 @@ def _vacuum(connection: sqlite3.Connection) -> int:
             raise PruneOperationalError("database vacuum failed")
         return page_count[0] * page_size[0]
     except (sqlite3.Error, PruneError) as error:
-        raise PruneOperationalError("database vacuum failed") from error
+        raise PruneOperationalError("database vacuum failed", step=step) from error
