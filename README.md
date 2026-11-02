@@ -454,6 +454,10 @@ opencode-db cleanup prune-backup \
 
 ## Active session pruning
 
+For long prunes with minimal downtime, use the opt-in
+[staged prune and update workflow](#staged-prune-and-update). Ordinary `prune`
+below remains the direct active-database operation.
+
 `prune` is an active-database retention command. Arrange OpenCode shutdown and
 writer concurrency before running it. It first opens the selected existing
 database read-only to calculate and flush an aggregate preview: scoped sessions
@@ -573,6 +577,114 @@ messages, OS exception filenames, SQL, session IDs, and row contents are not
 printed. If no structured cause is available, the diagnostic explicitly says
 so instead of guessing. Additional detail is automatic on stderr and bounded
 to 8192 characters; success output and exit classes are unchanged.
+
+### Staged prune and update
+
+`--staged` makes a consistent SQLite backup and performs selection, deletion and
+optional vacuum on a **private copy**. Keep using OpenCode on the original while
+this long phase runs. It requires an existing mode-0700 **local** `--work-dir`
+large enough for the image, sync state and SQLite work. The source must already
+use WAL; the tool never changes its journal policy or adds source tables/triggers.
+Run it on the same machine/context as the source users and resume on the creating
+host; it does not coordinate writers across cluster nodes.
+
+Example retaining the newest 1000 sessions (replace that selector with your
+existing policy):
+
+```bash
+mkdir -m 700 /absolute/large-local/opencode-db-work
+opencode-db prune --db /absolute/path/opencode.db \
+  --keep-newest 1000 --vacuum --staged \
+  --work-dir /absolute/large-local/opencode-db-work --yes --progress
+```
+
+The command prints `operation: prune-…` before the long copy and reports phases
+and elapsed time with `--progress` (also automatic on a human terminal). Each
+staged phase defaults to a 24-hour finite budget; `--timeout-seconds` can shorten
+it. A copied snapshot and completed prune/vacuum stages are retained on failure.
+An interrupted individual snapshot, planning scan or vacuum may need repeating;
+an already committed deletion is recognized using the exact saved ID selection,
+so resumption does not prune another oldest-N batch.
+
+After `state: ready`, catch up new sessions and changed existing sessions while
+continuing to use OpenCode:
+
+```bash
+opencode-db prune update --db /absolute/path/opencode.db \
+  --work-dir /absolute/large-local/opencode-db-work \
+  --operation prune-YYYYMMDDTHHMMSSZ-HEX --progress
+```
+
+Repeat update as needed. Each update reads session IDs/activity stamps, then
+copies complete row families for new sessions or sessions whose
+`session.time_updated` **differs** from the last synchronized value (including
+clock regression). It propagates source session deletions and synchronizes
+non-session metadata. Native sequence-row markers select changed non-session
+event histories without rereading every immutable event payload. It does not
+reevaluate retention or run another vacuum.
+
+Changed sessions are restored even if the original prune selected them for
+deletion. Unchanged pruned sessions stay deleted; necessary existing parent
+dependencies of new/restored sessions are also restored. Consequently, catch-up
+may exceed the original keep-count or size target. Repeated updates replace
+owned rows rather than duplicating messages, parts, events or todos.
+
+**Accepted limitation: timestamp-only sync can miss message/tool/metadata edits
+or deletions within a session when its parent activity timestamp is unchanged.**
+This is intentionally not a byte-perfect merge or a new change-tracking system.
+Source IDs/stamps, schema/migration identity and global metadata bind the staged
+source generation; they do not prove equality of every source payload byte.
+
+For final cutover, **stop OpenCode and other source clients**, then run:
+
+```bash
+opencode-db prune update --db /absolute/path/opencode.db \
+  --work-dir /absolute/large-local/opencode-db-work \
+  --operation prune-YYYYMMDDTHHMMSSZ-HEX --install --progress
+```
+
+This performs a final timestamp catch-up, verifies/seals the pruned image, stages
+it beside the source, rechecks the source generation, retains the original
+main/WAL/SHM/journal set privately, and promotes the new image. Only this explicit
+`--install` replaces the original. Start OpenCode separately after success.
+The tool does not inspect processes, request a shutdown confirmation or coordinate
+service lifecycle. Other cooperative staged readers/cutovers are serialized.
+
+The long prune is moved out of the stopped window; final downtime still depends
+on changed-session volume, validation and the pruned image's copy/hash time.
+Snapshot/update reads consume I/O and can retain source WAL frames until their
+read snapshot closes. Keep capacity on the source filesystem too. Installation
+needs room for the pruned image there, and keeps original bytes until explicit
+retirement; it does not make an extra full-size copy of the original.
+
+Use the same source/work-root selection and printed opaque ID for recovery:
+
+```bash
+opencode-db prune status --db /absolute/path/opencode.db \
+  --work-dir /absolute/large-local/opencode-db-work --operation prune-YYYYMMDDTHHMMSSZ-HEX
+opencode-db prune rollback --db /absolute/path/opencode.db \
+  --work-dir /absolute/large-local/opencode-db-work --operation prune-YYYYMMDDTHHMMSSZ-HEX
+opencode-db prune discard --db /absolute/path/opencode.db \
+  --work-dir /absolute/large-local/opencode-db-work --operation prune-YYYYMMDDTHHMMSSZ-HEX
+```
+
+`update` resumes incomplete preparation (`--yes` bypasses only any pending
+private-copy authorization). Once cutover starts, repeat `update --install` to
+finish it, or explicitly `rollback` with clients stopped. Rollback refuses to
+overwrite changed active state or new sidecars. There is no automatic rollback.
+`discard` removes only this job's exact artifacts/backups; incomplete cutover or
+unlisted files refuse. Retain the work directory until installation/recovery and
+backup retirement are finished. These are separate staged job IDs, not cleanup
+snapshot/candidate IDs.
+
+Supported staged sources have the native transfer-known session tables and
+normal non-session tables, without triggers/virtual tables. Schema or known
+migration-state changes require restarting preparation. Private cursor/policy
+checksums, candidate hashes, target/host binding and closed versioned state
+refuse changed or unknown evidence. Staged metadata is bounded to one million
+source sessions, 16 KiB per ID and 128 MiB of session-key evidence; non-session
+metadata is bounded to 64 MiB (immutable event payloads are streamed separately).
+The native selector's existing scope/evidence limits still apply.
 
 ## Results, deadlines, and storage
 

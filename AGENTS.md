@@ -53,6 +53,28 @@ excluded.
 Do not inspect live MkChad state, user credentials, OpenCode session data, or
 private database fixtures unless the current task explicitly authorizes it.
 
+## Staged Prune Profile
+
+Opt-in staged pruning permits concurrent normal same-machine OpenCode SQL
+writes during a read-only consistent WAL snapshot and timestamp catch-up. It
+never installs tracking tables/triggers in the source or changes the source
+journal policy.
+The operator still arranges shutdown/concurrency safety for explicit cutover;
+the tool must not inspect processes or verify/coordinate service shutdown.
+
+The user accepts that timestamp-only catch-up can miss changes not reflected in
+`session.time_updated`. Persist and display that limitation honestly. Source
+generation checks for this profile bind schema, session IDs/activity stamps and
+non-session metadata; do not claim byte-for-byte source equivalence. Preserve
+the entire original file set at cutover. Existing cleanup provenance and native
+in-place prune guarantees are not weakened by this opt-in profile.
+
+Staged SQLite images and sync metadata are tool-owned local work files. Their
+rollback-journal transaction policy may be selected explicitly for atomic
+attached-database commits; this exception does not authorize source journal
+changes. Job state, recovery intent and exact artifact paths must be private,
+versioned, target/host-bound and fail closed when changed or ambiguous.
+
 ## Verification And Git
 
 Run `python3 -m unittest discover -s tests -v` and compile checks for changes

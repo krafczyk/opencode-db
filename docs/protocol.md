@@ -185,6 +185,98 @@ rolls back uncommitted work; reporting never changes the deletion boundary.
 Secondary cleanup errors retain their numeric detail without replacing primary
 vacuum failures or an already committed outcome.
 
+## Staged prune timestamp profile
+
+The opt-in human-only grammar is:
+
+```text
+prune [native selector/vacuum options] --staged --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH [--progress]
+prune update [--db ABSOLUTE_DB] --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH --operation PRUNE_ID [--timeout-seconds N] [--progress] [--yes] [--install]
+prune status [--db ABSOLUTE_DB] --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH --operation PRUNE_ID
+prune rollback [--db ABSOLUTE_DB] --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH --operation PRUNE_ID [--timeout-seconds N] [--progress]
+prune discard [--db ABSOLUTE_DB] --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH --operation PRUNE_ID
+```
+
+Staged phases default to 86400 seconds; explicit positive finite overrides obey
+the existing prune maximum. Source selection remains explicit or the bounded
+XDG/HOME default, without process/service discovery. A staged source must already
+be WAL. SQLite read-only transactions and backup provide consistent views while
+normal source writers continue. No source tracking table, trigger, runtime
+change or journal-policy change is introduced. Source reads close before long
+local planning/pruning and release their read snapshot before local update
+validation; copying can nevertheless retain WAL frames and consume source I/O.
+
+Private work-root storage is
+`<work-dir>/.opencode-db/<target-id>/staged-prunes/<prune-id>/`. `job.json` is
+canonical mode-0600 schema version 1 with exact fields `schema_version`,
+`operation_id`, `target`, `target_id`, `host`, `policy`, `detection`. The detection
+value is `session_last_activity_only`; policy carries only the existing retention
+fields. IDs, canonical source and host must match. The JSON size cap is 64 KiB.
+`candidate.sqlite`, `state.sqlite` and `.lock` remain private under mode-0700
+directories. No staging tables are installed into the candidate/source schema.
+
+`state.sqlite` records meta, source versions/retention, frozen selected IDs and
+native non-session event markers. Its closed meta mapping holds phase, schema
+identity, logical source digest, candidate SHA-256, captured policy clock,
+generation, bounded result counts and job/cursor checksums. The cursor checksum
+binds IDs, stamps, retention bits and selection/marker rows with typed framing;
+the job checksum binds immutable policy/target metadata. Future or changed state
+refuses. Preparation phases are snapshot, planning, pruning, pruned, vacuum,
+sealing, ready. Interrupted pruning recognizes the exact committed selected set
+instead of deleting another count-based batch. Snapshot/scan/vacuum work inside
+an unfinished individual phase may repeat.
+
+Update compares all source IDs and `time_updated` against the prior synchronized
+snapshot; new IDs or unequal stamps copy complete known session-owned families.
+Changed pruned sessions and necessary existing ancestors are restored. Unchanged
+pruned sessions remain absent. Source session deletions propagate. Retention is
+not reevaluated and update does not vacuum. Non-session tables are refreshed from
+the same read snapshot. Native event-sequence row identities select changed
+non-session immutable event aggregates rather than scanning historical payloads.
+Unknown tables linked to session state, triggers and virtual tables refuse.
+
+This profile explicitly accepts missed child/metadata edits without a changed
+parent activity stamp. It does not claim full source-byte preservation or full
+content comparison. Source generation binds schema SQL, application/user version,
+known migration rows, session ID/stamp pairs and non-session metadata/sequence
+markers. Schema/migration changes refuse rather than recording a new migration
+receipt against old unchanged-stamp payloads. Existing cleanup completeness and
+source-byte contracts do not change.
+
+Candidate and state use rollback journaling on admitted local storage. Update
+uses one attached-database transaction with source rows from one read snapshot;
+private foreign-key enforcement is temporarily disabled to replace global
+parent tables without cascades, then candidate quick integrity and foreign-key
+checks gate commit. Candidate rows and cursor metadata commit atomically.
+Sealing after commit revalidates/hashes bytes; a killed unsealed commit resumes
+sealing rather than acknowledging nonexistent data or repeating retention.
+
+Per-job locks serialize mutations. A stable source-scoped advisory lock permits
+concurrent staged readers but excludes cutover/rollback across jobs. It neither
+coordinates native OpenCode nor introduces cross-node leases. Cutover requires
+operator-arranged stopped clients and an explicit `update --install`.
+
+Same-filesystem installation staging is adjacent under the source target's
+`staged-prunes/<id>/cutover/`; the intent remains in the work-root job. The closed
+mode-0600 `cutover.json` schema binds job/target IDs, source generation, candidate
+digest, phase/index and up to four standard original file names with size/mtime
+evidence. Paths are derived only; arbitrary persisted paths are never accepted.
+Originals move to private storage without a full-size extra original copy. A
+retained source generation is rechecked before promotion, and all active original
+paths/sidecars must be absent. Captured original SHM is separate from a disposable
+retained-source read cache. Renames and intent replacements sync both directories.
+
+Phases retaining/promoting/installed and rolling_back/rolled_back reconcile
+durable before/after paths. Only exact sealed candidate bytes can be retired for
+rollback, and changed active state or new sidecars refuse. Ambiguous source-file
+metadata/paths refuse with files preserved. Rollback preflights the whole file
+set before restoring the main database, so an unexpected sidecar cannot be
+paired with it even temporarily. Explicit discard retires only exact
+listed artifacts after terminal cutover/rollback; no automatic rollback or expiry
+is added. Status reads private metadata without opening the active source through
+SQLite and may recover private state journals. Source/session metadata, migration
+identity and globals have fixed bounds documented in README.
+
 ## Session transfer
 
 Top-level transfer commands have separate, human-only output from the closed

@@ -15,6 +15,7 @@ import re
 import shlex
 import sys
 import time
+import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
@@ -78,6 +79,7 @@ from .prune import (
     plan_prune,
 )
 from .prune_diagnostics import describe_prune_failure
+from .staged_prune import DEFAULT_STAGE_TIMEOUT, StageRequest
 from .transfer import (
     TransferError,
     TransferOperationalError,
@@ -153,13 +155,14 @@ class CliUsageError(ValueError):
 
 def parse_command(
     arguments: Sequence[str],
-) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest | MoveRepairCommandRequest | PruneRequest:
+) -> CommandRequest | TransferRequest | InspectionRequest | MoveCommandRequest | MoveRepairCommandRequest | PruneRequest | StageRequest:
     """Parse one cleanup, transfer, inspection, move, or move-repair command.
 
     Parameters: ``arguments`` is an argv sequence excluding the program name.
     Returns a :class:`CommandRequest`, :class:`TransferRequest`,
     :class:`InspectionRequest`, :class:`MoveCommandRequest`,
-    :class:`MoveRepairCommandRequest`, or :class:`PruneRequest` with validated
+    :class:`MoveRepairCommandRequest`, :class:`PruneRequest`, or
+    :class:`StageRequest` with validated
     fields; cleanup requests use a concrete environment-selected database string
     when their option is omitted. Every request accepts an absolute ``work_dir``
     for CLI work placement; execution validates its privacy and local scratch.
@@ -182,6 +185,8 @@ def parse_command(
     if values and values[0] in {"list-projects", "show-project", "show-session", "list-sessions"}:
         return _parse_inspection_command(values)
     if values and values[0] == "prune":
+        if len(values) > 1 and values[1] in {"update", "status", "rollback", "discard"}:
+            return _parse_staged_command(values)
         return _parse_prune_command(values)
     if values and values[0] in {"export", "import"}:
         return parse_transfer_command(values)
@@ -324,14 +329,16 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
 
     Parameters: ``arguments`` begins with ``prune``. Returns one
     :class:`PruneRequest` with an explicit or bounded-default database target and
-    exactly one validated retention selector or vacuum-only mode. Raises
+    exactly one validated retention selector or vacuum-only mode. ``--staged``
+    selects private-copy preparation; it is dispatched before native mutation.
+    Raises
     :class:`CliUsageError` for malformed paths, duplicate/unknown options,
     invalid IDs, or selectors. This function neither reads stdin nor changes a
     database.
     """
     command = "prune"
-    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "timeout-seconds", "vacuum", "vacuum-only", "yes"}
-    boolean_options = {"estimate-size", "vacuum", "vacuum-only", "yes"}
+    allowed = {"db", "project-id", "oldest", "keep-newest", "estimate-size", "target-size", "timeout-seconds", "vacuum", "vacuum-only", "yes", "staged", "progress"}
+    boolean_options = {"estimate-size", "vacuum", "vacuum-only", "yes", "staged", "progress"}
     options: dict[str, str | bool] = {}
     position = 1
     while position < len(arguments):
@@ -374,7 +381,9 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
                 parse_selector(_option(options, selector))
         except PruneError as error:
             raise CliUsageError(command, str(error)) from error
-    timeout_seconds = PRUNE_TIMEOUT_SECONDS
+    if options.get("progress") and not options.get("staged"):
+        raise CliUsageError(command, "--progress currently requires --staged for prune.")
+    timeout_seconds = DEFAULT_STAGE_TIMEOUT if options.get("staged") else PRUNE_TIMEOUT_SECONDS
     if "timeout-seconds" in options:
         try:
             timeout_seconds = parse_prune_timeout(_option(options, "timeout-seconds"))
@@ -392,6 +401,49 @@ def _parse_prune_command(arguments: list[str]) -> PruneRequest:
         yes=bool(options.get("yes", False)),
         timeout_seconds=timeout_seconds,
         vacuum_only=vacuum_only,
+        staged=bool(options.get("staged", False)),
+        progress=bool(options.get("progress", False)),
+    )
+
+
+def _parse_staged_command(arguments: list[str]) -> StageRequest:
+    """Parse exact staged job actions without inspecting a database or artifact."""
+    action = arguments[1]
+    command = "prune " + action
+    allowed = {"db", "operation"}
+    if action in {"update", "rollback"}:
+        allowed |= {"timeout-seconds", "progress"}
+    if action == "update":
+        allowed |= {"install", "yes"}
+    booleans = {"install", "progress", "yes"}
+    options = {}
+    index = 2
+    while index < len(arguments):
+        token = arguments[index]
+        name = token[2:] if token.startswith("--") else ""
+        if name not in allowed or name in options:
+            raise CliUsageError(command, "Unknown, duplicate or positional staged option.")
+        if name in booleans:
+            options[name] = True
+            index += 1
+        else:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+                raise CliUsageError(command, "A staged option is missing its value.")
+            options[name] = arguments[index + 1]
+            index += 2
+    if "operation" not in options:
+        raise CliUsageError(command, "--operation is required.")
+    operation = _optional_id(options, "operation", command)
+    if operation is None or re.fullmatch(r"prune-\d{8}T\d{6}Z-[0-9a-f]{24}", operation) is None:
+        raise CliUsageError(command, "An exact prune operation ID is required.")
+    try:
+        timeout = parse_prune_timeout(options.get("timeout-seconds", DEFAULT_STAGE_TIMEOUT))
+    except PruneError as error:
+        raise CliUsageError(command, str(error)) from error
+    return StageRequest(
+        _absolute_path(str(options["db"]), command, "db") if "db" in options else _default_database(command),
+        operation, action, timeout, bool(options.get("install")), bool(options.get("progress")),
+        yes=bool(options.get("yes")),
     )
 
 
@@ -540,8 +592,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return EXIT_PRECONDITION_REFUSED
 
 
-def _dispatch_request(request: CommandRequest | TransferRequest | InspectionRequest | PruneRequest | MoveCommandRequest | MoveRepairCommandRequest) -> int:
+def _dispatch_request(request: CommandRequest | TransferRequest | InspectionRequest | PruneRequest | MoveCommandRequest | MoveRepairCommandRequest | StageRequest) -> int:
     """Execute a parsed request within its selected CLI temporary environment."""
+    if isinstance(request, StageRequest) or isinstance(request, PruneRequest) and request.staged:
+        return _execute_staged(request)
     if isinstance(request, TransferRequest):
         return _execute_transfer(request)
     if isinstance(request, InspectionRequest):
@@ -587,6 +641,126 @@ def _execute_inspection(request: InspectionRequest) -> int:
     except InspectionError as error:
         sys.stderr.write(f"opencode-db: {error}\n")
         return EXIT_PRECONDITION_REFUSED
+
+
+def _execute_staged(request: PruneRequest | StageRequest) -> int:
+    """Run explicit private-copy pruning/sync or operator-arranged cutover.
+
+    Emits only bounded counts, opaque IDs, selected paths and phase progress.
+    Original SQLite content remains read-only until --install or rollback;
+    failures retain jobs and recovery authority. Native privacy/error exit
+    classes and authorization conventions apply without service coordination.
+    """
+    from . import staged_install, staged_prune
+
+    class Cancelled(Exception):
+        pass
+
+    started = time.monotonic()
+    job = None
+    phase = "staged_prepare" if isinstance(request, PruneRequest) else "staged_" + request.action
+    timeout = request.timeout_seconds
+    enabled = request.progress or bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+    def progress(stage: str) -> None:
+        if enabled:
+            try:
+                sys.stderr.write(f"opencode-db [{time.monotonic() - started:.0f}s]: {stage}\n")
+                sys.stderr.flush()
+            except OSError:
+                pass
+
+    def authorize(reviewed: ReviewedPrunePlan) -> None:
+        _render_prune_preview(reviewed, sys.stdout)
+        if request.yes:
+            return
+        if not (_is_terminal(sys.stdin) and _is_terminal(sys.stdout)):
+            raise PruneError("staged preparation requires terminal authorization or --yes")
+        _write_prune_confirmation_prompt(reviewed, sys.stdout)
+        try:
+            if sys.stdin.readline() not in ("y\n", "y\r", "y\r\n"):
+                raise Cancelled()
+        except (KeyboardInterrupt, EOFError):
+            raise Cancelled() from None
+
+    try:
+        if isinstance(request, PruneRequest):
+            job = staged_prune.create_job(request)
+            sys.stdout.write(f"opencode-db: staged prune\noperation: {job.operation_id}\n")
+            sys.stdout.flush()
+            with staged_prune.job_lock(job):
+                meta = staged_prune.prepare_job(job, timeout, authorize=authorize, progress=progress)
+        else:
+            job = staged_prune.load_job(request.database, request.work_dir, request.operation_id)
+            if request.action == "status":
+                meta = staged_prune.read_meta(job)
+                if (job.directory / "cutover.json").exists():
+                    meta = {**meta, "phase": staged_install.read_intent(job)["phase"]}
+            else:
+                with staged_prune.job_lock(job):
+                    if request.action == "rollback":
+                        meta = staged_install.rollback_job(job, timeout, progress=progress)
+                    elif request.action == "discard":
+                        staged_install.discard_job(job)
+                        meta = {"phase": "discarded", "result": {}}
+                    elif (job.directory / "cutover.json").exists():
+                        if not request.install:
+                            raise PruneError("cutover already started; use prune update --install or prune rollback")
+                        meta = staged_install.install_job(job, timeout, progress=progress)
+                    else:
+                        if staged_prune.read_meta(job)["phase"] not in {"ready", "sealing"}:
+                            staged_prune.prepare_job(job, timeout, authorize=authorize, progress=progress)
+                        meta = staged_prune.update_job(job, timeout, progress=progress)
+                        if request.install:
+                            phase = "staged_install"
+                            meta = staged_install.install_job(job, timeout, progress=progress)
+        lines = [f"operation: {job.operation_id}", f"state: {meta['phase']}", "sync_detection: session_last_activity_only"]
+        if "generation" in meta:
+            lines.append(f"sync_generation: {meta['generation']}")
+        if meta["phase"] != "discarded":
+            lines += ["candidate: " + json.dumps(str(job.candidate), ensure_ascii=True)]
+            lines += [f"{key}: {value}" for key, value in sorted(meta["result"].items())]
+            lines += ["next: " + action for action in _staged_actions(job, request.work_dir, meta["phase"])]
+        sys.stdout.write("\n".join(lines) + "\n")
+        return 0
+    except Cancelled:
+        sys.stderr.write("opencode-db: staged preparation cancelled; job retained\n")
+        return EXIT_PRECONDITION_REFUSED
+    except (PruneError, TransferError, CaptureError, sqlite3.Error, OSError, ValueError, KeyboardInterrupt) as error:
+        if isinstance(error, (PruneError, TransferError)) and not isinstance(error, (PruneOperationalError, TransferOperationalError)):
+            sys.stderr.write(f"opencode-db: {error}\n")
+            code = EXIT_PRECONDITION_REFUSED
+        elif isinstance(error, CaptureError) and error.code != "deadline_exceeded":
+            sys.stderr.write(f"opencode-db: staged artifact refused ({error.code})\n")
+            code = EXIT_PRECONDITION_REFUSED
+        else:
+            failure = PruneOperationalError(
+                "staged prune interrupted; files retained" if isinstance(error, KeyboardInterrupt) else "staged prune operation failed; files retained",
+                phase=phase,
+            )
+            if isinstance(error, CaptureError) and error.code == "deadline_exceeded":
+                failure = PruneOperationalError("staged prune phase timed out", phase=phase)
+            failure.timeout_seconds = timeout
+            failure.__cause__ = error
+            sys.stderr.write(f"opencode-db: {describe_prune_failure(failure, str(job.target) if job else request.database, request.work_dir)}\n")
+            code = EXIT_OPERATIONAL_FAILURE
+        if job is not None:
+            sys.stderr.write(f"operation: {job.operation_id}\n")
+            for action in _staged_actions(job, request.work_dir, "retaining" if (job.directory / "cutover.json").exists() else "ready"):
+                sys.stderr.write("next: " + action + "\n")
+        return code
+
+
+def _staged_actions(job: object, work_dir: str | None, phase: str) -> tuple[str, ...]:
+    """Keep source/store/opaque job selection in copyable explicit next actions."""
+    base = f"--db {shlex.quote(str(job.target))}{_work_option(work_dir)} --operation {job.operation_id}"
+    if phase in {"installed", "rolled_back"}:
+        return ((f"opencode-db prune rollback {base}",) if phase == "installed" else ()) + (f"opencode-db prune discard {base}",)
+    if phase == "rolling_back":
+        return (f"opencode-db prune rollback {base} --progress",)
+    if phase in {"retaining", "promoting"}:
+        return (f"opencode-db prune update {base} --install --progress", f"opencode-db prune rollback {base} --progress")
+    return (f"opencode-db prune update {base} --progress", f"opencode-db prune update {base} --install --progress")
 
 
 def _execute_prune(request: PruneRequest) -> int:
@@ -1464,7 +1638,11 @@ def _help_text(values: Sequence[str]) -> str:
             "oldest_surviving_session_updated, and optional projected logical bytes.\n"
             "--yes bypasses only the prompt; zero matches skip confirmation unless "
             "--vacuum remains. --vacuum-only compacts without deleting sessions, and "
-            "stale previews refuse with instructions to rerun."
+            "stale previews refuse with instructions to rerun.\n"
+            "--staged keeps the WAL source usable and prunes a private copy; it requires --work-dir.\n"
+            "--progress reports staged phases. Staged phases default to 86400 seconds.\n"
+            "Use prune update for timestamp-only catch-up; unchanged-timestamp edits may be missed.\n"
+            "Stop OpenCode before update --install or rollback; the tool does not coordinate shutdown."
         )
     }
     wal_help = (
@@ -1481,6 +1659,13 @@ def _help_text(values: Sequence[str]) -> str:
         name: synopsis + " [--work-dir ABSOLUTE_PATH]" + (" [--progress]" if name in {"cleanup preview", "cleanup resume"} else "")
         for name, synopsis in synopses.items()
     }
+    synopses["prune"] += " [--staged [--progress]]"
+    for action in ("update", "status", "rollback", "discard"):
+        synopses["prune " + action] = (
+            f"opencode-db prune {action} [--db ABSOLUTE_DB] --work-dir ABSOLUTE_PRIVATE_LOCAL_PATH --operation PRUNE_ID"
+            + (" [--timeout-seconds N] [--progress]" if action in {"update", "rollback"} else "")
+            + (" [--install] [--yes]" if action == "update" else "")
+        )
     wal_help += (
         "Preview saves completed stages. If interrupted or timed out, use cleanup resume\n"
         "with its operation ID and the same --work-dir; registered local scratch is reused.\n"
@@ -1489,6 +1674,8 @@ def _help_text(values: Sequence[str]) -> str:
         "--deadline-seconds to adjust the four-hour preview/resume default (max 86400).\n"
         "Initial source capture must finish first; partial capture is not resumable.\n"
     )
+    if command.startswith("prune ") and command in synopses:
+        return synopses[command] + "\nTimestamp-only sync can miss edits without activity changes. Stop OpenCode for --install/rollback.\n"
     if values and values[0] in top_level:
         selected = values[0]
         detail = (f"\n{details[selected]}" if selected in details else "") + (

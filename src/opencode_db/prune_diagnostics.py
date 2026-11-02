@@ -16,6 +16,12 @@ from .prune import CHILD_SESSION_TABLES, MAX_PRUNE_TIMEOUT_SECONDS, PruneError, 
 from .target import TargetError, _display_path, storage_failure, storage_space
 
 _PHASES = {
+    "staged": "staged private-copy work",
+    "staged_prepare": "staged snapshot / planning / pruning",
+    "staged_update": "staged timestamp catch-up",
+    "staged_install": "staged source cutover",
+    "staged_rollback": "staged source rollback",
+    "staged_discard": "staged artifact discard",
     "path": "database path inspection",
     "planning_open": "planning / opening database read-only",
     "planning": "planning / validation and selection",
@@ -83,6 +89,7 @@ _PUBLIC_REASONS = {
     "unknown session-linked table": "An unsupported session-linked table exists; pruning cannot safely delete its state.",
 }
 _TIMEOUTS = {
+    "staged prune phase timed out",
     "prune operation timed out", "prune planning timed out", "prune application timed out",
     "database vacuum timed out",
     "sessions were pruned but vacuum timed out; do not repeat the prune request; rerun with --vacuum-only",

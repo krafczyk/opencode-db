@@ -115,6 +115,8 @@ class PruneRequest:
     confirmation bypass. ``vacuum_only`` selects compaction without a retention
     selector or deletion. ``timeout_seconds`` independently bounds planning,
     application, and vacuum. ``work_dir`` selects CLI SQLite temporary storage.
+    ``staged``/``progress`` select the separate staged CLI workflow; native
+    planning/application refuse staged requests rather than touching the source.
     The value has no SQLite or filesystem side effects.
     """
 
@@ -130,6 +132,8 @@ class PruneRequest:
     timeout_seconds: float = PRUNE_TIMEOUT_SECONDS
     vacuum_only: bool = False
     work_dir: str | None = None
+    staged: bool = False
+    progress: bool = False
 
 
 @dataclass(frozen=True)
@@ -794,6 +798,8 @@ def _one_selector(
 
 def _normalize_selector(request: PruneRequest) -> PruneSelector:
     """Return the parsed selector retained in reviewed immutable evidence."""
+    if request.staged:
+        raise PruneError("staged requests must use the staged preparation/update workflow")
     if request.vacuum_only:
         if (
             request.vacuum
