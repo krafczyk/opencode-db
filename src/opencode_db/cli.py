@@ -1614,6 +1614,8 @@ def _wants_help(values: Sequence[str]) -> bool:
 def _help_text(values: Sequence[str]) -> str:
     top_level = {"mv", "repair-move", "export", "import", "list-projects", "show-project", "show-session", "list-sessions", "prune"}
     command = values[0] if values and values[0] in top_level else " ".join(values[:2])
+    if len(values) > 1 and values[0] == "prune" and values[1] in {"update", "status", "rollback", "discard"}:
+        command = "prune " + values[1]
     synopses = {
         "mv": "opencode-db mv --project-id ID --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--method sibling] [--application-timeout-seconds SECONDS] [--yes] [--progress]",
         "repair-move": "opencode-db repair-move --project-id ID --source-project-dir ABSOLUTE_SOURCE_PROJECT_DIR --target-project-dir ABSOLUTE_TARGET_PROJECT_DIR [--db ABSOLUTE_DB] [--application-timeout-seconds SECONDS] [--yes]",

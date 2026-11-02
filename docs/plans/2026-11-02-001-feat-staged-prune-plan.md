@@ -81,11 +81,13 @@ child full suite, compile checks and installed-copy smoke tests.
 
 ## Verification results
 
-- All 251 repository tests passed, including 31 staged-prune tests using
+- All 252 repository tests passed, including 32 staged-prune tests using
   generated WAL databases and fresh-process interruption/recovery checks.
 - Rollback preflights every original/active file before moving the main database;
   regression coverage verifies that unexpected WAL/journal files preserve both
   the retained original and the unexpected sidecar without restoring the main.
 - Ruff, Python compile checks and `git diff --check` passed.
+- Installed-command smoke verification found a staged subcommand help-routing
+  defect; the fix and all four staged help routes now have regression coverage.
 - The full suite emits existing Python 3.14 unclosed-SQLite `ResourceWarning`s;
   the focused staged suite passes without those warnings when run independently.

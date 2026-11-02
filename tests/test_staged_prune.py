@@ -643,6 +643,17 @@ class StagedPruneTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(cli.CliUsageError):
                 cli.parse_command(args)
 
+    def test_staged_subcommand_help_describes_its_own_options_without_io(self):
+        """Each staged action exposes its own recovery grammar instead of prune selectors."""
+        for action in ("update", "status", "rollback", "discard"):
+            with self.subTest(action=action), patch.object(sqlite3, "connect", side_effect=AssertionError("help opened SQLite")):
+                code, output, error = self._run(["prune", action, "--help"])
+                self.assertEqual(code, 0, error)
+                self.assertTrue(output.startswith(f"opencode-db prune {action} "))
+                self.assertIn("--operation PRUNE_ID", output)
+                self.assertNotIn("--oldest", output)
+                self.assertEqual("[--install]" in output, action == "update")
+
 
 if __name__ == "__main__":
     unittest.main()
